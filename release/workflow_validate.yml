@@ -1,0 +1,42 @@
+# 骨架：issue「模型适配」的自动校验 bot。
+# 仓库公开后挪到 .github/workflows/validate-adaptation.yml 并按需改 triggers/权限。
+# 逻辑：从 issue 正文提取 ```json 块 → release/validate_submission.py --from-issue-body
+#       校验 schema/白名单 → 结果写进 issue comment（人工审核仍必须有，bot 只做前置过滤）。
+name: validate-adaptation
+
+on:
+  issues:
+    types: [opened, edited]
+
+permissions:
+  issues: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract & validate JSON from issue body
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          printf '%s' "$ISSUE_BODY" > /tmp/issue.md
+          python3 release/validate_submission.py --from-issue-body /tmp/issue.md \
+            | tee /tmp/verdict.txt
+          cat /tmp/verdict.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: Comment verdict
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const v = fs.readFileSync('/tmp/verdict.txt', 'utf8').slice(0, 3000);
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `🤖 自动校验（schema/白名单级，不代表已审核）：\n\n\`\`\`\n${v}\n\`\`\`\n维护者会复核 selfcheck 与参数合理性。`
+            });
+# 说明：
+# - 这里**不做** selfcheck 重放（需要真实模型与硬件）；GitHub runner 只能验 schema。
+#   模型公开 + 有 runner GPU 的进阶重放属于后续可选项，不要写进 v1 承诺。
+# - requires_local_build=true 的提交必须人工复核（校验脚本已给 warn）。

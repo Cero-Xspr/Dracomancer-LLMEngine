@@ -22,7 +22,9 @@ PROFILE_SCHEMA_VERSION = 2
 #   · 新增 `engines`：按引擎分段（llama_cpp / dracomancer），顶层字段成为默认值；
 #   · 新增 `status`：works / broken / untested —— `broken` 是**负结果**的正式位置
 #     （参数救不了的情况，例如 BitNet 的量化类型被引擎移除）；
-#   · `match.arch` 可以是字符串**或字符串数组**（同一架构在不同 GGUF 里写法不同）。
+#   · `match.arch` 可以是字符串**或字符串数组**（同一架构在不同 GGUF 里写法不同）；
+#   · `display_name`：覆盖 GGUF 里那个可能没意义的 general.name（实测 Falcon-H1 写的是
+#     "Original"，列表里就只能显示 "Original"）。
 
 # 已知后端名（backend_hint 只能取其中之一）。与 draco.BACKENDS 的键保持一致；
 # 这里写死是为了让本模块不依赖 draco（拿一份就能独立校验）。
@@ -39,10 +41,11 @@ KNOWN_STATUS = ("works", "broken", "untested")
 
 _TOP_KEYS = ("schema_version", "match", "requires_local_build", "launch",
              "sampling", "backend_hint", "notes", "source",
-             "engines", "status")
+             "engines", "status", "display_name")
 _LAUNCH_KEYS = ("extra_args", "ngl")
 _SAMPLING_KEYS = ("temp", "repeat_penalty", "max_tokens_default", "think_default")
-_ENGINE_KEYS = ("launch", "requires_local_build", "backend_hint", "status", "notes")
+_ENGINE_KEYS = ("launch", "requires_local_build", "backend_hint", "status", "notes",
+                "display_name")
 
 # 内置兜底档案：models.d/ 整个丢失时也不至于让已知的坑复现
 # （zaya 的批量 prefill 会被 Q8_K 量化台阶放大，见 STAGE1_NPU.md 里程碑 18）。
@@ -127,6 +130,9 @@ def validate_profile(p, origin="<submission>"):
                 _check_status(sec["status"], f"engines.'{name}'")
             if "requires_local_build" in sec and not isinstance(sec["requires_local_build"], bool):
                 raise ValueError(f"engines.'{name}'.requires_local_build 必须是布尔")
+            if "display_name" in sec and not (isinstance(sec["display_name"], str)
+                                              and sec["display_name"].strip()):
+                raise ValueError(f"engines.'{name}'.display_name 必须是非空字符串")
             if "backend_hint" in sec and sec["backend_hint"] not in KNOWN_BACKENDS:
                 raise ValueError(f"engines.'{name}'.backend_hint '{sec['backend_hint']}' 不是已知后端")
     if "sampling" in p:
@@ -146,6 +152,8 @@ def validate_profile(p, origin="<submission>"):
                          f"（{'/'.join(KNOWN_BACKENDS)}）")
     if "notes" in p and not isinstance(p["notes"], str):
         raise ValueError("notes 必须是字符串")
+    if "display_name" in p and not (isinstance(p["display_name"], str) and p["display_name"].strip()):
+        raise ValueError("display_name 必须是非空字符串")
     if "source" in p and not isinstance(p["source"], dict):
         raise ValueError("source 必须是对象")
 
@@ -166,9 +174,10 @@ def engine_view(profile, engine="llama_cpp"):
         "backend_hint": profile.get("backend_hint"),
         "status": profile.get("status", "untested"),
         "notes": profile.get("notes", ""),
+        "display_name": profile.get("display_name"),
     }
     sec = (profile.get("engines") or {}).get(engine) or {}
-    for k in ("requires_local_build", "backend_hint", "status"):
+    for k in ("requires_local_build", "backend_hint", "status", "display_name"):
         if k in sec:
             out[k] = sec[k]
     if "launch" in sec:

@@ -14,8 +14,8 @@ import sys, os, json, argparse
 
 # ★ 只依赖 adapt_schema（与 draco 共用同一份 schema 实现）—— 本文件可原样拷进公开
 #   仓库独立运行，不需要引擎在场。仓库里它俩放在同一目录（release/）。
-for _p in (os.path.dirname(os.path.abspath(__file__)),
-           os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")):
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _p in (_HERE, os.path.join(_HERE, ".."), os.path.join(_HERE, "..", "src")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 import adapt_schema  # noqa: E402

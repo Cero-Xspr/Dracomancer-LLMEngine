@@ -1,6 +1,9 @@
 {
   "schema_version": 2,
-  "match": { "arch": "falcon-h1", "max_size_gb": 2.0 },
+  "match": {
+    "arch": "falcon-h1",
+    "max_size_gb": 2.0
+  },
   "engines": {
     "llama_cpp": {
       "backend_hint": "cpu",
@@ -12,7 +15,15 @@
       "notes": "自研引擎尚未实现 falcon-h1 架构（这是 Tier 2 候选：混合 SSM + 注意力）。"
     }
   },
-  "sampling": { "repeat_penalty": 1.1 },
+  "sampling": {
+    "repeat_penalty": 1.1
+  },
   "notes": "Falcon-H1-0.5B-Instruct（Q4_K_M，tiiuae/Falcon-H1-0.5B-Instruct-GGUF）：混合架构（Mamba-2 类 SSM + 注意力），llama.cpp 支持该架构。另注：本 GGUF 的 general.name 是无意义的 \"Original\"，draco list 里显示成 \"Original\"（已知 UX 问题，待注册表支持显示名覆盖）。证据：selfcheck JSON（arch=falcon-h1，2026-09-13）。",
-  "source": { "author": "maintainer", "date": "2026-09-13", "issue": null, "selfcheck_ref": "selfcheck:falcon-h1:cpu+iGPU" }
+  "source": {
+    "author": "maintainer",
+    "date": "2026-09-13",
+    "issue": null,
+    "selfcheck_ref": "selfcheck:falcon-h1:cpu+iGPU"
+  },
+  "display_name": "Falcon-H1 0.5B Instruct"
 }

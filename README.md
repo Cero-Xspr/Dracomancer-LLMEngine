@@ -13,11 +13,29 @@ Dracomancer 是一个自研的 **GGUF 量化推理引擎**（端侧优先：内�
 | 路径 | 作用 |
 |---|---|
 | `AGENT_ADAPTER.md` | **入口**：给 agent（或人）的适配指南——决策树、schema、自检、提交流程 |
-| `adapt_schema.py` | 档案 schema 的**唯一**实现（独立可跑，只依赖标准库） |
 | `models.d/` | 注册表本体：每个 `*.json` 是一份模型档案 |
+| `src/draco.py` | 启动器 / 聊天 CLI：`list` `chat` `serve` `perf` `selfcheck` `caps` `tune` |
+| `src/adapt_schema.py` | 档案 schema 的**唯一**实现（只依赖标准库） |
+| `src/gguf_probe.py` | **能力探针**：加载之前静态判定（类型被移除 / 架构未实现 / 可能可以） |
+| `src/hwprobe.py` | 功率传感器按 name+label 定位（不按 hwmon 编号——编号会变） |
 | `release/validate_submission.py` | 提交校验器（schema/白名单 + 可选 GGUF 匹配核对） |
-| `.github/ISSUE_TEMPLATE/` | 「模型适配」issue 表单 |
-| `.github/workflows/` | 自动校验 bot（只做 schema 级过滤，不替代人工复核） |
+| `.github/` | 「模型适配」issue 表单 + 自动校验 bot（只做 schema 级过滤，不替代人工复核） |
+
+### 三个诊断命令
+
+| 命令 | 管什么 | 要装载模型吗 |
+|---|---|---|
+| `draco.py caps` | **能不能加载**（静态：类型被移除/架构未实现） | 不用，秒级 |
+| `draco.py selfcheck` | **跑起来行为对不对**（指纹/健康问句/速度） | 要 |
+| `draco.py tune` | **参数哪个好**（小配置空间实测，按 tok/s 与 J/token 双口径排序，带缓存） | 要 |
+
+三者互补：`caps` 看不了数值问题，`tune` 的能耗口径需要机器安静，`selfcheck` 是最终判据。
+
+### 路径配置
+
+默认路径是本机布局；别人的机器用环境变量覆盖，无需改代码：
+`DRACO_GGUF_DIRS`（模型目录，冒号分隔）、`DRACO_LLAMA_ROOT`（llama.cpp 发布包）、
+`DRACO_LOCAL_BASE`（自研构建/源码树）、`DRACO_FLM_DIR`（FastFlowLM，npu 后端）。
 
 ## 三档适配（为什么是"参数文件"，不是"代码"）
 
@@ -56,7 +74,7 @@ Dracomancer 是一个自研的 **GGUF 量化推理引擎**（端侧优先：内�
 
 ## 许可证
 
-**待定**（未声明即保留所有权利）。在明确之前，请勿假设任何使用许可。
+**MIT** —— 见 [`LICENSE`](LICENSE)。
 
 ## 参考硬件
 
