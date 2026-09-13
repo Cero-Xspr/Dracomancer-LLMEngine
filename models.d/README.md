@@ -13,6 +13,8 @@
 | 文件 | 架构 | 要点 |
 |---|---|---|
 | `zaya.json` | `zaya` | 需本地构建；必须 `-ub 1`（逐 token prefill） |
+| `falcon-h1.json` | `falcon-h1` | 混合 SSM；**推荐 CPU**（iGPU 在此架构上丢可复现性） |
+| `bitnet.json` | `bitnet` | **负结果记录**：官方 GGUF 的量化类型已被当前 llama.cpp 移除，加载不了 |
 
 维护者内测期间（2026-09-13）只收维护者自己写的档案；社区提交走 GitHub issue
 （模板见 `../release/`），人工审核后由维护者落进本目录。

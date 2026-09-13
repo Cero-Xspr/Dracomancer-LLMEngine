@@ -78,7 +78,7 @@ draco.py list 能看到它吗？
 | `launch.extra_args` | 追加到 llama-server 命令行；用户 `--extra` 在其后可覆盖 | 字符串数组，如 `["-ub","1"]` |
 | `launch.ngl` | 覆盖后端默认 `-ngl` | `"0"` / `"99"` |
 | `sampling.*` | chat 的默认采样（只补用户没显式给的） | 数值型 + `think_default` 布尔 |
-| `backend_hint` | list 显示的建议后端 | `cpu`/`igpu`/`local`/`npu` |
+| `backend_hint` | **默认后端**（用户没给 `-b` 时生效）+ list 显示的建议 | `cpu`/`igpu`/`local`/`npu` |
 
 ## 4. Tier 2：新架构的「适配档案」
 
