@@ -45,7 +45,7 @@ _TOP_KEYS = ("schema_version", "match", "requires_local_build", "launch",
 _LAUNCH_KEYS = ("extra_args", "ngl")
 _SAMPLING_KEYS = ("temp", "repeat_penalty", "max_tokens_default", "think_default")
 _ENGINE_KEYS = ("launch", "requires_local_build", "backend_hint", "status", "notes",
-                "display_name")
+                "display_name", "selfcheck_ref")
 
 # 内置兜底档案：models.d/ 整个丢失时也不至于让已知的坑复现
 # （zaya 的批量 prefill 会被 Q8_K 量化台阶放大，见 STAGE1_NPU.md 里程碑 18）。
@@ -130,6 +130,8 @@ def validate_profile(p, origin="<submission>"):
                 _check_status(sec["status"], f"engines.'{name}'")
             if "requires_local_build" in sec and not isinstance(sec["requires_local_build"], bool):
                 raise ValueError(f"engines.'{name}'.requires_local_build 必须是布尔")
+            if "selfcheck_ref" in sec and not isinstance(sec["selfcheck_ref"], str):
+                raise ValueError(f"engines.'{name}'.selfcheck_ref 必须是字符串")
             if "display_name" in sec and not (isinstance(sec["display_name"], str)
                                               and sec["display_name"].strip()):
                 raise ValueError(f"engines.'{name}'.display_name 必须是非空字符串")
