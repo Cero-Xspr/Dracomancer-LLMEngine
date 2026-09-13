@@ -1,0 +1,70 @@
+name: 模型适配（Model adaptation）
+description: 提交一份模型适配档案（参数文件），或一份新架构的适配探路报告
+title: "[adapt] <模型名 / 架构名>"
+labels: ["model-adaptation"]
+body:
+  - type: dropdown
+    id: tier
+    attributes:
+      label: 适配档位
+      description: |
+        Tier 1 = 已知架构的调优/参数档案（models.d/*.json 的内容）。
+        Tier 2 = llama.cpp 不支持的新架构的「适配档案」（张量清单/hparams/结构伪代码）。
+        拿不准就选 Tier 1，维护者会改标。
+      options:
+        - "Tier 1: 参数档案"
+        - "Tier 2: 新架构探路报告"
+    validations:
+      required: true
+  - type: input
+    id: model_source
+    attributes:
+      label: 模型来源
+      description: HF repo / 下载页 / GGUF 文件名（不要贴权重本体）
+      placeholder: "例如 https://huggingface.co/<org>/<repo>（Q4_K_M）"
+    validations:
+      required: true
+  - type: textarea
+    id: profile_json
+    attributes:
+      label: 档案 JSON（Tier 1 必填）
+      description: 完整的 models.d/*.json 内容。schema 见 AGENT_ADAPTER.md §3
+      placeholder: |
+        ```json
+        { "schema_version": 1, "match": { "arch": "..." }, ... }
+        ```
+    validations:
+      required: false
+  - type: textarea
+    id: dossier
+    attributes:
+      label: 适配档案（Tier 2 必填）
+      description: AGENT_ADAPTER.md §4 的 7 项：架构标识/张量清单/hparams/结构伪代码/跨 token 状态/chat 模板/证据
+    validations:
+      required: false
+  - type: textarea
+    id: selfcheck_json
+    attributes:
+      label: selfcheck 结果（Tier 1 必填）
+      description: `python3 draco.py selfcheck -m <模型> -b <后端> --json out.json` 的 JSON 全文
+      placeholder: |
+        ```json
+        { "tool": "draco selfcheck", ... }
+        ```
+    validations:
+      required: false
+  - type: textarea
+    id: notes
+    attributes:
+      label: 补充说明
+      description: 踩坑、失败现象、你试过但没写进档案的东西
+  - type: checkboxes
+    id: rules
+    attributes:
+      label: 提交规则确认
+      options:
+        - label: 我只提交了数据文件与运行结果，没有提交可执行代码改动
+        - label: 档案里的参数我都在本机用 selfcheck 验证过
+        - label: 我没有上传权重文件/二进制/base64 数据块
+    validations:
+      required: true

@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "match": { "arch": "zaya" },
+  "requires_local_build": true,
+  "launch": { "extra_args": ["-ub", "1"] },
+  "backend_hint": "local",
+  "sampling": { "think_default": false },
+  "notes": "ZAYA1（CCA+MoE 自写架构）：官方二进制没有实现，必须用本地构建；必须逐 token prefill（-ub 1）——批量 prefill 会被 Q8_K 量化台阶放大成 1e-3 级跳变，-ub 16 起 prompt 编码直接崩（实测 -ub 16 输出乱码、-ub 32/64 幻觉出没给过的问题；根因与曲线见 STAGE1_NPU.md 里程碑 18）。本地构建带 Vulkan 时自动 -ngl 99 上 iGPU。维护者内测档案（2026-09-13）。",
+  "source": { "author": "maintainer", "date": "2026-09-13", "issue": null, "selfcheck_ref": null }
+}
