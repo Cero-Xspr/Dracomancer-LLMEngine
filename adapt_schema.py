@@ -17,60 +17,118 @@ import os
 import struct
 import sys
 
-PROFILE_SCHEMA_VERSION = 1
+PROFILE_SCHEMA_VERSION = 2
+# v1 → v2 的差别（**v1 永远继续有效**）：
+#   · 新增 `engines`：按引擎分段（llama_cpp / dracomancer），顶层字段成为默认值；
+#   · 新增 `status`：works / broken / untested —— `broken` 是**负结果**的正式位置
+#     （参数救不了的情况，例如 BitNet 的量化类型被引擎移除）；
+#   · `match.arch` 可以是字符串**或字符串数组**（同一架构在不同 GGUF 里写法不同）。
 
 # 已知后端名（backend_hint 只能取其中之一）。与 draco.BACKENDS 的键保持一致；
 # 这里写死是为了让本模块不依赖 draco（拿一份就能独立校验）。
 KNOWN_BACKENDS = ("cpu", "igpu", "local", "npu")
 
+# 已知引擎。★ 本项目有**两套栈**，档案必须说清是在哪套上得到的结论：
+#   llama_cpp    —— llama.cpp 的 llama-server（draco 的 chat/serve 现在走的就是它）
+#   dracomancer  —— 我们自研的那套（m4f_v5 / ling_engine / smol_engine / zaya_gguf + HIP/NPU）
+# 混着写会把"在 A 上验证过的参数"当成"对 B 也成立"。
+KNOWN_ENGINES = ("llama_cpp", "dracomancer")
+
+# 引擎视角下的状态。broken 是**负结果**的正式位置（参数档案救不了的情况）。
+KNOWN_STATUS = ("works", "broken", "untested")
+
 _TOP_KEYS = ("schema_version", "match", "requires_local_build", "launch",
-             "sampling", "backend_hint", "notes", "source")
+             "sampling", "backend_hint", "notes", "source",
+             "engines", "status")
 _LAUNCH_KEYS = ("extra_args", "ngl")
 _SAMPLING_KEYS = ("temp", "repeat_penalty", "max_tokens_default", "think_default")
+_ENGINE_KEYS = ("launch", "requires_local_build", "backend_hint", "status", "notes")
 
 # 内置兜底档案：models.d/ 整个丢失时也不至于让已知的坑复现
 # （zaya 的批量 prefill 会被 Q8_K 量化台阶放大，见 STAGE1_NPU.md 里程碑 18）。
 BUILTIN_PROFILES = [
     {
-        "schema_version": 1,
+        "schema_version": 2,
         "match": {"arch": "zaya"},
-        "requires_local_build": True,
-        "launch": {"extra_args": ["-ub", "1"]},
-        "backend_hint": "local",
+        "engines": {"llama_cpp": {"requires_local_build": True, "backend_hint": "local",
+                                  "launch": {"extra_args": ["-ub", "1"]}, "status": "works"}},
         "notes": "内置兜底档案（models.d/zaya.json 丢失时生效）",
         "_file": "(内置)",
     },
 ]
 
 
+def _check_status(v, where):
+    if v not in KNOWN_STATUS:
+        raise ValueError(f"{where} 的 status '{v}' 不是已知值（{'/'.join(KNOWN_STATUS)}）")
+
+
+def _check_launch(l, where):
+    if not isinstance(l, dict):
+        raise ValueError(f"{where} 必须是对象")
+    for k in l:
+        if k not in _LAUNCH_KEYS:
+            raise ValueError(f"{where}.'{k}' 不在白名单（允许：extra_args/ngl）")
+    if "extra_args" in l:
+        ea = l["extra_args"]
+        if not isinstance(ea, list) or not all(isinstance(x, str) for x in ea):
+            raise ValueError(f"{where}.extra_args 必须是字符串数组")
+
+
 def validate_profile(p, origin="<submission>"):
-    """校验档案结构。不合法就 raise ValueError（调用方带上文件名报错）。"""
+    """校验档案结构。不合法就 raise ValueError（调用方带上文件名报错）。
+
+    v1 与 v2 都接受：v1 = 只有顶层字段（引擎未分段）；v2 = 可加 `engines` 按引擎分段
+    与 `status`。**v1 档案永远继续有效**（顶层字段就是"未列出的引擎的默认值"）。"""
     if not isinstance(p, dict):
         raise ValueError("顶层必须是对象")
-    if p.get("schema_version") != PROFILE_SCHEMA_VERSION:
-        raise ValueError(f"schema_version 必须是 {PROFILE_SCHEMA_VERSION}")
+    ver = p.get("schema_version")
+    if ver not in (1, PROFILE_SCHEMA_VERSION):
+        raise ValueError(f"schema_version 必须是 1 或 {PROFILE_SCHEMA_VERSION}（收到 {ver!r}）")
     m = p.get("match")
     if not isinstance(m, dict) or not m.get("arch"):
         raise ValueError("match.arch 必填（GGUF 的 general.architecture）")
     for k in m:
         if k not in ("arch", "name_contains", "max_size_gb"):
             raise ValueError(f"match.'{k}' 不在白名单（允许：arch/name_contains/max_size_gb）")
+    # arch 可以是字符串，也可以是字符串数组（同一架构在不同 GGUF 里写法不同，例如
+    # llama.cpp 认 "bitnet" 而某些包写 "bitnet-b1.58"）。
+    a = m["arch"]
+    if isinstance(a, list):
+        if not a or not all(isinstance(x, str) and x for x in a):
+            raise ValueError("match.arch 的数组必须非空且元素是非空字符串")
+    elif not isinstance(a, str):
+        raise ValueError("match.arch 必须是字符串或字符串数组")
     for k in p:
         if k not in _TOP_KEYS:
             raise ValueError(f"未知字段 '{k}'（白名单外一律拒绝）")
+    if "status" in p:
+        _check_status(p["status"], "顶层")
     if "requires_local_build" in p and not isinstance(p["requires_local_build"], bool):
         raise ValueError("requires_local_build 必须是布尔")
     if "launch" in p:
-        l = p["launch"]
-        if not isinstance(l, dict):
-            raise ValueError("launch 必须是对象")
-        for k in l:
-            if k not in _LAUNCH_KEYS:
-                raise ValueError(f"launch.'{k}' 不在白名单（允许：extra_args/ngl）")
-        if "extra_args" in l:
-            ea = l["extra_args"]
-            if not isinstance(ea, list) or not all(isinstance(x, str) for x in ea):
-                raise ValueError("launch.extra_args 必须是字符串数组")
+        _check_launch(p["launch"], "launch")
+    if "engines" in p:
+        es = p["engines"]
+        if not isinstance(es, dict) or not es:
+            raise ValueError("engines 必须是非空对象")
+        for name, sec in es.items():
+            if name not in KNOWN_ENGINES:
+                raise ValueError(f"engines.'{name}' 不是已知引擎（{'/'.join(KNOWN_ENGINES)}）")
+            if not isinstance(sec, dict):
+                raise ValueError(f"engines.'{name}' 必须是对象")
+            for k in sec:
+                if k not in _ENGINE_KEYS:
+                    raise ValueError(f"engines.'{name}'.'{k}' 不在白名单"
+                                     f"（允许：{', '.join(_ENGINE_KEYS)}）")
+            if "launch" in sec:
+                _check_launch(sec["launch"], f"engines.'{name}'.launch")
+            if "status" in sec:
+                _check_status(sec["status"], f"engines.'{name}'")
+            if "requires_local_build" in sec and not isinstance(sec["requires_local_build"], bool):
+                raise ValueError(f"engines.'{name}'.requires_local_build 必须是布尔")
+            if "backend_hint" in sec and sec["backend_hint"] not in KNOWN_BACKENDS:
+                raise ValueError(f"engines.'{name}'.backend_hint '{sec['backend_hint']}' 不是已知后端")
     if "sampling" in p:
         s = p["sampling"]
         if not isinstance(s, dict):
@@ -90,6 +148,34 @@ def validate_profile(p, origin="<submission>"):
         raise ValueError("notes 必须是字符串")
     if "source" in p and not isinstance(p["source"], dict):
         raise ValueError("source 必须是对象")
+
+
+def engine_view(profile, engine="llama_cpp"):
+    """把档案摊平成**某个引擎视角**的扁平视图，供调用方直接用。
+
+    规则（简单且少意外）：
+      · 顶层 `launch`/`requires_local_build`/`backend_hint`/`status` = **默认值**，
+        适用于没有在 `engines` 里单独列出的引擎；
+      · `engines.<engine>` 里出现的字段**按字段覆盖**默认（`launch.extra_args` 与
+        `launch.ngl` 各自独立覆盖 —— 只写一个不会把另一个清掉）。
+    这样 v1 档案（没有 engines）在任意引擎视角下都返回它原本的语义。
+    """
+    out = {
+        "launch": dict(profile.get("launch") or {}),
+        "requires_local_build": bool(profile.get("requires_local_build", False)),
+        "backend_hint": profile.get("backend_hint"),
+        "status": profile.get("status", "untested"),
+        "notes": profile.get("notes", ""),
+    }
+    sec = (profile.get("engines") or {}).get(engine) or {}
+    for k in ("requires_local_build", "backend_hint", "status"):
+        if k in sec:
+            out[k] = sec[k]
+    if "launch" in sec:
+        out["launch"] = {**out["launch"], **sec["launch"]}
+    if "notes" in sec:
+        out["notes"] = sec["notes"]
+    return out
 
 
 def load_profiles(dirpath):
@@ -126,7 +212,11 @@ def profile_for(arch, name, size_bytes, profiles):
     hits = []
     for p in profiles:
         m = p.get("match") or {}
-        if m.get("arch") != arch:
+        a = m.get("arch")
+        if isinstance(a, list):
+            if arch not in a:
+                continue
+        elif a != arch:
             continue
         sub = m.get("name_contains")
         if sub and sub.lower() not in (name or "").lower():

@@ -1,8 +1,18 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "match": { "arch": "falcon-h1", "max_size_gb": 2.0 },
-  "backend_hint": "cpu",
+  "engines": {
+    "llama_cpp": {
+      "backend_hint": "cpu",
+      "status": "works",
+      "notes": "推荐 CPU 而不是 iGPU，理由是实测（draco.py selfcheck，同一台机）：CPU 两轮指纹一致、decode 90.9 / prefill 205.8 tok/s；iGPU(Vulkan) **两轮不一致**（贪心+固定 seed 下同一 prompt 给出不同答案）、decode ~95~107 / prefill ~157~183。即 iGPU 在 decode 上只快一点、prefill 反而更慢，却丢掉可复现性 ⇒ 不值得。同一模型 CPU 一致 / iGPU 不一致这一点，在与 draco 的预热请求（形状与真实请求对齐）排除'进程第一次解码'效应后仍然成立。健康问句 3/3 通过（Paris / 2 / 1-5）。"
+    },
+    "dracomancer": {
+      "status": "untested",
+      "notes": "自研引擎尚未实现 falcon-h1 架构（这是 Tier 2 候选：混合 SSM + 注意力）。"
+    }
+  },
   "sampling": { "repeat_penalty": 1.1 },
-  "notes": "Falcon-H1-0.5B-Instruct（Q4_K_M，tiiuae/Falcon-H1-0.5B-Instruct-GGUF）：混合架构（Mamba-2 类 SSM + 注意力），llama.cpp 支持该架构。推荐 CPU 而不是 iGPU，理由是实测（draco.py selfcheck，同一台机）：CPU 两轮指纹一致、decode 90.9 / prefill 205.8 tok/s；iGPU(Vulkan) **两轮不一致**（贪心+固定 seed 下同一 prompt 给出不同答案）、decode ~95~107 / prefill ~157~183。即 iGPU 在 decode 上只快一点、prefill 反而更慢，却丢掉可复现性 ⇒ 不值得。同一模型 CPU 一致、iGPU 不一致这一点已用 draco 的预热请求排除'进程第一次解码'效应后仍然成立。健康问句 3/3 通过（Paris / 2 / 1-5）。另注：本 GGUF 的 general.name 是无意义的 \"Original\"，draco list 里显示成 \"Original\"（已知 UX 问题，待注册表支持显示名覆盖）。证据：selfcheck JSON（arch=falcon-h1，2026-09-13）。",
+  "notes": "Falcon-H1-0.5B-Instruct（Q4_K_M，tiiuae/Falcon-H1-0.5B-Instruct-GGUF）：混合架构（Mamba-2 类 SSM + 注意力），llama.cpp 支持该架构。另注：本 GGUF 的 general.name 是无意义的 \"Original\"，draco list 里显示成 \"Original\"（已知 UX 问题，待注册表支持显示名覆盖）。证据：selfcheck JSON（arch=falcon-h1，2026-09-13）。",
   "source": { "author": "maintainer", "date": "2026-09-13", "issue": null, "selfcheck_ref": "selfcheck:falcon-h1:cpu+iGPU" }
 }

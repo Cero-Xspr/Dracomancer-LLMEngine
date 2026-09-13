@@ -1,7 +1,17 @@
 {
-  "schema_version": 1,
-  "match": { "arch": "bitnet" },
-  "backend_hint": "cpu",
-  "notes": "⚠ 已知不可用（负结果记录，2026-09-13 实测）。BitNet-b1.58-2B-4T（三值权重，架构标识很特别）在 llama.cpp b10819 上**加载不了**，两道独立的墙：①官方 GGUF microsoft/bitnet-b1.58-2B-4T-gguf 的 general.architecture 是 'bitnet-b1.58'，而 llama.cpp 认的名字是 'bitnet'；②更硬的墙——该包的 210 个权重张量类型是 GGML_TYPE_IQ4_NL_4_4(=36)，而这个类型在当前 llama.cpp 里已被**移除**（ggml.h 里枚举被注释掉、ggml.c 里名字直接写着 'TYPE_IQ4_NL_4_4 REMOVED, use IQ4_NL with runtime repacking'），加载即报 'has 6912 elements per row, not a multiple of block size (0)'。⇒ 参数档案救不了它（这不是启动参数问题），出路只有：用当前版转换器从 HF 原权重（microsoft/bitnet-b1.58-2B-4T）重转，或等上游重发新包。注意我们的转换器目前**没有**三值权重路径（grep 无 bitnet 处理）⇒ 重转大概率得到 bf16 而非 1.58bit，需先补转换器。结论：Tier 2 级的'产物与引擎版本不兼容'，记录在此避免重复踩。",
+  "schema_version": 2,
+  "match": { "arch": ["bitnet", "bitnet-b1.58"] },
+  "engines": {
+    "llama_cpp": {
+      "status": "broken",
+      "backend_hint": "cpu",
+      "notes": "⚠ 已实测不可用（负结果，2026-09-13）。官方包 microsoft/bitnet-b1.58-2B-4T-gguf 在 llama.cpp b10819 上加载不了，两道独立的墙：①该 GGUF 的 general.architecture 写的是 'bitnet-b1.58'，而 llama.cpp 认的名字是 'bitnet'；②更硬的墙——210 个权重张量的类型是 GGML_TYPE_IQ4_NL_4_4(=36)，该类型在当前 llama.cpp 里**已被移除**（ggml.h 里枚举被注释掉、ggml.c 里名字直写 'TYPE_IQ4_NL_4_4 REMOVED, use IQ4_NL with runtime repacking'），加载即报 'has 6912 elements per row, not a multiple of block size (0)'。⇒ 参数档案救不了它（这不是启动参数问题）。出路：用当前版转换器从 HF 原权重（microsoft/bitnet-b1.58-2B-4T）重转，或等上游重发新包。注意我们的转换器目前**没有**三值权重路径（grep 无 bitnet 处理）⇒ 重转大概率得到 bf16 而非 1.58bit，需先补转换器。"
+    },
+    "dracomancer": {
+      "status": "untested",
+      "notes": "自研引擎未实现 bitnet 架构；且三值权重（TQ1_0/TQ2_0 那一族）需要自己的反量化内核。"
+    }
+  },
+  "notes": "BitNet b1.58 2B4T（三值权重）。记录在此的目的是**避免重复踩**：这份是 Tier 2 级的'产物与引擎版本不兼容'，不是参数能解决的。",
   "source": { "author": "maintainer", "date": "2026-09-13", "issue": null, "selfcheck_ref": null }
 }

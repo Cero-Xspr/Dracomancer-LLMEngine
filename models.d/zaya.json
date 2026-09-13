@@ -1,10 +1,20 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "match": { "arch": "zaya" },
-  "requires_local_build": true,
-  "launch": { "extra_args": ["-ub", "1"] },
-  "backend_hint": "local",
+  "engines": {
+    "llama_cpp": {
+      "requires_local_build": true,
+      "backend_hint": "local",
+      "launch": { "extra_args": ["-ub", "1"] },
+      "status": "works",
+      "notes": "官方预编译二进制没有 zaya 实现，必须本地构建（build-vk 带 Vulkan 时自动 -ngl 99 上 iGPU）。必须逐 token prefill（-ub 1）：批量 prefill 会被 Q8_K 量化台阶放大成 1e-3 级跳变，-ub 16 起 prompt 编码直接崩（实测 -ub 16 输出乱码、-ub 32/64 幻觉出没给过的问题）。根因与退化曲线见 STAGE1_NPU.md 里程碑 18。"
+    },
+    "dracomancer": {
+      "status": "works",
+      "notes": "自研引擎与 llama.cpp 是两条独立实现（m6_engine 里 ZAYA 前向已与精确 fp32 对账，CCA+MoE 路由 cos=1.0）。★ 这里的启动参数与 llama_cpp 那套**不通用**：`-ub 1` 是 llama.cpp 的 flag，自研引擎没有对应概念，别照搬。"
+    }
+  },
   "sampling": { "think_default": false },
-  "notes": "ZAYA1（CCA+MoE 自写架构）：官方二进制没有实现，必须用本地构建；必须逐 token prefill（-ub 1）——批量 prefill 会被 Q8_K 量化台阶放大成 1e-3 级跳变，-ub 16 起 prompt 编码直接崩（实测 -ub 16 输出乱码、-ub 32/64 幻觉出没给过的问题；根因与曲线见 STAGE1_NPU.md 里程碑 18）。本地构建带 Vulkan 时自动 -ngl 99 上 iGPU。维护者内测档案（2026-09-13）。",
+  "notes": "ZAYA1-8B：CCA（卷积注意力）+ MLP 路由 MoE 的交替混合架构（80 blk = 40 注意力 + 40 MoE）。维护者内测档案（2026-09-13 起为 schema v2）。",
   "source": { "author": "maintainer", "date": "2026-09-13", "issue": null, "selfcheck_ref": null }
 }

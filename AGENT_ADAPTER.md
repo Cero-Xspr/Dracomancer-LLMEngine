@@ -19,7 +19,10 @@
 draco.py list 能看到它吗？
 ├─ 看不到（GGUF 损坏/不在扫描目录）→ 修路径或换权重，不用提交
 ├─ 后端列是 "—"（llama.cpp 不支持该架构）
-│   → Tier 2：真·新架构。产出「适配档案」（§4），交 issue 等维护者实现 C++。
+│   → Tier 2：真·新架构。产出「适配档案」（§4），交 issue 等维护者实现。
+│     ★ 实现分两处、难度不同，请在报告里说清你希望走哪边：
+│        · 进 llama.cpp（写 src/models/<arch>.cpp）——让 draco 的 chat/serve 能跑；
+│        · 进自研引擎（自己写内核）——项目主线，工作量更大。
 │     同时可以交一份 Tier 1 档案草案（你探明的参数），维护者实现时会用上。
 └─ 能看到、能跑
     ├─ 默认参数就很好 → Tier 0，什么都不用交
@@ -41,39 +44,38 @@ draco.py list 能看到它吗？
 ⚠ 如果某个参数改变后**健康问句从通过变失败**，那不是"调优"，是"正确性红线"——
 把安全值写进档案，并在 notes 里记录失败现象（这比速度数字有价值得多）。
 
-## 3. Tier 1：档案 JSON（schema v1）
+## 3. Tier 1：档案 JSON（schema **v2**；v1 档案永远继续有效）
 
 存成 `models.d/<arch 或模型名>.json`，字段白名单**外的任何键都会被拒绝**：
 
 ```json
 {
-  "schema_version": 1,
-  "match": {
-    "arch": "zaya",
-    "name_contains": "可选：general.name 子串（不区分大小写）",
-    "max_size_gb": 6.0
+  "schema_version": 2,
+  "match": { "arch": "zaya" },
+  "engines": {
+    "llama_cpp": {
+      "requires_local_build": true,
+      "backend_hint": "local",
+      "launch": { "extra_args": ["-ub", "1"], "ngl": "99" },
+      "status": "works",
+      "notes": "在 llama.cpp 这条链上的结论"
+    },
+    "dracomancer": {
+      "status": "untested",
+      "notes": "自研引擎上还没试过；★ 启动参数与上面**不通用**，别照搬"
+    }
   },
-  "requires_local_build": false,
-  "launch": {
-    "extra_args": ["-ub", "1"],
-    "ngl": "99"
-  },
-  "sampling": {
-    "temp": 0.7,
-    "repeat_penalty": 1.1,
-    "max_tokens_default": 2048,
-    "think_default": false
-  },
-  "backend_hint": "local",
+  "sampling": { "temp": 0.7, "repeat_penalty": 1.1, "think_default": false },
   "notes": "人类可读：为什么是这些值、踩过什么坑（重点写！）",
-  "source": { "author": "你的 GitHub ID", "date": "2026-09-13",
-              "issue": null, "selfcheck_ref": null }
+  "source": { "author": "你的 GitHub ID", "date": "2026-09-13" }
 }
 ```
 
 | 字段 | 含义 | 约束 |
 |---|---|---|
-| `match.arch` | GGUF 的 `general.architecture` **精确匹配**，必填 | 用 `draco.py list` 里显示的架构名 |
+| `match.arch` | GGUF 的 `general.architecture` 精确匹配；**可以是字符串或字符串数组**（同一架构在不同 GGUF 里写法可能不同，例如引擎认 `bitnet` 而某些包写 `bitnet-b1.58`） | 用 `draco.py list` 里显示的架构名 |
+| `engines` | **按引擎分段**（v2 新增）。本项目有**两套栈**：`llama_cpp`（llama.cpp 的 server，draco 的 chat/serve 走这条）与 `dracomancer`（自研引擎）。顶层字段是"未列出的引擎的默认值"；段内字段**按字段覆盖**默认 | 键只能是这两个 |
+| `status` | 该引擎视角下的结论：`works` / `broken` / `untested`。★ **`broken` 是负结果的正式位置**——参数救不了的情况（例如量化类型被引擎移除）写在这里，draco 会直接给出你 notes 里的理由，而不是让人对着引擎报错猜 | 枚举 |
 | `requires_local_build` | 官方预编译二进制没有该架构实现，必须用项目本地构建 | 只有维护者确认后才为 true |
 | `launch.extra_args` | 追加到 llama-server 命令行；用户 `--extra` 在其后可覆盖 | 字符串数组，如 `["-ub","1"]` |
 | `launch.ngl` | 覆盖后端默认 `-ngl` | `"0"` / `"99"` |
@@ -82,7 +84,8 @@ draco.py list 能看到它吗？
 
 ## 4. Tier 2：新架构的「适配档案」
 
-llama.cpp 不认识的架构需要维护者写 C++ 计算图——**这是你来探路，不是你来写码**。
+引擎不认识的架构需要维护者写代码——**这是你来探路，不是你来写码**。
+（两处可选：进 llama.cpp 让 chat 链跑起来，或进自研引擎；报告里请说明偏好与理由。）
 把下面每一项探明，放进 issue（这能把实现时间砍半，都是我们实测最费时间的部分）：
 
 1. **架构标识**：`general.architecture` 的确切值 + GGUF 来源（HF repo/出处）；
