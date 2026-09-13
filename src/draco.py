@@ -170,7 +170,7 @@ BACKENDS = {
         dir=os.path.dirname(os.path.abspath(__file__)),
         ngl="0",
         desc="自研引擎（m6 内核桥，OpenAI 兼容）",
-        threads_default=8,
+        threads_default=4,             # ★ 实测 135M：OMP=4 317 tok/s；默认全核 20 反而 204（小 gemv 同步开销）
     ),
 }
 
@@ -509,16 +509,20 @@ class Server:
             reason = broken_reason(model, "dracomancer")
             if reason:
                 raise SystemExit(f"'{model.name}' 在自研引擎上不可用 —— {reason}")
-            gguf_name = getattr(model, "gguf_name", model.name).lower()
-            if "smollm2" not in gguf_name:
-                raise SystemExit("自研引擎的桥目前只接了 SmolLM2（其余模型/架构待逐个对账后接线；"
-                                 " ling/zaya 走独立脚本，见 hybrid/README.md）")
             exe = os.path.join(b["dir"], "draco_engine_server.py")
             if not os.path.exists(exe):
                 raise SystemExit(f"找不到 {exe}")
             self.url = f"http://127.0.0.1:{self.port}"
+            gguf_name = getattr(model, "gguf_name", model.name).lower()
+            # ★ 引擎适配器映射（逐个对账后接入；见 models.d 各档案的 engines.dracomancer 段）
+            _ENG_MAP = (("zaya", "zaya"), ("smollm2", "smol"))
+            eng_adapter = next((e for k, e in _ENG_MAP if k in gguf_name), None)
+            if eng_adapter is None:
+                raise SystemExit("自研引擎的桥目前只接了 SmolLM2 与 ZAYA1（其余模型/架构待逐个"
+                                 "对账后接线；ling 走独立脚本，见 hybrid/README.md）")
             self.cmd = [sys.executable, exe, "--model", model.path,
-                        "--port", str(self.port), "--engine", "smol"]
+                        "--port", str(self.port), "--engine", eng_adapter,
+                        "--threads", str(threads)]
             if extra:
                 self.cmd += extra
             if verbose:
