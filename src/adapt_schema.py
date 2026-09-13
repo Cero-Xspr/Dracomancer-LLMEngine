@@ -28,7 +28,7 @@ PROFILE_SCHEMA_VERSION = 2
 
 # 已知后端名（backend_hint 只能取其中之一）。与 draco.BACKENDS 的键保持一致；
 # 这里写死是为了让本模块不依赖 draco（拿一份就能独立校验）。
-KNOWN_BACKENDS = ("cpu", "igpu", "local", "npu")
+KNOWN_BACKENDS = ("cpu", "igpu", "local", "npu", "dengine")
 
 # 已知引擎。★ 本项目有**两套栈**，档案必须说清是在哪套上得到的结论：
 #   llama_cpp    —— llama.cpp 的 llama-server（draco 的 chat/serve 现在走的就是它）

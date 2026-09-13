@@ -163,6 +163,15 @@ BACKENDS = {
         desc="NPU（FastFlowLM serve，OpenAI 兼容）",
         threads_default=8,             # NPU 上线程数无意义，仅为接口兼容
     ),
+    # ★★ 自研引擎（m5/m6 内核）的桥：draco_engine_server.py 把引擎包成 OpenAI 兼容服务。
+    #    与 llama.cpp 完全独立 —— 这是 Dracomancer 本体的直接出口（schema v2 的
+    #    engines.dracomancer 段终于有消费者了）。
+    "dengine": dict(
+        dir=os.path.dirname(os.path.abspath(__file__)),
+        ngl="0",
+        desc="自研引擎（m6 内核桥，OpenAI 兼容）",
+        threads_default=8,
+    ),
 }
 
 
@@ -319,6 +328,7 @@ class Model:
         self.arch = (m.get("general.architecture") or "?")
         self.name = (m.get("general.name") or os.path.basename(path)).strip()
         # 名字规范化：GGUF 里有的叫 "Smollm2 135M 8k Lc100K Mix1 Ep2"，太啰嗦
+        self.gguf_name = self.name       # ★ 原名保留给"选择匹配"用（display_name 只管显示）
         self.short = self.name
         self.supported = self.arch in SUPPORTED_ARCHS
         # 适配档案（models.d/*.json 命中与否）——纯数据，见 load_registry()
@@ -379,12 +389,13 @@ def profile_status(model):
     return draco_view(model).get("status", "untested")
 
 
-def broken_reason(model):
-    """档案把它标成 broken 时给出理由（否则 None）。"""
-    if profile_status(model) != "broken":
+def broken_reason(model, engine="llama_cpp"):
+    """档案把它标成 broken 时给出理由（否则 None）。engine 按视角取。"""
+    prof = getattr(model, "profile", None) or {}
+    v = engine_view(prof, engine)
+    if v.get("status") != "broken":
         return None
-    v = draco_view(model)
-    src = (getattr(model, "profile", None) or {}).get("_file", "档案")
+    src = prof.get("_file", "档案")
     return f"{src}：{v.get('notes') or '（档案未写 notes）'}"
 
 
@@ -408,7 +419,8 @@ def pick_model(ms, want):
         i = int(w)
         if 0 <= i < len(ms):
             return ms[i]
-    hits = [m for m in ms if w in m.name.lower() or w in os.path.basename(m.path).lower()]
+    hits = [m for m in ms if w in getattr(m, "gguf_name", m.name).lower()
+            or w in m.name.lower() or w in os.path.basename(m.path).lower()]
     if len(hits) == 1:
         return hits[0]
     if not hits:
@@ -490,6 +502,33 @@ class Server:
             raise SystemExit(f"'{model.name}' 在当前引擎上不可用 —— {reason}")
         b = BACKENDS[backend]
         self.port = free_port()
+        # ── 自研引擎（dengine）分支：桥接服务器 ──
+        #   ★ 守卫用 **dracomancer 视角**的 status —— 档案说这条引擎坏了就拒，
+        #     理由直接来自 notes（2026-09-13 smol 就是这样被拦下的：m6-smol 内核对账未过）。
+        if backend == "dengine":
+            reason = broken_reason(model, "dracomancer")
+            if reason:
+                raise SystemExit(f"'{model.name}' 在自研引擎上不可用 —— {reason}")
+            gguf_name = getattr(model, "gguf_name", model.name).lower()
+            if "smollm2" not in gguf_name:
+                raise SystemExit("自研引擎的桥目前只接了 SmolLM2（其余模型/架构待逐个对账后接线；"
+                                 " ling/zaya 走独立脚本，见 hybrid/README.md）")
+            exe = os.path.join(b["dir"], "draco_engine_server.py")
+            if not os.path.exists(exe):
+                raise SystemExit(f"找不到 {exe}")
+            self.url = f"http://127.0.0.1:{self.port}"
+            self.cmd = [sys.executable, exe, "--model", model.path,
+                        "--port", str(self.port), "--engine", "smol"]
+            if extra:
+                self.cmd += extra
+            if verbose:
+                print("  $ " + " ".join(self.cmd))
+            self.proc = subprocess.Popen(
+                self.cmd,
+                stdout=None if verbose else subprocess.DEVNULL,
+                stderr=subprocess.STDOUT if verbose else subprocess.DEVNULL,
+                preexec_fn=_pdeathsig)
+            return
         # ── NPU（FastFlowLM）分支：不是 llama-server，命令行完全不同 ──
         #   `flm serve <tag> --host 127.0.0.1 -p <port>`；模型加载完成**之后**才开 HTTP，
         #   所以"/v1/models 返回 200"就是就绪（见 wait_ready）。
