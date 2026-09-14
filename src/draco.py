@@ -383,7 +383,7 @@ def discover():
 # ★ 自研引擎（Darco）的适配器映射：按 GGUF 名匹配 —— 只有这份表里的模型能走 dengine。
 #   新增模型/架构必须先在 draco_engine_server.py 里写适配器并**过数值对账**，再登记到这里
 #   （见 models.d/*.json 的 engines.dracomancer 段）。
-_DENGINE_ADAPTERS = (("zaya", "zaya"), ("smollm2", "smol"))
+_DENGINE_ADAPTERS = (("zaya", "zaya"), ("smollm2", "smol"), ("ling", "ling"))
 
 
 def dengine_adapter(model):
@@ -549,7 +549,7 @@ class Server:
             self.url = f"http://127.0.0.1:{self.port}"
             eng_adapter = dengine_adapter(model)
             if eng_adapter is None:
-                raise SystemExit("自研引擎（Darco）目前只接了 SmolLM2 与 ZAYA1"
+                raise SystemExit("自研引擎（Darco）目前只接了 SmolLM2 / ZAYA1 / Ling"
                                  "（其余模型/架构待逐个过数值对账后再接线；"
                                  "清单见 draco._DENGINE_ADAPTERS 与各档案的 engines.dracomancer 段）")
             self.cmd = [sys.executable, exe, "--model", model.path,

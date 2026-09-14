@@ -1,0 +1,27 @@
+{
+  "schema_version": 2,
+  "match": {
+    "arch": "bailingmoe3"
+  },
+  "display_name": "Ling 3.0 Tiny（bailingmoe3）",
+  "engines": {
+    "llama_cpp": {
+      "backend_hint": "igpu",
+      "status": "works",
+      "notes": "iGPU 走官方 vulkan 二进制（bailingmoe3 在官方构建里有实现）。无特殊参数。"
+    },
+    "dracomancer": {
+      "backend_hint": "dengine",
+      "status": "works",
+      "notes": "自研引擎（m6 内核 bailingmoe3 路径：MLA + KDA 线性注意力 + 分组 MoE）2026-09-14 对账通过：同一渲染文本、同一串 26 个 token（分词与 llama.cpp 逐位一致），logits cos 0.998814、top-5 完全一致（16644, 1782, 92442, 4672, 480）。★ 接入要点：**Ling 的对话格式不是 ChatML**（实测渲染出 <role>SYSTEM</role>detailed thinking off<|role_end|><role>HUMAN</role>…<role>ASSISTANT</role>）⇒ 必须用 jinja2 跑模型自己的模板渲染，手工渲染必错（这就是先前把这步推迟的原因）；状态复位 = MLA 层 kcache/vcache/tlen + KDA 层 conv_state/S（都是 Python 侧缓冲的副本，memset 即可；delta-net 状态 S 是 [NH,128,128] = 1MB/层）。★ 这就是本项目『引擎主线』的里程碑：自研引擎第一次在**混合线性注意力 + MoE** 架构上对上 llama.cpp。 ★ 速度（dengine，OMP=8，3 次中位）：max_tokens=24 → 28.8、100 → 26.5、300 → 24.5 t/s（与 ZAYA 同档；两个都是约 5GB 权重）。★ 注意：Ling 开思考时**不用 <think> 标签**包思考内容（直接输出推理文本），所以 dengine 的 reasoning_content 拆分对它不生效 —— 显示上不会有 [思考] 前缀。",
+      "selfcheck_ref": "reconcile:ling:cos0.998814:top5-identical"
+    }
+  },
+  "notes": "Ling 3.0 Tiny（bailingmoe3：24 层，其中 MLA 全注意力层与 KDA 线性注意力层交织 + 分组 MoE，128 专家选 8、带共享专家）。Q4_K_M。",
+  "source": {
+    "author": "maintainer",
+    "date": "2026-09-14",
+    "issue": null,
+    "selfcheck_ref": null
+  }
+}

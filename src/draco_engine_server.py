@@ -63,7 +63,8 @@ def _load_smol():
     return dict(forward=E.forward, logits=E.logits_of_x, reset=reset,
                 encode=lambda t: TOK.encode(t, add_special_tokens=True),
                 decode=lambda ids: TOK.decode(ids), eos=EOS_ID, im_end=IM_END, max_t=MAXT,
-                system_default=DEFAULT_SYSTEM, bos=None, think_block=False, think_default=False)
+                system_default=DEFAULT_SYSTEM, bos=None, think_block=False, think_default=False,
+                render=lambda msgs, think: render_chatml_generic(msgs, think, None, DEFAULT_SYSTEM, False))
 
 
 def _load_zaya():
@@ -187,7 +188,70 @@ def _load_zaya():
     return dict(forward=forward, logits=logits, reset=reset,
                 encode=enc, decode=decode, eos=eos, im_end=im_end, max_t=MAXT,
                 system_default=None, bos=2, vsz=vsz,
-                think_block=True, think_default=True)   # ZAYA 模板默认开思考，用空 think 块关
+                think_block=True, think_default=True,   # ZAYA 模板默认开思考，用空 think 块关
+                render=lambda msgs, think: render_chatml_generic(msgs, think, None, None, True))
+
+
+def _load_ling():
+    """Ling 3.0 Tiny（bailingmoe3：MLA + KDA 线性注意力 + 分组 MoE）→ ling_engine.py。
+
+    ★ 与 smol/zaya 的关键差别：**它的对话格式不是 ChatML**
+      （实测模板渲染出 `<role>SYSTEM</role>detailed thinking off<|role_end|><role>HUMAN</role>…<|role_end|><role>ASSISTANT</role>`）
+      ⇒ 必须用 jinja2 跑模型自己的模板，手工渲染必错（这也是之前把这步推迟的原因）。
+    ★ 状态复位：MLA 层的 kcache/vcache/tlen + KDA 层的 conv_state/S（都是 Python 侧缓冲的
+      **副本**，memset 即可）。KDA 的 delta-net 状态 S 是 [NH,128,128]（1MB/层）。
+    """
+    global ENG, MAXT
+    import os
+    os.environ["MODEL"] = ARGS.model
+    os.environ.setdefault("MAXT", "1024")
+    import ling_engine as E
+    import ling_proto as LP
+    import jinja2
+    import gguf as _g
+    from transformers import AutoTokenizer
+    ENG = E
+    tk = AutoTokenizer.from_pretrained(os.path.join(BASE, "tok-ling"))
+
+    # ---- 模板与特殊 token（从 GGUF 读，jinja2 渲染）----
+    _r = _g.GGUFReader(ARGS.model)
+    _f = {t.name: t for t in _r.fields.values()}
+    _toks = [t.decode("utf-8", "replace") if isinstance(t, bytes) else str(t)
+             for t in _f["tokenizer.ggml.tokens"].contents()]
+    _vars = {}
+    for _n, _t in _f.items():
+        if _n.startswith("tokenizer.ggml.") and _n.endswith("_token_id"):
+            try:
+                _vars[_n.split(".")[-1][:-3]] = _toks[int(_t.contents())]
+            except Exception:
+                pass
+    _tpl = jinja2.Environment().from_string(_f["tokenizer.chat_template"].contents())
+
+    def render(msgs, think):
+        return _tpl.render(messages=msgs, add_generation_prompt=True,
+                           enable_thinking=(True if think is None else bool(think)), **_vars)
+
+    def reset():
+        import ctypes as ct
+        for item in E.KEEP:
+            if isinstance(item, E.M6MlaP):
+                ks = LP.KV_LORA + LP.ROT
+                ct.memset(ct.cast(item.kcache, ct.c_void_p), 0, item.max_t * ks * 4)
+                ct.memset(ct.cast(item.vcache, ct.c_void_p), 0, item.max_t * LP.KV_LORA * 4)
+                item.tlen[0] = 0
+            elif isinstance(item, E.M6KdaP):
+                ct.memset(ct.cast(item.conv_state, ct.c_void_p), 0,
+                          3 * LP.D_INNER * (LP.CONV_K - 1) * 4)
+                ct.memset(ct.cast(item.S, ct.c_void_p), 0,
+                          LP.NH * LP.KDA_HEAD * LP.KDA_HEAD * 4)
+
+    MAXT = E.MAXT
+    return dict(forward=E.forward, logits=E.logits_of_x, reset=reset,
+                encode=lambda t: tk.encode(t, add_special_tokens=False),
+                decode=lambda ids: tk.decode(ids), eos=tk.eos_token_id,
+                im_end=tk.eos_token_id, max_t=MAXT,
+                system_default=None, bos=None, think_block=False, think_default=False,
+                render=render)
 
 
 def load_engine():
@@ -197,8 +261,10 @@ def load_engine():
         AP = _load_smol()
     elif ARGS.engine == "zaya":
         AP = _load_zaya()
+    elif ARGS.engine == "ling":
+        AP = _load_ling()
     else:
-        raise SystemExit(f"未知引擎 {ARGS.engine}（当前支持：smol / zaya）")
+        raise SystemExit(f"未知引擎 {ARGS.engine}（当前支持：smol / zaya / ling）")
     MAXT = AP["max_t"]
     print(f"[SRV] 引擎就绪：{ARGS.model}  ctx<={MAXT}", flush=True)
 
@@ -212,7 +278,7 @@ def reset_state():
     AP["reset"]()
 
 
-def render_chatml(messages, enable_thinking=None):
+def render_chatml_generic(messages, enable_thinking, system_default, default_system, think_block):
     """ChatML（SmolLM2 与 ZAYA 同族）。★ 手写渲染而非 jinja：模板字段变了显式报错。
 
     ★★ 生成前缀必须**逐字照模型自己的模板**（2026-09-14 用户报「无法关思考、思考撑满 max_tokens」）：
@@ -223,14 +289,13 @@ def render_chatml(messages, enable_thinking=None):
     """
     parts = []
     msgs = list(messages)
-    sysdef = AP.get("system_default")
+    sysdef = system_default or default_system
     if sysdef and (not msgs or msgs[0].get("role") != "system"):
         msgs.insert(0, {"role": "system", "content": sysdef})
     for m in msgs:
         parts.append(f"<|im_start|>{m.get('role','user')}\n{m.get('content','')}<|im_end|>\n")
-    # 思考开关：None = 按模型模板默认（ZAYA 模板默认 True）
-    think = AP.get("think_default", True) if enable_thinking is None else bool(enable_thinking)
-    if AP.get("think_block"):
+    think = True if enable_thinking is None else bool(enable_thinking)
+    if think_block:
         parts.append("<|im_start|>assistant\n<think>\n" if think
                      else "<|im_start|>assistant\n<think>\n</think>\n\n")
     else:
@@ -257,7 +322,9 @@ def generate(messages, max_tokens, temp, seed, repeat_penalty, enable_thinking=N
     rng = random.Random(seed if seed and seed > 0 else None)
     think_now = (AP.get("think_default", True) if enable_thinking is None
                  else bool(enable_thinking))
-    text = render_chatml(messages, enable_thinking)
+    # ★ 渲染交给适配器：SmolLM2/ZAYA 用已验证的手写 ChatML；Ling 的格式完全不同
+    #   （<role>HUMAN</role>...<|role_end|>）⇒ 必须用模型自己的 jinja 模板渲染。
+    text = AP["render"](messages, enable_thinking)
     ids = AP["encode"](text)
     if AP.get("bos"):
         ids = [AP["bos"]] + ids
