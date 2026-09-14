@@ -685,7 +685,7 @@ class Server:
                                  "清单见 draco._DENGINE_ADAPTERS 与各档案的 engines.dracomancer 段）")
             self.cmd = [sys.executable, exe, "--model", model.path,
                         "--port", str(self.port), "--engine", eng_adapter,
-                        "--threads", str(threads)]
+                        "--threads", str(threads), "--ctx", str(ctx)]
             if extra:
                 self.cmd += extra
             if verbose:

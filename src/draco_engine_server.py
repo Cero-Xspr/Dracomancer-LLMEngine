@@ -386,20 +386,32 @@ def sample(logits, temp, seed_rng, repeat_penalty, recent):
 
 
 def generate(messages, max_tokens, temp, seed, repeat_penalty, enable_thinking=None):
-    """生成器：yield (文本增量, 计时dict)。最后一次 yield 后返回 timing。"""
-    rng = random.Random(seed if seed and seed > 0 else None)
+    """**同步**做完准备工作（渲染/分词/上下文预算），返回真正的生成器。
+
+    ★ 为什么拆两层（2026-09-15 实测）：整个函数若是生成器，异常要等第一次 next() 才抛 ——
+      那时 SSE 响应头已经发出去了，客户端只能看到"连接被意外关闭"（我实测撞到过：
+      提示词超过上下文时，前端就是这个表现）。现在超长会在**发头之前**变成干净的 400 +
+      明确文案（含实际 token 数与上下文）。
+    """
     think_now = (AP.get("think_default", True) if enable_thinking is None
                  else bool(enable_thinking))
-    # ★ 渲染交给适配器：SmolLM2/ZAYA 用已验证的手写 ChatML；Ling 的格式完全不同
-    #   （<role>HUMAN</role>...<|role_end|>）⇒ 必须用模型自己的 jinja 模板渲染。
+    # ★ 渲染交给适配器：有 chat_template 的模型一律用模型自己的 jinja 模板（见
+    #   _template_renderer 的注释：手写 ChatML 漏过 ZAYA 的空 system 轮）。
     text = AP["render"](messages, enable_thinking)
     ids = AP["encode"](text)
     if AP.get("bos"):
         ids = [AP["bos"]] + ids
     budget = MAXT - len(ids) - 8
     if budget <= 0:
-        raise ValueError(f"prompt 太长（{len(ids)} token > ctx {MAXT}）")
+        raise ValueError(f"提示词太长：{len(ids)} token > 本引擎上下文 {MAXT}。"
+                         f"（draco 侧可用 -c 调大，桥接会用同一个值）")
     n_gen = min(max_tokens if max_tokens and max_tokens > 0 else 256, budget)
+    return _gen(ids, n_gen, temp, seed, repeat_penalty, think_now)
+
+
+def _gen(ids, n_gen, temp, seed, repeat_penalty, think_now):
+    """生成器：yield (kind, 文本增量, 计时dict)。"""
+    rng = random.Random(seed if seed and seed > 0 else None)
 
     reset_state()
     t0 = time.time()
@@ -412,29 +424,49 @@ def generate(messages, max_tokens, temp, seed, repeat_penalty, enable_thinking=N
     out, gen_ids = [], []
     t1 = time.time()
     t_first = None
+    # ★ 可选分段计时（DRACO_ENG_PROF=1）：实测过"引擎裸跑 159.5 t/s、走桥接只有 123.4 t/s"，
+    #   差的 1.8ms/token 必须落到具体一段上才谈得上优化（别猜）。
+    _prof = os.environ.get("DRACO_ENG_PROF") == "1"
+    _p = {"logits": 0.0, "sample": 0.0, "decode": 0.0, "split": 0.0, "fwd": 0.0}
     # ★ 分区分片是有状态的（见 ThinkSplitter：未闭合思考要挂起最后一段做兜底）
     sp = ThinkSplitter(start_inside=bool(AP.get("think_block")) and think_now)
     for i in range(n_gen):
+        _q = time.perf_counter()
         lg = AP["logits"]()
         nid = sample(lg, temp, rng, repeat_penalty, gen_ids)
+        if _prof:
+            _q2 = time.perf_counter(); _p["logits"] += _q2 - _q
         if nid == AP["eos"] or nid == AP["im_end"]:
             break
         out.append(nid)
         gen_ids.append(nid)
+        _q = time.perf_counter()
         full = AP["decode"](out)
+        if _prof:
+            _q2 = time.perf_counter(); _p["decode"] += _q2 - _q; _q = _q2
         if len(full) > sp.sent:
             if t_first is None:
                 t_first = time.time()
             for kind, piece in sp.feed(full):
                 if piece:
                     yield kind, piece, {}
+        if _prof:
+            _q2 = time.perf_counter(); _p["split"] += _q2 - _q; _q = _q2
         AP["forward"](nid, len(ids) + i)
+        if _prof:
+            _p["fwd"] += time.perf_counter() - _q
     full = AP["decode"](out)
     for kind, piece in sp.feed(full, final=True):    # ★ 收尾：未闭合的思考末段按 content 发出
         if piece:
             yield kind, piece, {}
     dec_s = time.time() - t1
     ttft_ms = round((t_first - t1) * 1000, 1) if t_first else None
+    if _prof and out:
+        n = len(out)
+        _p["其余(HTTP/JSON/发生器)"] = dec_s - sum(_p.values())
+        print("[PROF] 每 token 分摊 ms: "
+              + "  ".join(f"{k}={v / n * 1000:.3f}" for k, v in _p.items())
+              + f"  |  合计 {dec_s / n * 1000:.3f}", file=sys.stderr, flush=True)
     timings = {
         "prompt_n": len(ids), "prompt_per_second": round(len(ids) / prefill_s, 1) if prefill_s else 0,
         "predicted_n": len(out), "predicted_per_second": round(len(out) / dec_s, 1) if dec_s else 0,
@@ -595,13 +627,20 @@ class Handler(BaseHTTPRequestHandler):
         ctk = req.get("chat_template_kwargs") or {}
         think = ctk.get("enable_thinking")          # None = 按模型默认
         rid = f"draco-eng-{int(time.time()*1000)}"
+        # ★ 准备阶段在发响应头之前完成 ⇒ 超长/渲染失败都能回一个像样的 400
+        try:
+            gen = generate(msgs, mt, temp, seed, rp, think)
+        except ValueError as e:
+            return self._json(400, {"error": {"message": str(e), "type": "invalid_request_error"}})
+        except Exception as e:
+            return self._json(500, {"error": {"message": f"准备失败：{e}", "type": "server_error"}})
         try:
             if req.get("stream"):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.end_headers()
                 timing = {}
-                for kind, delta, tim in generate(msgs, mt, temp, seed, rp, think):
+                for kind, delta, tim in gen:
                     if tim:
                         timing = tim
                     # kind=reasoning → reasoning_content（draco 会暗色显示为 [思考]）
@@ -620,7 +659,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(b"data: [DONE]\n\n")
             else:
                 parts, reasoning, timing = [], [], {}
-                for kind, delta, tim in generate(msgs, mt, temp, seed, rp, think):
+                for kind, delta, tim in gen:
                     if tim:
                         timing = tim
                     (reasoning if kind == "reasoning" else parts).append(delta)
@@ -654,8 +693,13 @@ def main():
     ap.add_argument("--engine", default="smol")
     ap.add_argument("--threads", type=int, default=4,
                     help="OMP 线程数（小模型 4 最快；默认全核反而慢 2.5×，实测）")
+    ap.add_argument("--ctx", type=int, default=0,
+                    help="上下文长度（0=引擎默认 1024）。★ 必须与 draco 的 -c 一致，"
+                         "否则会出现「能发出去但引擎拒收」的落差")
     ARGS = ap.parse_args()
     os.environ["OMP_NUM_THREADS"] = str(ARGS.threads)
+    if ARGS.ctx and ARGS.ctx > 0:
+        os.environ["MAXT"] = str(ARGS.ctx)      # 引擎在 import 时读这个值分配 KV/score 缓冲
     load_engine()
     srv = ThreadingHTTPServer(("127.0.0.1", ARGS.port), Handler)
     print(f"[SRV] listening on http://127.0.0.1:{ARGS.port}", flush=True)
