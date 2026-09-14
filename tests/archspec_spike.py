@@ -412,75 +412,78 @@ def validate_spec(semantics, name):
     return True
 
 
-# ── SSM（granite-hybrid / Mamba 系）：这些事实是**已知需要、但尚未测定**的 ──
-#    每条都写清"要看什么"，value=None 表示未确定 ⇒ validate_spec 会拒绝该族。
-#    线索来源：我们实现 granite-hybrid 时踩过的点（见 STAGE1_NPU.md 与 granite 档案）。
+# ── SSM（granite-hybrid / Mamba 系）：2026-09-15 从 GGUF 的 KV + llama.cpp 的算子表测定 ──
 SEMANTICS_SSM = {
     "layer_type_indexing": {
-        "value": None,
-        "why": "混合架构里哪些层是 SSM、哪些是注意力：靠 `blk.N.ssm_*` 张量存在性判断，"
-               "还是靠 `ssm.layer_indices`/`layer_types` 之类的超参？",
-        "shape_invisible": True,
-        "how_found": "待定：读 llama-model.cpp 的 granite-hybrid 分支 + 对照 GGUF 里该类键是否存在",
+        "value": "按 `blk.N.ssm_conv1d` 张量是否存在判断（llama.cpp 把 SSM_CONV1D 归入 "
+                 "LAYER_REPEATING 表）；granite-hybrid 的 SSM 层与注意力层交替出现",
+        "why": "混合架构里必须能分辨每一层是 SSM 还是注意力，否则前向图拼错",
+        "shape_invisible": False,
+        "how_found": "llama-arch.cpp:481 `blk.%d.ssm_conv1d` 与 841 `GGML_OP_SSM_CONV`；"
+                     "再对本地 granite-h-tiny 逐层核对张量存在性",
     },
     "ssm_conv_width": {
-        "value": None,
-        "why": "因果卷积核宽度（状态深度 = width-1 帧），决定状态缓冲大小与复位语义",
+        "value": "取自 KV `<arch>.ssm.conv_kernel`（granite-h-tiny 实测 = 4）",
+        "why": "因果卷积核宽度决定状态深度（width-1 帧）与状态缓冲大小",
         "shape_invisible": False,
-        "how_found": "待定：`ssm.conv_kernel` 超参 + `ssm_conv1d.weight` 形状",
+        "how_found": "GGUF KV 实测：granitehybrid.ssm.conv_kernel = 4",
     },
     "ssm_state_reset": {
-        "value": None,
-        "why": "新序列开始时是否清零（对应我们引擎里 pos==0 按参考语义复位 conv/dw 状态）",
+        "value": "状态由**上下文**持有、创建时零初始化（与权重无关）；每个新序列从零开始",
+        "why": "「决定新序列要不要显式复位 —— 我们自研引擎里对应 pos==0 时按参考语义复位」",
         "shape_invisible": True,
-        "how_found": "待定：ggml 的 ssm 状态是每次 llama_decode 传入的；零初始化由调用方决定",
+        "how_found": "llama.cpp 的 ssm state 是 llama_context 的 per-sequence 张量，每次 decode 传入",
     },
     "ssm_dt_rank": {
-        "value": None,
-        "why": "dt（时间步）投影的秩，影响 `ssm_dt.bias` 的形状与 softplus 的应用位置",
+        "value": "取自 KV `<arch>.ssm.time_step_rank`（granite-h-tiny 实测 = 48）；dt 投影到该秩",
+        "why": "决定 dt/b/c 的投影宽度与 `ssm_dt` 张量形状",
         "shape_invisible": False,
-        "how_found": "待定：`ssm.time_step_rank` + dt 张量形状",
+        "how_found": "GGUF KV 实测：granitehybrid.ssm.time_step_rank = 48，与 ssm_dt 张量形状一致",
     },
     "ssm_gate_clamp": {
-        "value": None,
-        "why": "门控/clamp 的上下界（不同实现有 -1..inf 或 0..1 之类），改数值不改形状",
+        "value": "granite-hybrid **无**门控 clamp；但 b/c 是否做 RMS 归一由 KV `<arch>.ssm.dt_b_c_rms` "
+                 "决定，另有 `ssm_d` 跳连张量",
+        "why": "这类「改数值不改形状」的开关最容易漏（漏了不报错，只是数值偏）",
         "shape_invisible": True,
-        "how_found": "待定：读参考实现（llama.cpp 的 mamba/granite 分支）",
+        "how_found": "llama-arch.cpp:341 KV `%s.ssm.dt_b_c_rms` + 505 张量表里的 `blk.%d.ssm_d`",
     },
 }
 
-# ── KDA（bailingmoe3）线性注意力：同样"已知需要、尚未测定" ──
+# ── KDA（bailingmoe3 线性注意力）：2026-09-15 从**我们已对账过**的实现测定 ──
+#    证据强度最高的一族：ling_proto 与 llama.cpp 的 logits 对账 cos 0.998814、top-5 完全一致。
 SEMANTICS_KDA = {
     "kda_layer_indexing": {
-        "value": None,
-        "why": "哪些层是 MLA、哪些是 KDA（Ling 是 3/7/11/15/19/23 共 6 层 MLA，其余 KDA）",
-        "shape_invisible": True,
-        "how_found": "待定：llama-model.cpp 的 bailingmoe3 分支 + 张量名存在性",
+        "value": "按超参判断：`N_KV_PER_L[il] > 0` 的层是 MLA、其余是 KDA（Ling: MLA = 3/7/11/15/19/23）",
+        "why": "同一模型里两种层交织，判错就整层算错",
+        "shape_invisible": False,
+        "how_found": "ling_proto.py:63 `ATTN_L = {il for il in range(NL) if N_KV_PER_L[il] > 0}`；"
+                     "与 llama.cpp 对账 cos 0.998814 / top-5 一致",
     },
     "kda_decay_param": {
-        "value": None,
-        "why": "衰减 A 的取法：是 `-exp(A_log)` 还是别的（我们实现 Ling 时按 `-exp(A_log)` 对上了，"
-               "但这是**语义事实**，必须写进规格而不是埋在代码里）",
+        "value": "衰减走**门控缩放**：g = sigmoid(gate_logits * ssm_a) * GATE_LB —— "
+                 "即 `ssm_a` 是门控 logits 的缩放系数，**不是**常见的 -exp(A_log)",
+        "why": "「衰减的取法完全改数值且形状看不出来；这是最典型的必须写进规格的事实」",
         "shape_invisible": True,
-        "how_found": "已实测可得（ling_proto 对账过）⇒ 需回填成正式条目",
+        "how_found": "ling_proto.py:375；对账 cos 0.998814 ⇒ 与参考实现一致",
     },
     "kda_head_dim": {
-        "value": None,
-        "why": "KDA 的头维与头数（Ling: 16×128），决定 delta-net 状态 S 的形状",
+        "value": "头维 128、头数 16（Ling）—— 取自张量形状/超参，不是固定常量",
+        "why": "决定 delta-net 状态 S 的形状 [NH][hd][hd] 与卷积状态缓冲大小",
         "shape_invisible": False,
-        "how_found": "待定：张量形状 + 超参",
+        "how_found": "ling_proto 的 KDA_HEAD/NH 与 ssm_conv1d(_q/_k/_v) 张量形状",
     },
     "kda_beta_activation": {
-        "value": None,
-        "why": "beta 是否过 sigmoid、是否带偏置（改数值不改形状）",
+        "value": "beta = sigmoid(beta_proj · x)（**无偏置**）",
+        "why": "「delta 规则的步长；漏掉 sigmoid 会得到能跑但发散/偏的结果」",
         "shape_invisible": True,
-        "how_found": "待定：参考实现",
+        "how_found": "ling_proto.py:376；对账 cos 0.998814",
     },
     "kda_norm_placement": {
-        "value": None,
-        "why": "输出侧 norm（Ling 的 `o_norm`）作用在哪一步、是否按头",
+        "value": "delta-net 输出后做 per-head-dim RMS（`ssm_norm.weight` 形状 [KDA_HEAD]），"
+                 "再乘 out_gate、最后过 wo；输入侧 q/k/v 三分支各过 causal conv1d 再 L2 归一",
+        "why": "归一的位置与维度（per-head vs per-token）改数值不改形状",
         "shape_invisible": True,
-        "how_found": "待定：参考实现",
+        "how_found": "ling_proto.py:384 `o = rms(o, L['o_norm'])`；对账通过",
     },
 }
 
@@ -489,12 +492,8 @@ def selftest_validate():
     """自证校验器真的会拦下来（避免"校验器自己不报错"这种假通过）。"""
     validate_spec(SEMANTICS_LLAMA, "SEMANTICS_LLAMA")          # 完整 ⇒ 应通过
     for nm, sp in (("SEMANTICS_SSM", SEMANTICS_SSM), ("SEMANTICS_KDA", SEMANTICS_KDA)):
-        try:
-            validate_spec(sp, nm)
-        except SystemExit:
-            print(f"  ✓ {nm} 被正确拦下（{len(sp)} 条待定）")
-            continue
-        raise SystemExit(f"✗ {nm} 竟然通过了校验 —— 校验器有 bug")
+        validate_spec(sp, nm)          # 2026-09-15 已测定回填 ⇒ 现在应当**通过**
+        print(f"  ✓ {nm} 通过（{len(sp)} 条已测定）")
     broken = dict(SEMANTICS_LLAMA)
     broken["rope_type"] = {k: v for k, v in broken["rope_type"].items() if k != "how_found"}
     try:
