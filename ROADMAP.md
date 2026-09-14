@@ -258,7 +258,11 @@
   实测全过：`ssm_conv`/`ssm_scan`/`kda_delta` KAT 通过、三族步骤通过、缺口为**空**。
 - **剩余（C3 收尾，明确且不小）**：三个算子还**没串进求值器的 op 分派**（现在只是各自的纯函数 + KAT），
   所以还不能端到端跑一族的模型。要做：
-  ① 把 `ssm_conv`/`ssm_scan`/`kda_delta` 接进 `Evaluator` 的 `if op == ...` 分派（含状态键、pos 传递）；
+  ① ✅ **权重布局断言已做**（`check_conv_layout` / `check_vec_layout`，已接进 `--selftest`）：
+     `ssm_conv1d.weight` 可能是 [C,width] 也可能是 [width,C]，`ssm_a` 可能是 [nh]/(1,nh)/(nh,1) ——
+     **拿错不报错、只会静默算错**，所以加载时必须显式确认，确认不了就带着尺寸报错，**绝不猜**。
+     自证：合法轴序通过；错形状（(8,5)/(3,4,8)/(4,)/(16,4) 等）一律被拦。
+  ② **仍待做**：把三算子接进 `Evaluator` 的 `if op == ...` 分派（含状态键、pos 传递）；
   ② 权重加载补 SSM/KDA 张量名（`ssm_conv1d`/`ssm_a`/`ssm_dt`/`ssm_d`/`ssm_beta`/`ssm_norm`…），
      并对**权重布局**（如 `ssm_conv1d.weight` 是 [C,width] 还是 [width,C]）做显式断言 —— 拿错不报错才最危险；
   ③ 用 **granite-h-tiny**（SSM 族）与 **Ling**（KDA 族）的真权重跑**逐层对账**，参考用 llama.cpp 的 dump；

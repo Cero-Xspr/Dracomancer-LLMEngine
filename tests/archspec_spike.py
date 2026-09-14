@@ -832,6 +832,57 @@ def selftest_validate():
     print("  ✅ 校验器自证通过：完整规格通过、缺字段/未确定都被拦")
 
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# C3 收尾前置：SSM/KDA 张量的**权重布局断言**（接权重加载时最先要用到的东西）
+#   为什么单独做成函数：`ssm_conv1d.weight` 可能是 [C,width] 也可能是 [width,C]，
+#   `ssm_a` 可能是 [nh] 也可能是 [1,nh]……**拿错布局不会报错、只会静默算错**
+#   （本项目已经被"静默算错"坑过多次：ZAYA 的 -ub、gemv 行区间、selfcheck 空回复）。
+#   ⇒ 加载时必须显式确认布局，确认不了就**带着尺寸信息报错**，绝不猜。
+# ═══════════════════════════════════════════════════════════════════════════
+def check_conv_layout(shape, channels, width, name="ssm_conv1d.weight"):
+    """确认 conv1d 权重的轴序 → 返回 'CW'（[C,width]）或 'WC'（[width,C]）。都不是就报错。"""
+    sh = tuple(int(x) for x in shape)
+    if sh == (channels, width):
+        return "CW"
+    if sh == (width, channels):
+        return "WC"
+    raise SystemExit(
+        f"权重布局无法确认：{name} 形状 {sh}，期望 {channels}×{width} 的两种轴序之一 —— "
+        f"**不许猜**（猜错的后果是静默算错，不是报错）。请先核对 GGUF 里该张量的形状与参考实现的用法。")
+
+
+def check_vec_layout(shape, n, name="ssm_a"):
+    """确认逐头向量的形状（[n] / [1,n] / [n,1] 都算合法，返回压平后的数组由调用方决定）。"""
+    sh = tuple(int(x) for x in shape)
+    if sh == (n,) or sh == (1, n) or sh == (n, 1):
+        return sh
+    raise SystemExit(f"逐头向量形状无法确认：{name} 形状 {sh}，期望 ({n},) / (1,{n}) / ({n},1) 之一 —— 不许猜。")
+
+
+def kat_layout_checks():
+    """自证断言真的会拦（避免"断言成了摆设"）。"""
+    assert check_conv_layout((8, 4), 8, 4) == "CW"
+    assert check_conv_layout((4, 8), 8, 4) == "WC"
+    for bad in ((8, 5), (3, 4, 8), (4,), (16, 4)):
+        try:
+            check_conv_layout(bad, 8, 4)
+        except SystemExit:
+            pass
+        else:
+            raise SystemExit(f"check_conv_layout 竟然放过了 {bad} —— 断言是摆设")
+    assert check_vec_layout((4,), 4) == (4,)
+    assert check_vec_layout((1, 4), 4) == (1, 4)
+    for bad in ((5,), (2, 2)):
+        try:
+            check_vec_layout(bad, 4)
+        except SystemExit:
+            pass
+        else:
+            raise SystemExit(f"check_vec_layout 竟然放过了 {bad}")
+    print("  ✅ 布局断言自证通过（合法轴序通过；错形状一律带尺寸信息报错）")
+
+
 def c3_selftest():
     """C3 装置总验收：事实完整性 + 层内步骤 + 算子 KAT + 缺口清单，一条命令跑完（可进 CI）。
 
@@ -844,7 +895,8 @@ def c3_selftest():
     validate_steps(LAYER_STEPS_SSM, SEMANTICS_SSM, "ssm")
     validate_steps(LAYER_STEPS_KDA, SEMANTICS_KDA, "kda")
     print("  OK llama / ssm / kda 三族层内步骤均通过（含 semantics 引用存在性）")
-    print("== ③ 算子 KAT ==")
+    print("== ③ 算子 KAT 与布局断言 ==")
+    kat_layout_checks()
     kat_ssm_conv()
     kat_ssm_scan()
     kat_kda_delta()
