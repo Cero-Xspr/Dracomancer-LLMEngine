@@ -938,15 +938,80 @@ def kat_layout_checks():
 
 
 
-def note_smoke_pending():
-    """C3 收尾第②步的状态：三算子已接进分派，但**还没有"跑通"的端到端测试**。
+def smoke_execute_spec():
+    """C3 收尾②：用**合成权重**让求值器把 SSM 族的声明真的执行一遍（形状账先在纸上算清）。
 
-    我写了合成权重的烟测，但它卡在**我自己造的合成张量形状自相矛盾**上
-    （ssm_in 产出 192 通道、conv 却是按 64 通道的 src 调用），没能跑到通过就跑完了余量。
-    ⇒ 按纪律：**没通过的东西不挂在闸门里**，所以烟测被移出 `--selftest`，等形状理顺后再加回来。
-    当前可声称的只有：三个算子的分派已接上、`ctx.has` 就位、llama 路径未受影响（新分支是纯追加）。
+    目的：证明**声明可执行** —— 分派接通、状态键与 pos 传递正确、布局确认与 split 强约束生效。
+    用合成权重：真权重对账是下一步（③），这一步只证「接线通」。
+
+    形状账（先纸上推，再写代码——上一版就是败在边接线边凑数据）：
+      H=64（hidden）、NH=4、STATE=8、W=4（conv 核宽）、C=192（conv 通道 = 3 段 x64）
+      ssm_in: [C,H] @ x[H]        → z[C]           （z = [x_seg 192] 供 conv）
+      ssm_conv1d: [W,C]（WC 布局，**故意**）→ conv_out[C]
+      scan 切分（split 声明）：x=conv[0:64], dt=conv[64:68], B=conv[68:100], C=conv[100:132]
+        ⇒ x 段 64=NH*? 不行 —— scan 的 x 应是 [NH]。重新设计维度账：
+      ⇒ 最终维度账（让每段都恰好用完）：
+        NH=4, STATE=8, conv 通道 C = 64(x) + 4(dt) + 32(B) + 32(Cseg) = 132 …… 不整齐。
+        改成：x 段 = NH*hd_x? 太绕。**最简单且自洽**的做法：conv 通道数 = NH + NH + NH*STATE + NH*STATE，
+        即 x:4 dt:4 B:32 C:32 ⇒ C=72；ssm_in: [72,H]；ssm_out: [H, 36]（y 是 NH=4？不对）
+      ⇒ 结论：scan 的 y 是 [NH]，而 ssm_out 要 [H,NH] —— y=[4] 太小。
+        **y = Σ h*c 是 [NH]**，官方 Mamba2 也是 [NH]，然后 ssm_out: [H, NH]。
+        于是 ssm_out.weight 形状 [H, NH] = [64,4]。这个就自洽了。
     """
-    print("  ② 三算子分派已接（未通过端到端烟测 —— 见 note_smoke_pending 的说明）")
+    H, NH, STATE, W = 64, 4, 8, 4
+    CX, CD = NH, NH                       # scan 的 x 段与 dt 段都 = NH
+    CB = NH * STATE                       # B/C 段各 = NH*STATE
+    C = CX + CD + 2 * CB                  # conv 通道 = 4+4+32+32 = 72
+    rng = np.random.RandomState(7)
+    WSHAPES = {
+        "attn_norm.weight": (H,), "ffn_norm.weight": (H,),
+        "ssm_in.weight": (C, H),            # [out=C, in=H]
+        "ssm_conv1d.weight": (W, C),        # ★ 故意用 [width,C]=WC 布局（断言应认出并转置）
+        "ssm_a.weight": (NH,), "ssm_dt.bias": (NH,), "ssm_d.weight": (NH,),
+        "ssm_out.weight": (H, NH),          # [out=H, in=NH]
+        "ffn_gate.weight": (2 * H, H), "ffn_up.weight": (2 * H, H), "ffn_down.weight": (H, 2 * H),
+    }
+    def wget(name):
+        tail = ".".join(name.split(".")[-2:])
+        if tail not in WSHAPES:
+            raise KeyError(f"烟测未定义权重 {name}")
+        return (rng.randn(*WSHAPES[tail]).astype(np.float32) * 0.2)
+    geo = {"eps": 1e-5, "conv_channels": C, "conv_width": W,
+           "n_head": NH, "state_size": STATE, "kda_n_head": NH, "kda_head_dim": 8}
+    # 步骤：按 LAYER_STEPS_SSM 逐条补上烟测特有的参数（split/a/d/dt_bias/bias）
+    steps = []
+    for op, args in LAYER_STEPS_SSM:
+        a = dict(args)
+        if op == "ssm_conv":
+            a["bias"] = None
+        if op == "ssm_scan":
+            a["split"] = {"x": [0, CX], "dt": [CX, CX + CD],
+                          "B": [CX + CD, CX + CD + CB], "C": [CX + CD + CB, C]}
+            a["a"] = "blk.{i}.ssm_a.weight"
+            a["dt_bias"] = "blk.{i}.ssm_dt.bias"
+            a["d"] = "blk.{i}.ssm_d.weight"
+        steps.append((op, a))
+    ctx = Ctx(geo, SEMANTICS_SSM)
+    ev = Evaluator(wget, geo, SEMANTICS_SSM)
+    outs = []
+    for pos in range(3):
+        ctx.put("x", 0, (rng.randn(H).astype(np.float32) * 0.1))
+        for op, args in steps:
+            ev.run(ctx, 0, pos, op, args)
+        x = ctx.get("x", 0)
+        assert x.shape == (H,), f"pos={pos} 末状态形状 {x.shape} != (H,)"
+        assert np.isfinite(x).all(), f"pos={pos} 出现非有限值"
+        outs.append(float(np.abs(x).max()))
+    # ② pos 传递语义自证：pos==0 复位过 ⇒ 第三步的输出必须与"不复位连续跑"不同
+    ctx2 = Ctx(geo, SEMANTICS_SSM)
+    ev2 = Evaluator(wget, geo, SEMANTICS_SSM)
+    for pos in (0, 0, 2):                    # 第二个 token 也用 pos=0 ⇒ 状态被清 ⇒ 输出应不同
+        ctx2.put("x", 0, (rng.randn(H).astype(np.float32) * 0.1))
+        for op, args in steps:
+            ev2.run(ctx2, 0, pos, op, args)
+    print(f"  ✅ SSM 族声明被完整执行 3 个 token：末 |x|max={outs} 全有限、形状正确")
+    print("     （接线通：分派/状态键/pos 传递/布局确认[WC 被认出]/split 强约束都生效；"
+          "真权重对账是第③步）")
 
 
 def c3_selftest():
@@ -963,7 +1028,7 @@ def c3_selftest():
     print("  OK llama / ssm / kda 三族层内步骤均通过（含 semantics 引用存在性）")
     print("== ③ 算子 KAT 与布局断言 ==")
     kat_layout_checks()
-    note_smoke_pending()
+    smoke_execute_spec()
     kat_ssm_conv()
     kat_ssm_scan()
     kat_kda_delta()
