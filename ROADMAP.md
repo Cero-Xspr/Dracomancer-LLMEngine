@@ -272,7 +272,13 @@
      ⇒ 当前可声称：**SSM 族的声明式描述是可执行的**（KDA 族的接线同构、执行路径同一段代码）。
   ② 权重加载补 SSM/KDA 张量名（`ssm_conv1d`/`ssm_a`/`ssm_dt`/`ssm_d`/`ssm_beta`/`ssm_norm`…），
      并对**权重布局**（如 `ssm_conv1d.weight` 是 [C,width] 还是 [width,C]）做显式断言 —— 拿错不报错才最危险；
-  ③ 用 **granite-h-tiny**（SSM 族）与 **Ling**（KDA 族）的真权重跑**逐层对账**，参考用 llama.cpp 的 dump；
+  ③ 🔄 **进行中，且已有第一个重要发现**：**granite-h-tiny 是 Mamba-1/S4D 结构，不是 Mamba-2**——
+     `ssm_a` 形状 (1, 48) 是 **[1, dt_rank]**（A 作用在 dt 秩上，每 state 列共享），
+     而声明式求值器的 `ssm_scan` 实现的是 Mamba-2（A={d_state, n_head}，作用在 state 维）。
+     `ssm_in` 6448 = dt_rank 48 + inner 3072 + 2·state·group 佐证了这一点（llama.cpp mamba-base 同款）。
+     ⇒ **不能拿现算子直接对账**；正确路径是二选一：(a) 给求值器加 S4D 分支（A 取 [1,dt_rank]、
+     Δ=B/C 分组共享），或 (b) 先用 **Ling（KDA 族）**完成真权重对账（它没有这个结构分歧），
+     S4D 对账排后。**「先纸上对账再写代码」再次避免了一轮白干**。
   ④ ✅ **`ssm_scan` 公式已与 llama.cpp 逐行核对**（来源：`models/mamba-base.cpp` 的图 +
      `ggml-cpu/ops.cpp` 的 `ggml_compute_forward_ssm_scan_f32`），**修正三处凭常识写错的地方**：
      ①内核**无 clamp**（旧版凭印象加了 ±4）；②**A 形状 {d_state, n_head}**，d_state>0 时
