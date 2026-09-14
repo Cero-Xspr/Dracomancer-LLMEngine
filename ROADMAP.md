@@ -243,10 +243,19 @@
      ⚠️ **公式本身尚未与 llama.cpp 对账**（a 的取法、softplus 的 clamp 界、D 跳连的位置都要读
      `build_mamba2_layer` 逐行核对后回填）—— 这是**有意标注**：B1 那次"四个自写实现互相打架"
      就是自写参考自证的代价，所以这里只声称"内部一致"，不声称"与参考一致"。
-  ③ `kda_delta`（KDA 三分支卷积 + delta-net 递推 + o_norm/out_gate）—— **待做**
+  ③ ✅ **`kda_delta`**（delta-net 递推）—— **逐字移植自已对账过的 `ling_proto.kda_step`**
+     （vs llama.cpp cos 0.998814、top-5 一致）⇒ 三族里第一个有**外部参考**的算子。
+     语义：g=sigmoid(gate·ssm_a)·GATE_LB（逐通道衰减）→ S 衰减 → delta=(v−S·k)·beta →
+     S += k⊗delta（rank-1 写入，i=key 维、j=value 维）→ o=(S·q)·hd^-0.5 →
+     per-head-dim RMS(o_norm) → ×out_gate。
+     **四项语义性质测试**（不靠自写参考自证）：① β=0 且 g=0 ⇒ 状态完全不变 ✓
+     ② delta 规则的定义性质：‖S·k − v‖ 一步归零（**因为 ‖k‖=1**，这正是索引约定正确的证据 ——
+     写错维度就不会是 0）✓ ③ 强衰减(g=-30) 后 S == k⊗v（max|Δ|=0）✓ ④ 读出与缩放公式一致 ✓
+- ⇒ **C3 数值层 3/3 完成**：`unimplemented_ops()` 已返回**空**。
   （`unimplemented_ops()` 现在会自动报 `ssm: [ssm_scan]`、`kda: [kda_delta]`）
-- **剩余（数值层收尾）**：实现上述 2 个算子后，拿 granite-h-tiny / Ling 的真权重跑逐层对账 ——
-  这步才真正验证「声明式描述能复现真模型」。
+- **剩余（C3 收尾）**：三个算子都有了，但还没**串起来跑真权重**（granite-h-tiny 的 SSM 族
+  与 Ling 的 KDA 族各跑一遍逐层对账）—— 这步才真正验证「声明式描述能复现真模型」。
+  另需把 `ssm_scan` 的公式与 `build_mamba2_layer` 逐行核对（目前只声称内部一致）。
 
 ### C3（旧描述，保留）声明式表达力覆盖混合 SSM/KDA
 - archspec spike 已验证 llama 密集 + MoE（cos 0.999962 / 0.9998），但 granite-hybrid、bailingmoe3(KDA) 还没进。

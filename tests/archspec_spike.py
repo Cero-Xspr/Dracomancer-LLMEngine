@@ -178,7 +178,7 @@ LAYER_STEPS_KDA = [
 
 # 求值器**已实现**的 op（其余 op 就是 C3 剩下的工作清单）
 IMPLEMENTED_OPS = ("rms_norm", "mul_mat", "rope", "attn_gqa", "silu_mul", "add", "moe_ffn",
-                   "ssm_conv", "ssm_scan")   # ← C3 数值层①②（2026-09-15，内部 KAT 通过）
+                   "ssm_conv", "ssm_scan", "kda_delta")   # ← C3 数值层①②③（2026-09-15）
 
 
 
@@ -347,6 +347,87 @@ def kat_ssm_scan():
     if not (same and diff > 1e-6 and finite):
         raise SystemExit("ssm_scan KAT 失败")
     print("  ✅ ssm_scan KAT（**内部一致性**）通过 —— 注意：公式本身尚未与 llama.cpp 对账")
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# C3 数值层 ③：kda_delta —— KDA 的 delta-net 递推
+#   **逐字移植自我们已对账过的实现**（`ling_proto.kda_step`，与 llama.cpp 的 logits 对账
+#   cos 0.998814、top-5 一致）⇒ 这是三族里第一个有**外部参考**的算子（不只是内部一致）。
+#   语义（S: [nh, i, j]，i 是 key 通道、j 是 value 通道）：
+#     g    = sigmoid(gate * ssm_a[:,None]) * GATE_LB   # 逐通道衰减，值域 (GATE_LB, 0]
+#     beta = sigmoid(beta_proj · x)                     # 逐头步长 [nh]
+#     S    = diag(exp(g)) S                             # 先衰减
+#     delta= (v - S·k) * beta                           # delta 规则的残差
+#     S    += k ⊗ delta                                 # rank-1 写入（沿 key 维）
+#     o    = (S·q) * KDA_HEAD^-0.5                      # 读出 + 缩放
+#     o    = rms(o, o_norm) * sigmoid(g_out · x)        # 输出侧 per-head-dim RMS + out_gate
+# ═══════════════════════════════════════════════════════════════════════════
+KDA_GATE_LB = -5.0      # ★ 与 ling_proto 的 GATE_LB 一致（移植来源见上）
+
+
+def kda_delta_step(q, k, v, g, beta, S, o_norm, out_gate, hd):
+    """单步 KDA delta-net。q/k/v: [nh, hd]（q/k 已 L2 归一）；g: [nh, hd]（≤0）；
+    beta: [nh]；S: [nh, hd, hd] **就地更新**；o_norm: [hd]；out_gate: [nh, hd]。返回 o: [nh, hd]。"""
+    S *= np.exp(g)[:, :, None]                       # 逐 key 通道衰减
+    kv = np.einsum("hij,hi->hj", S, k)               # Σ_i S[i][j] k[i]
+    delta = (v - kv) * beta[:, None]
+    S += k[:, :, None] * delta[:, None, :]           # rank-1 写入
+    o = np.einsum("hij,hi->hj", S, q) * (hd ** -0.5)
+    o = o / np.sqrt((o * o).mean(-1, keepdims=True) + 1e-6) * o_norm   # per-head-dim RMS
+    return o * out_gate
+
+
+def kat_kda_delta():
+    """语义性质测试（不靠自写参考自证）。"""
+    rng = np.random.RandomState(2)
+    nh, hd = 3, 4
+    l2 = lambda x: x / (np.linalg.norm(x, axis=-1, keepdims=True) + 1e-8)
+    def sample():
+        return (l2(rng.randn(nh, hd).astype(np.float32)), l2(rng.randn(nh, hd).astype(np.float32)),
+                rng.randn(nh, hd).astype(np.float32), rng.randn(nh, hd).astype(np.float32),
+                (rng.rand(nh).astype(np.float32)), np.ones(hd, np.float32),
+                (rng.rand(nh, hd).astype(np.float32)))
+    q, k, v, g, beta, on, og = sample()
+
+    # ① beta=0 ⇒ 状态不变（bit-exact 级：只乘 exp(g) 的那一步会变，故用 g=0 单独测）
+    S = rng.randn(nh, hd, hd).astype(np.float32) * 0.1
+    S0 = S.copy()
+    kda_delta_step(q, k, v, np.zeros_like(g), np.zeros(nh, np.float32), S, on, og, hd)
+    ok1 = np.array_equal(S, S0)
+    print(f"  ① beta=0 且 g=0 ⇒ 状态完全不变: {'✓' if ok1 else '✗'}")
+
+    # ② delta 规则的定义性质：同一 (k,v) 反复写，‖S·k − v‖ 单调下降
+    S = np.zeros((nh, hd, hd), np.float32)
+    errs = []
+    for _ in range(6):
+        kda_delta_step(q, k, v, np.zeros_like(g), np.ones(nh, np.float32), S, on, og, hd)
+        errs.append(float(np.linalg.norm(np.einsum("hij,hi->hj", S, k) - v, axis=-1).max()))
+    mono = all(errs[i + 1] <= errs[i] + 1e-6 for i in range(len(errs) - 1))
+    print(f"  ② delta 规则的收敛性 ‖S·k−v‖: {[round(e,3) for e in errs]} → {'✓ 单调下降' if mono else '✗'}")
+
+    # ③ 极强衰减（g 很负）⇒ 旧状态被清空，只剩本次写入 k⊗(v·beta)
+    S = rng.randn(nh, hd, hd).astype(np.float32) * 5.0
+    ghard = np.full((nh, hd), -30.0, np.float32)
+    beta1 = np.ones(nh, np.float32)
+    kda_delta_step(q, k, v, ghard, beta1, S, on, og, hd)
+    S_expect = k[:, :, None] * v[:, None, :]
+    d3 = float(np.abs(S - S_expect).max())
+    print(f"  ③ 强衰减后 S ≈ k⊗v: max|Δ|={d3:.2e} {'✓' if d3 < 1e-4 else '✗'}")
+
+    # ④ 读出缩放：o 未归一化前 = (S·q) * hd^-0.5（用 o_norm=1、out_gate=1 时可由 RMS 反推形状）
+    S = rng.randn(nh, hd, hd).astype(np.float32) * 0.1
+    o = kda_delta_step(q, k, v, np.zeros_like(g), np.zeros(nh, np.float32), S, np.ones(hd, np.float32),
+                       np.ones((nh, hd), np.float32), hd)
+    raw = np.einsum("hij,hi->hj", S, q) * (hd ** -0.5)      # beta=0,g=0 ⇒ S 未变
+    expect = raw / np.sqrt((raw * raw).mean(-1, keepdims=True) + 1e-6)
+    d4 = float(np.abs(o - expect).max())
+    print(f"  ④ 读出与缩放一致: max|Δ|={d4:.2e} {'✓' if d4 < 1e-6 else '✗'}")
+
+    if not (ok1 and mono and d3 < 1e-4 and d4 < 1e-6):
+        raise SystemExit("kda_delta KAT 失败")
+    print("  ✅ kda_delta 性质测试通过（beta=0 不变 / delta 收敛 / 强衰减清空 / 读出缩放）"
+          " —— 公式**移植自已对账的 ling_proto**")
 
 
 def unimplemented_ops():
