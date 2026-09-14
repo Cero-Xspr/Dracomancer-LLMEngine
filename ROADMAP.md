@@ -272,7 +272,18 @@
      ⇒ 当前可声称：**SSM 族的声明式描述是可执行的**（KDA 族的接线同构、执行路径同一段代码）。
   ② 权重加载补 SSM/KDA 张量名（`ssm_conv1d`/`ssm_a`/`ssm_dt`/`ssm_d`/`ssm_beta`/`ssm_norm`…），
      并对**权重布局**（如 `ssm_conv1d.weight` 是 [C,width] 还是 [width,C]）做显式断言 —— 拿错不报错才最危险；
-  ③ 🔄 **进行中，且已有第一个重要发现**：**granite-h-tiny 是 Mamba-1/S4D 结构，不是 Mamba-2**——
+  ③ ✅ **KDA 族真权重对账完成（2026-09-15）**：`tests/kda_reconcile.py` —— 按 SEMANTICS_KDA 语义
+     **独立重写**的求值路径（fp32 权重 + numpy）vs `ling_proto.kda_step`（已对账 llama.cpp
+     cos 0.998814 的参考），Ling 层 0/1/2 三层 **cos=1.00000000**（max|Δ| ≤ 2.8e-08）。
+     过程中抓到一个自己的 bug（第一版三个 conv 分支全错用 `conv_q` ⇒ cos 0.056）——
+     **逐段二分**（conv → delta → 读出）一轮定位。
+     ⇒ **「声明式描述能复现真模型」在 KDA 族上被验证**（描述 → 语义 → 独立实现 → 与已对账参考一致）。
+  ③a 🔄 **granite-h-tiny（SSM 族）的发现与待办**：**它是 Mamba-1/S4D 结构，不是 Mamba-2**——
+     `ssm_a` 形状 (1, 48) 是 **[1, dt_rank]**（A 作用在 dt 秩上，每 state 列共享），
+     而声明式求值器的 `ssm_scan` 实现的是 Mamba-2（A={d_state, n_head}，作用在 state 维）。
+     `ssm_in` 6448 = dt_rank 48 + inner 3072 + 2·state·group 佐证（llama.cpp mamba-base 同款）。
+     ⇒ **不能拿现算子直接对账**；待办 = 给求值器加 S4D 分支（A 取 [1,dt_rank]、Δ/B/C 分组共享）后再对。
+     「先纸上对账再写代码」再次避免了一轮白干。
      `ssm_a` 形状 (1, 48) 是 **[1, dt_rank]**（A 作用在 dt 秩上，每 state 列共享），
      而声明式求值器的 `ssm_scan` 实现的是 Mamba-2（A={d_state, n_head}，作用在 state 维）。
      `ssm_in` 6448 = dt_rank 48 + inner 3072 + 2·state·group 佐证了这一点（llama.cpp mamba-base 同款）。
