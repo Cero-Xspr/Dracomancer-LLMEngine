@@ -19,7 +19,15 @@
 //   ⇒ 结论：B1 要做得用 **VNNI `_mm512_dpbusd_epi32`**（一条指令 64 个 MAC）+ 把两个 32 块
 //     塞进同一个 512 位寄存器、修正项折叠进掩码/预计算（llama.cpp 的做法），
 //     而不是这种"朴素整数化"。本文件保留作为**反例基准**（改 B1 时先跑它对比）。
-//   ⚠️ 本文件的数值列（cos/max|Δ|）**当前不可信**：我临时写的 float64 参考实现自己也对不上
+//   ⚠️⚠️ 2026-09-15 第二次实测（VNNI 版）：**速度有正向信号，但本文件的数值列整体不可信**。
+//     速度（token_embd 49152×960，50MB / attn_v 960×320）：浮点 26.8、maddubs 23.5、**VNNI 30.9 GB/s**
+//     （小张量 16.2 / 15.4 / 18.7）⇒ VNNI 比浮点快约 **15%**，方向成立。
+//     但四个实现两两都不一致（浮点 vs 标量整数 cos=0.059！）⇒ 连我临时重写的"浮点路径"
+//     都是错的（它只是照着 m5_kern6.c 的内层循环重写，没有多累加器/tail 等细节）。
+//     ⇒ 结论：**先修参考，再谈数值**。正确做法是拿**引擎自己的 Q8_0 内核**（m5_kern6.so 的
+//       m5_gemv，生产里已验证）当参考，而不是自己重写一份 —— 这正是 ROADMAP B1 里写过的纪律，
+//       这次违反了，代价是这一轮的数值结论全部作废（只有计时还有参考价值）。
+//   ⚠️ 早期结论（maddubs 比浮点慢）：我临时写的 float64 参考实现自己也对不上
 //     浮点路径（cos 0.968，说明参考的块/行布局读错了）。改 B1 时要用**引擎自己的浮点内核**
 //     当参考（判据：整数路径与它的偏差应是小而可解释的，因为激活被量化了）。
 #include <stdint.h>
@@ -99,9 +107,86 @@ static void path_int8(const float* x, const uint8_t* W, int n_out, int n_in, flo
     }
 }
 
+
+// ---------- C: VNNI 路径（dpbusd，一条指令 64 个 MAC；修正项折叠成向量）----------
+// 与 B 的区别：B 用 maddubs+madd 且每个 32 块单独算修正 ⇒ 指令数没省下来。
+// C 一次处理 **两个 32 块**（64 个 int8 = 一个 512 位寄存器），
+//   p = dpbusd(0, w^0x80, x)  ⇒ 16 个 int32 lane，lane k = 第 4k..4k+3 个乘积之和
+//   lane 0..7 覆盖第 0 块、8..15 覆盖第 1 块 ⇒ 用 mask_blend 把两块的 (dw*dx) 与
+//   (128*Σx*dw*dx) 各自铺成向量，最后 sumf += sv*(p - cvb)（一条 fma）。
+static void path_int8_vnni(const float* x, const uint8_t* W, int n_out, int n_in, float* y,
+                           int8_t* qxbuf, float* dxbuf, int32_t* sxbuf) {
+    const int nb = n_in / 32;
+    quant_x_q8(x, n_in, qxbuf, dxbuf);
+    for (int b = 0; b < nb; b++) {              // 每块的 Σx（供 +128 修正；整行共享，只算一次）
+        int32_t s = 0;
+        for (int i = 0; i < 32; i++) s += qxbuf[b * 32 + i];
+        sxbuf[b] = s;
+    }
+    const __m512i off = _mm512_set1_epi8((char)0x80);
+    const int half = nb & ~1;                   // 成对处理
+    for (int o = 0; o < n_out; o++) {
+        const uint8_t* row = W + (size_t)o * nb * 34;
+        __m512 sumf = _mm512_setzero_ps();
+        int b = 0;
+        for (; b < half; b += 2) {
+            const uint8_t* w0 = row + (size_t)b * 34;
+            const uint8_t* w1 = w0 + 34;
+            __m256i qw0 = _mm256_loadu_si256((const __m256i*)(w0 + 2));
+            __m256i qw1 = _mm256_loadu_si256((const __m256i*)(w1 + 2));
+            __m512i qw = _mm512_inserti64x4(_mm512_castsi256_si512(qw0), qw1, 1);
+            __m256i qx0 = _mm256_loadu_si256((const __m256i*)(qxbuf + b * 32));
+            __m256i qx1 = _mm256_loadu_si256((const __m256i*)(qxbuf + b * 32 + 32));
+            __m512i qx = _mm512_inserti64x4(_mm512_castsi256_si512(qx0), qx1, 1);
+            __m512i p = _mm512_dpbusd_epi32(_mm512_setzero_si512(), _mm512_xor_si512(qw, off), qx);
+            const float a = _cvtsh_ss(*(const unsigned short*)w0) * dxbuf[b];
+            const float c = _cvtsh_ss(*(const unsigned short*)w1) * dxbuf[b + 1];
+            const __m512 sv = _mm512_mask_blend_ps(0xFF00, _mm512_set1_ps(a), _mm512_set1_ps(c));
+            const __m512 cvb = _mm512_mask_blend_ps(0xFF00, _mm512_set1_ps(128.0f * (float)sxbuf[b]),
+                                                         _mm512_set1_ps(128.0f * (float)sxbuf[b + 1]));
+            sumf = _mm512_fmadd_ps(sv, _mm512_sub_ps(_mm512_cvtepi32_ps(p), cvb), sumf);
+        }
+        for (; b < nb; b++) {                   // 尾部单块（n_in/32 为奇数时）
+            const uint8_t* w0 = row + (size_t)b * 34;
+            __m256i qw = _mm256_loadu_si256((const __m256i*)(w0 + 2));
+            __m256i qx = _mm256_loadu_si256((const __m256i*)(qxbuf + b * 32));
+            __m512i qw512 = _mm512_castsi256_si512(qw);
+            __m512i qx512 = _mm512_castsi256_si512(qx);
+            __m512i p = _mm512_dpbusd_epi32(_mm512_setzero_si512(), _mm512_xor_si512(qw512, off), qx512);
+            const float a = _cvtsh_ss(*(const unsigned short*)w0) * dxbuf[b];
+            sumf = _mm512_fmadd_ps(_mm512_set1_ps(a),
+                                   _mm512_sub_ps(_mm512_cvtepi32_ps(p), _mm512_set1_ps(128.0f * (float)sxbuf[b])),
+                                   sumf);
+        }
+        y[o] = _mm512_reduce_add_ps(sumf);
+    }
+}
+
+// 标量整数参考（用于自证：C 路径必须与它**逐位相同**）
+static void path_int8_scalar(const float* x, const uint8_t* W, int n_out, int n_in, float* y,
+                             int8_t* qxbuf, float* dxbuf) {
+    const int nb = n_in / 32;
+    quant_x_q8(x, n_in, qxbuf, dxbuf);
+    for (int o = 0; o < n_out; o++) {
+        const uint8_t* row = W + (size_t)o * nb * 34;
+        double acc = 0.0;
+        for (int b = 0; b < nb; b++) {
+            const uint8_t* blk = row + (size_t)b * 34;
+            const int8_t* qw = (const int8_t*)(blk + 2);
+            int32_t s = 0;
+            for (int i = 0; i < 32; i++) s += (int32_t)qw[i] * (int32_t)qxbuf[b * 32 + i];
+            const float dw = _cvtsh_ss(*(const unsigned short*)blk);
+            acc += (double)(dw * dxbuf[b]) * (double)s;
+        }
+        y[o] = (float)acc;
+    }
+}
+
 // 供 Python 调用：把两种路径都跑一遍（数值由调用方比对，计时也由调用方做）
 void bench_path(int which, const float* x, const uint8_t* W, int n_out, int n_in, float* y,
                 int8_t* qxbuf, float* dxbuf) {
     if (which == 0) path_fp32(x, W, n_out, n_in, y);
-    else path_int8(x, W, n_out, n_in, y, qxbuf, dxbuf);
+    else if (which == 1) path_int8(x, W, n_out, n_in, y, qxbuf, dxbuf);
+    else if (which == 2) path_int8_vnni(x, W, n_out, n_in, y, qxbuf, dxbuf, (int32_t*)(dxbuf + 4096));
+    else path_int8_scalar(x, W, n_out, n_in, y, qxbuf, dxbuf);
 }
