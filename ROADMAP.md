@@ -236,7 +236,13 @@
      且测试自证"复位确实改变数值"以免测试无效）。已登记进 `IMPLEMENTED_OPS`。
      坑：偏置必须**最后**加 —— 我先写成"从 b 起累加"，差 **1 ULP**，而判据是逐位相同
      （对账用：差 1 ULP 说明顺序没对齐，不是"精度问题"）。
-  ② `ssm_scan`（SSM 递推：离散化 dt/A/B + 选择性扫描）—— **待做**
+  ② ✅ **`ssm_scan`**（SSM 递推，Mamba2 风格）：`dt=softplus(dt_pre+dt_bias)`（clamp）→
+     `dA=exp(dt*a)`、`x'=dt*x` → `h = dA*h + x'⊗b` → `y = Σ h*c + d*x`。
+     KAT **内部一致性**通过：与朴素逐帧参考**逐位相同**、状态复位确实影响输出（|Δ|=0.121）、
+     a≤0 时 50 步稳态有界（|h|max=0.21）。
+     ⚠️ **公式本身尚未与 llama.cpp 对账**（a 的取法、softplus 的 clamp 界、D 跳连的位置都要读
+     `build_mamba2_layer` 逐行核对后回填）—— 这是**有意标注**：B1 那次"四个自写实现互相打架"
+     就是自写参考自证的代价，所以这里只声称"内部一致"，不声称"与参考一致"。
   ③ `kda_delta`（KDA 三分支卷积 + delta-net 递推 + o_norm/out_gate）—— **待做**
   （`unimplemented_ops()` 现在会自动报 `ssm: [ssm_scan]`、`kda: [kda_delta]`）
 - **剩余（数值层收尾）**：实现上述 2 个算子后，拿 granite-h-tiny / Ling 的真权重跑逐层对账 ——

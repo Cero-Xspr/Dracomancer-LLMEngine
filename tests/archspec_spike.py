@@ -178,7 +178,7 @@ LAYER_STEPS_KDA = [
 
 # 求值器**已实现**的 op（其余 op 就是 C3 剩下的工作清单）
 IMPLEMENTED_OPS = ("rms_norm", "mul_mat", "rope", "attn_gqa", "silu_mul", "add", "moe_ffn",
-                   "ssm_conv")   # ← C3 数值层第①个（2026-09-15，KAT 通过）
+                   "ssm_conv", "ssm_scan")   # ← C3 数值层①②（2026-09-15，内部 KAT 通过）
 
 
 
@@ -267,6 +267,86 @@ def kat_ssm_conv():
             if not same:
                 raise SystemExit("ssm_conv KAT 失败：与朴素参考不逐位相同")
     print("  ✅ ssm_conv KAT 通过（含状态推进与 pos==0 复位语义）")
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# C3 数值层 ②：ssm_scan —— 选择性扫描（SSM 递推）
+#   公式（Mamba2 风格，逐头；对应 llama.cpp `build_mamba2_layer` 的递推式）：
+#     dt   = softplus(dt_pre + dt_bias)      # 时间步，softplus 后按 clamp 上下界截断
+#     dA   = exp(dt * a)                     # 离散化后的状态衰减（a 一般 ≤ 0）
+#     x'   = dt * x                          # 离散化输入
+#     h    = dA * h + x' ⊗ b                 # 状态递推（h: [n_head, state]）
+#     y    = Σ_state h * c  + d * x          # 读出头 + D 跳连
+#   ⚠️⚠️ **本实现只做了"内部一致性"验证**（KAT：与朴素逐帧循环逐位相同、状态复位、
+#      形状与边界），**公式本身尚未与 llama.cpp 对账** —— a 的取法、softplus 的 clamp 界、
+#      D 跳连是否在门控之前，都必须读 `build_mamba2_layer` 逐行核对后回填（见 ROADMAP C3）。
+#      这是有意的诚实标注：B1 那次"四个自写实现互相打架"就是自写参考自证的代价。
+# ═══════════════════════════════════════════════════════════════════════════
+def ssm_scan_step(x, dt_pre, dt_bias, a, b, c, d, h, clamp=(-4.0, 4.0)):
+    """单步 SSM 递推。h: [n_head, state] **就地更新**并返回；返回 (y, h)。
+
+    x/dt_pre: [n_head]；b/c: [n_head, state]；a/dt_bias/d: [n_head]。
+    clamp: dt 的上下界（Mamba2 里通常是 dt 限幅；值待与参考核对）。
+    """
+    dt = np.log1p(np.exp(dt_pre + dt_bias))                  # softplus（数值稳定写法）
+    dt = np.clip(dt, clamp[0], clamp[1])
+    dA = np.exp(dt * a)                                      # [n_head]
+    xp = dt * x                                              # [n_head]
+    nh, st = h.shape
+    for j in range(nh):                                      # 逐头递推（状态小、无需并行）
+        h[j] = dA[j] * h[j] + xp[j] * b[j]
+    y = np.einsum("js,js->j", h, c) + d * x
+    return y, h
+
+
+def kat_ssm_scan():
+    """内部一致性 KAT：与朴素逐帧循环逐位相同 + 状态复位语义 + 形状。"""
+    rng = np.random.RandomState(1)
+    nh, st, T = 4, 6, 5
+    a = -np.abs(rng.randn(nh).astype(np.float32))            # a ≤ 0
+    dt_bias = (rng.randn(nh).astype(np.float32) * 0.1)
+    d = (rng.randn(nh).astype(np.float32) * 0.1)
+    xs = [rng.randn(nh).astype(np.float32) * 0.5 for _ in range(T)]
+    bs = [rng.randn(nh, st).astype(np.float32) * 0.5 for _ in range(T)]
+    cs = [rng.randn(nh, st).astype(np.float32) * 0.5 for _ in range(T)]
+    dts = [rng.randn(nh).astype(np.float32) * 0.5 for _ in range(T)]
+
+    # ① 参考：朴素逐帧（同一公式、同一运算顺序，用于确认"实现没写歪"）
+    h_ref = np.zeros((nh, st), np.float32)
+    ys_ref = []
+    for t in range(T):
+        dt = np.log1p(np.exp(dts[t] + dt_bias))
+        dt = np.clip(dt, -4.0, 4.0)
+        h_ref = np.exp(dt * a)[:, None] * h_ref + (dt * xs[t])[:, None] * bs[t]
+        ys_ref.append(np.einsum("js,js->j", h_ref, cs[t]) + d * xs[t])
+    ys_ref = np.array(ys_ref)
+
+    # ② 被测
+    h = np.zeros((nh, st), np.float32)
+    ys = []
+    for t in range(T):
+        y, h = ssm_scan_step(xs[t], dts[t], dt_bias, a, bs[t], cs[t], d, h)
+        ys.append(y)
+    ys = np.array(ys)
+    same = np.array_equal(ys, ys_ref)
+    print(f"  ① 与朴素逐帧参考：逐位相同={same}  max|Δ|={np.abs(ys-ys_ref).max():.2e}")
+
+    # ③ 状态复位语义（新序列 h 清零 ⇒ 输出必须变）
+    h2 = np.zeros((nh, st), np.float32)
+    y_first = ssm_scan_step(xs[0], dts[0], dt_bias, a, bs[0], cs[0], d, h2.copy())[0]
+    y_warm = ssm_scan_step(xs[0], dts[0], dt_bias, a, bs[0], cs[0], d, h.copy())[0]
+    diff = float(np.abs(y_first - y_warm).max())
+    print(f"  ② 状态复位确实影响输出：max|Δ|={diff:.4f}" + ("" if diff > 1e-6 else "  ⚠️ 无效"))
+    # ④ 状态有界性（a≤0 ⇒ |h| 不应发散）
+    h3 = np.zeros((nh, st), np.float32)
+    for t in range(50):
+        _, h3 = ssm_scan_step(xs[t % T], dts[t % T], dt_bias, a, bs[t % T], cs[t % T], d, h3)
+    finite = bool(np.isfinite(h3).all()) and float(np.abs(h3).max()) < 1e3
+    print(f"  ③ 稳态有界（a≤0，50 步）：{'✓' if finite else '✗'}  |h|max={float(np.abs(h3).max()):.2f}")
+    if not (same and diff > 1e-6 and finite):
+        raise SystemExit("ssm_scan KAT 失败")
+    print("  ✅ ssm_scan KAT（**内部一致性**）通过 —— 注意：公式本身尚未与 llama.cpp 对账")
 
 
 def unimplemented_ops():
