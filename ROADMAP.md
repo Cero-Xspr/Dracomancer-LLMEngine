@@ -196,7 +196,20 @@
   失败时给出可复现命令。
 - **做完标准**：一个新模型接进来，一条命令就能给出"可以去提 issue 的证据包"。
 
-### C3 💤 声明式表达力覆盖混合 SSM/KDA
+### C3 🔄 进行中（2026-09-15 第一小步：**完整性校验 + 把 SSM/KDA 的待定事实显式列出来**）
+- **已完成**：`archspec_spike.py` 新增 `validate_spec()` —— 每条语义事实必须带
+  `(value, why, shape_invisible, how_found)` 四件套，`value=None` 视为**未确定**，一律 `SystemExit` 报错。
+  **纪律：缺字段必须报错，不许静默走默认**（静默默认＝"能跑但算错"，比报错危险得多）。
+- **已完成**：`SEMANTICS_SSM`（granite-hybrid/Mamba 系）与 `SEMANTICS_KDA`（bailingmoe3）各列出 5 条
+  **已知需要、尚未测定**的事实（层类型索引方式、卷积宽度/状态复位语义、dt 秩、门控 clamp、衰减参数取法、
+  beta 激活、norm 位置…），每条都写清"要看什么"，`value=None` ⇒ 现在这两族**跑不起来**（会被拦），
+  这正是"没覆盖"该有的样子。
+- **自证**：`selftest_validate()` 证明拦得住 —— 完整规格通过；SSM/KDA 被拦；删掉一条事实的 `how_found`
+  也被拦（避免"校验器自己不报错"的假通过）。
+- **剩余**：把这 10 条待定事实逐条测定（读 llama.cpp 参考实现 + 对照 GGUF 张量/超参）后回填 `value`，
+  再让 spike 真跑一遍这两族、与参考实现对数。
+
+### C3（旧描述，保留）声明式表达力覆盖混合 SSM/KDA
 - archspec spike 已验证 llama 密集 + MoE（cos 0.999962 / 0.9998），但 granite-hybrid、bailingmoe3(KDA) 还没进。
 - **做完标准**：把这两族的"形状看不出来的语义事实"补进 `SEMANTICS_*`，并让缺失字段**报错而不是默认**。
 
