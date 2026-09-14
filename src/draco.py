@@ -1367,6 +1367,9 @@ def apply_profile_defaults(args, model):
     if not args.max_tokens and "max_tokens_default" in sp:
         args.max_tokens = sp["max_tokens_default"]
     args.think_default = sp.get("think_default", False)
+    # ★ 档案也可给"推荐的思考流式粒度"（sampling.think_hold）—— 开箱即用，不必让用户记环境变量。
+    #   命令行没有 /hold 之前用它作为初始值（用户仍可用 /hold 覆盖）。
+    args.think_hold = sp.get("think_hold") or None
 
 
 def cmd_family(args):
@@ -1491,7 +1494,7 @@ def loop_chat(srv, args):
     #   不支持该开关的模板会忽略这个 kwargs（已用 Llama-3.2 验证无害）。
     #   注册表档案可用 sampling.think_default 覆盖这个默认。
     think = getattr(args, "think_default", False)
-    hold = None            # 思考流式粒度（/hold 设置；仅自研引擎 dengine 生效）
+    hold = getattr(args, "think_hold", None)   # 档案推荐值；/hold 可覆盖（仅 dengine 生效）
     rep = args.repeat_penalty
     in_think = [False]
     while True:
@@ -1516,6 +1519,10 @@ def loop_chat(srv, args):
                 print(f"  温度={temp}  重复惩罚={rep}  seed={seed}  最多生成={maxtok or '不限'}  "
                       f"ctx={args.ctx}  后端={srv.backend}  模型={srv.model.name}")
                 print(f"  系统提示={system or '(无)'}")
+                if srv.backend == "dengine":
+                    print(f"  思考流式粒度={hold or '(引擎默认 line)'}   （/hold line|token|dup 可改）")
+                think_txt = "开" if think else "关"
+                print(f"  思考模式={think_txt or '(模板默认)'}   （/think on|off|auto）")
             elif c == "temp":
                 try:
                     temp = float(rest); print(f"  温度 → {temp}")

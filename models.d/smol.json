@@ -19,7 +19,8 @@
     }
   },
   "sampling": {
-    "think_default": false
+    "think_default": false,
+    "think_hold": "line"
   },
   "notes": "SmolLM2 135M/360M Instruct（Q4_K_M）。llama 密集架构、GQA 9/3（135M）。",
   "source": {

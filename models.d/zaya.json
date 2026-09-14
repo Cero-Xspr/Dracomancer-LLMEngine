@@ -24,7 +24,8 @@
     }
   },
   "sampling": {
-    "think_default": false
+    "think_default": false,
+    "think_hold": "dup"
   },
   "notes": "ZAYA1-8B：CCA（卷积注意力）+ MLP 路由 MoE 的交替混合架构（80 blk = 40 注意力 + 40 MoE）。维护者内测档案（2026-09-13 起为 schema v2）。 ★ 2026-09-15：ZAYA 是推理模型但**不写 </think>**（llama.cpp 亦然）；draco 默认 think off，/think on 时由引擎侧兜底分区显示。",
   "source": {

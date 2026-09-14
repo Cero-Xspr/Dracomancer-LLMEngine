@@ -23,5 +23,8 @@
     "date": "2026-09-15",
     "issue": null,
     "selfcheck_ref": null
+  },
+  "sampling": {
+    "think_hold": "dup"
   }
 }
