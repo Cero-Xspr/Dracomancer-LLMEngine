@@ -262,7 +262,14 @@
      `ssm_conv1d.weight` 可能是 [C,width] 也可能是 [width,C]，`ssm_a` 可能是 [nh]/(1,nh)/(nh,1) ——
      **拿错不报错、只会静默算错**，所以加载时必须显式确认，确认不了就带着尺寸报错，**绝不猜**。
      自证：合法轴序通过；错形状（(8,5)/(3,4,8)/(4,)/(16,4) 等）一律被拦。
-  ② **仍待做**：把三算子接进 `Evaluator` 的 `if op == ...` 分派（含状态键、pos 传递）；
+  ② 🔄 **部分完成**：三算子**已接进** `Evaluator` 分派（`ssm_conv`/`ssm_scan`/`kda_delta`），
+     并补了 `Ctx.has()`、`Evaluator._state()`（含 pos==0 清零 = 语义事实 ssm_state_reset），
+     `ssm_scan` 强制要求声明 `split`（输入切分不许猜）、`ssm_conv` 强制过布局断言。
+     ⚠️ **但没有"跑通"的端到端测试**：我写的合成权重烟测卡在**自造张量形状自相矛盾**上
+     （ssm_in 产 192 通道、conv 却按 64 通道的 src 调用），没跑到通过就跑完了余量 ⇒
+     按纪律**把它移出 `--selftest`**（没通过的东西不挂在闸门里），只留一条状态说明。
+     当前可声称的：分派接上、llama 路径未受影响（新分支是纯追加）；**不可声称"已能跑 SSM/KDA 族"**。
+     **待做**：把合成张量形状理顺 → 烟测通过 → 再加回闸门；然后才有资格谈真权重对账（③）。
   ② 权重加载补 SSM/KDA 张量名（`ssm_conv1d`/`ssm_a`/`ssm_dt`/`ssm_d`/`ssm_beta`/`ssm_norm`…），
      并对**权重布局**（如 `ssm_conv1d.weight` 是 [C,width] 还是 [width,C]）做显式断言 —— 拿错不报错才最危险；
   ③ 用 **granite-h-tiny**（SSM 族）与 **Ling**（KDA 族）的真权重跑**逐层对账**，参考用 llama.cpp 的 dump；

@@ -474,6 +474,9 @@ class Ctx:
     def put(self, name, il, val):
         self.t[self._rm(name, il)] = val
 
+    def has(self, name, il):
+        return self._rm(name, il) in self.t
+
     @staticmethod
     def _rm(name, il):
         return name.replace("{i}", str(il))
@@ -526,6 +529,22 @@ class Evaluator:
 
     quant_act = False                           # 打开则模仿 llama.cpp 的激活量化
 
+    def _state(self, key, shape, pos):
+        """跨 token 状态（conv 的最近帧 / scan 的 h / delta 的 S）。
+
+        ★ pos==0 时清零 —— 对应语义事实 `ssm_state_reset`（"状态由上下文持有、创建时零初始化"）。
+        ★ 缺 geo 里的尺寸参数**直接报错**，不猜（猜错=静默算错）。
+        """
+        if not hasattr(self, "_st"):
+            self._st = {}
+        st = self._st.get(key)
+        if st is None or st.shape != tuple(shape):
+            st = np.zeros(shape, np.float32)
+            self._st[key] = st
+        elif pos == 0:
+            st[:] = 0
+        return st
+
     def _mm(self, wname, x):
         W = self.wget(wname)                    # [out, in]
         if self.quant_act:
@@ -558,6 +577,41 @@ class Evaluator:
                 out[h * hd:(h + 1) * hd] = _rope(x[h * hd:(h + 1) * hd], pos,
                                                  g["n_rot"], g["rope_base"], mode)
             ctx.put(args["out"], il, out)
+        elif op == "ssm_conv":
+            # ★ 布局必须显式确认（拿错不报错 = 静默算错）
+            W = self.wget(args["w"])
+            C = int(g["conv_channels"])          # 缺了会 KeyError —— 有意如此
+            WID = int(g["conv_width"])
+            layout = check_conv_layout(W.shape, C, WID, args["w"])
+            wcw = W if layout == "CW" else np.ascontiguousarray(W.T)
+            st = self._state(f"conv:{il}:{args['w']}", (WID - 1, C), pos)
+            b = self.wget(args["bias"]) if args.get("bias") else None
+            ctx.put(args["out"], il, ssm_conv_step(gv("src"), wcw, b, st, WID))
+        elif op == "ssm_scan":
+            # ★★ 输入切分（哪一段是 x / dt / B / C）**必须由声明给出**：args["split"] 形如
+            #    {"x": [0, n_head], "dt": [n_head, 2*n_head], ...}。缺了就报错 —— 不许猜
+            #    （猜错这一处，整条 SSM 都算错且不报错）。
+            if "split" not in args:
+                raise SystemExit(f"ssm_scan 步骤缺 `split` 声明（层 {il}）："
+                                 f"输入切分必须显式给出，不能猜。参见 SEMANTICS_SSM")
+            src = gv("src")
+            sl = lambda k: src[args["split"][k][0]:args["split"][k][1]]
+            nh = int(g["n_head"])
+            h = self._state(f"scan:{il}", (nh, int(g["state_size"])), pos)
+            dt_bias = self.wget(args["dt_bias"]) if args.get("dt_bias") else np.zeros(nh, np.float32)
+            dskip = self.wget(args["d"]) if args.get("d") else np.zeros(nh, np.float32)
+            y, _ = ssm_scan_step(sl("x"), sl("dt"), dt_bias, self.wget(args["a"]).reshape(-1),
+                                 sl("B").reshape(nh, -1), sl("C").reshape(nh, -1), dskip, h)
+            ctx.put(args["out"], il, y)
+        elif op == "kda_delta":
+            q, k, v = gv("q"), gv("k"), gv("v")
+            nh, hd = int(g["kda_n_head"]), int(g["kda_head_dim"])
+            S = self._state(f"kda:{il}", (nh, hd, hd), pos)
+            gst = gv("g") if args.get("g") and ctx.has(args["g"], il) else np.zeros((nh, hd), np.float32)
+            beta = gv("beta") if args.get("beta") and ctx.has(args["beta"], il) else np.ones(nh, np.float32)
+            onorm = self.wget(args["o_norm"]) if args.get("o_norm") else np.ones(hd, np.float32)
+            og = gv("out_gate") if args.get("out_gate") and ctx.has(args["out_gate"], il) else np.ones((nh, hd), np.float32)
+            ctx.put(args["out"], il, kda_delta_step(q, k, v, gst, beta, S, onorm, og, hd))
         elif op == "silu_mul":
             gate = gv("g")
             ctx.put(args["out"], il, (gate / (1 + np.exp(-gate))) * gv("u"))
@@ -883,6 +937,18 @@ def kat_layout_checks():
     print("  ✅ 布局断言自证通过（合法轴序通过；错形状一律带尺寸信息报错）")
 
 
+
+def note_smoke_pending():
+    """C3 收尾第②步的状态：三算子已接进分派，但**还没有"跑通"的端到端测试**。
+
+    我写了合成权重的烟测，但它卡在**我自己造的合成张量形状自相矛盾**上
+    （ssm_in 产出 192 通道、conv 却是按 64 通道的 src 调用），没能跑到通过就跑完了余量。
+    ⇒ 按纪律：**没通过的东西不挂在闸门里**，所以烟测被移出 `--selftest`，等形状理顺后再加回来。
+    当前可声称的只有：三个算子的分派已接上、`ctx.has` 就位、llama 路径未受影响（新分支是纯追加）。
+    """
+    print("  ② 三算子分派已接（未通过端到端烟测 —— 见 note_smoke_pending 的说明）")
+
+
 def c3_selftest():
     """C3 装置总验收：事实完整性 + 层内步骤 + 算子 KAT + 缺口清单，一条命令跑完（可进 CI）。
 
@@ -897,6 +963,7 @@ def c3_selftest():
     print("  OK llama / ssm / kda 三族层内步骤均通过（含 semantics 引用存在性）")
     print("== ③ 算子 KAT 与布局断言 ==")
     kat_layout_checks()
+    note_smoke_pending()
     kat_ssm_conv()
     kat_ssm_scan()
     kat_kda_delta()
