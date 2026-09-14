@@ -1094,6 +1094,11 @@ def cmd_tune(args):
 
     cache = _load_tune_cache()
     fp = _model_fingerprint(m)
+    try:
+        from hwprobe import power_state
+        print(f"  {power_state()}")
+    except Exception:
+        pass
     print(f"tune：{m.short}  后端={backend}  模型指纹={fp}")
     print(f"  配置数 {len(space)}，每组生成 {args.tokens} token；缓存 {TUNE_CACHE}")
     rows = []

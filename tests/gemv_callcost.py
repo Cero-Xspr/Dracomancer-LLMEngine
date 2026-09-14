@@ -54,6 +54,12 @@ if not line:
     print("采集失败：", r.stdout[-300:], r.stderr[-500:]); sys.exit(1)
 d = json.loads(line[6:])
 NT, recs = d["nt"], d["recs"]
+try:
+    sys.path.insert(0, BASE)
+    from hwprobe import power_state
+    print(power_state())
+except Exception:
+    pass
 print(f"模型 {m.name}  引擎 {ENG}  线程 {T}  采样 {NT} 个 token")
 print(f"引擎报告 {len(recs)} 个不同的 (格式, n_out, n_in) 调用组合\n")
 

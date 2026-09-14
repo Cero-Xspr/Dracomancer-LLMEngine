@@ -73,6 +73,12 @@ for r in range(ROUNDS):
             if line:
                 res[(tag, T)].append(json.loads(line[6:]))
 swap_so(B_SO, SO)
+try:
+    sys.path.insert(0, BASE)
+    from hwprobe import power_state
+    print(power_state())
+except Exception:
+    pass
 print(f"\n{ROUNDS} 轮交替，每轮 {NGEN} token（取各轮中位的再中位）\n")
 print(f"{'线程':>4s} {'A ms':>8s} {'B ms':>8s} {'提速':>7s} | {'A attn':>7s} {'B attn':>7s} | {'A ffn':>7s} {'B ffn':>7s}")
 for T in THREADS:

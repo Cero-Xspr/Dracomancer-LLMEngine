@@ -143,3 +143,31 @@ if __name__ == "__main__":
         with PowerSampler("PPT") as s:
             time.sleep(1.0)
         print("1 秒空闲采样：", s.summary())
+
+
+def power_state():
+    """当前供电/功耗状态的一行摘要（**每条性能与能耗数字都必须带上它**）。
+
+    ★ 为什么要做成工具强制项（2026-09-15 的教训）：同一份 Q8_0 gemv、同一个内核，
+      AC 上 40.4 GB/s，电池上只有 19.2~24.4（1.7~2.1×）。我一度把这个差异当成"测量噪声"，
+      其实**电池下平台 PPT 上限低得多**（用户当时没说他离电了）。能耗/性能数字脱离供电状态就没有意义。
+    """
+    import os
+    def rd(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return f.read().strip()
+        except OSError:
+            return None
+    ac = rd("/sys/class/power_supply/AC0/online")
+    st = rd("/sys/class/power_supply/BAT0/status")
+    cap = rd("/sys/class/power_supply/BAT0/capacity")
+    prof = rd("/sys/firmware/acpi/platform_profile")
+    src = "AC" if ac == "1" else ("电池" if ac == "0" else "未知")
+    bits = [f"供电={src}"]
+    if st or cap:
+        bits.append(f"{st or ''}{('/' + cap + '%') if cap else ''}")
+    if prof:
+        bits.append(f"平台档={prof}")
+    warn = "" if ac == "1" else "  ⚠️ 电池下平台功耗上限更低，性能/能耗数字偏保守（跨供电不可比）"
+    return "  ".join(bits) + warn
