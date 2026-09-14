@@ -55,7 +55,7 @@ paths = (("m6_bailing_moe(融合路由)", run(True, True)),
          ("m6_moe_batch3", run(False, False)))
 LP._BLMOE, LP._BATCH4 = True, True                       # 还原默认
 
-print(f"\n参考实现 |out|max = {np.abs(ref).max():.4f}   （差异判为"一致"的门槛：cos=1.0 且 1~2 ULP）")
+print(f"\n参考实现 |out|max = {np.abs(ref).max():.4f}   （判为「一致」的门槛：cos=1.0 且 1~2 ULP）")
 print(f"{'实现':24s} {'max|Δ|':>11s} {'cos':>14s}  结论")
 bad = 0
 for tag, r in paths:
