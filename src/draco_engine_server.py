@@ -63,7 +63,7 @@ def _load_smol():
     return dict(forward=E.forward, logits=E.logits_of_x, reset=reset,
                 encode=lambda t: TOK.encode(t, add_special_tokens=True),
                 decode=lambda ids: TOK.decode(ids), eos=EOS_ID, im_end=IM_END, max_t=MAXT,
-                system_default=DEFAULT_SYSTEM, bos=None)
+                system_default=DEFAULT_SYSTEM, bos=None, think_block=False, think_default=False)
 
 
 def _load_zaya():
@@ -186,7 +186,8 @@ def _load_zaya():
 
     return dict(forward=forward, logits=logits, reset=reset,
                 encode=enc, decode=decode, eos=eos, im_end=im_end, max_t=MAXT,
-                system_default=None, bos=2, vsz=vsz)
+                system_default=None, bos=2, vsz=vsz,
+                think_block=True, think_default=True)   # ZAYA 模板默认开思考，用空 think 块关
 
 
 def load_engine():
@@ -211,9 +212,15 @@ def reset_state():
     AP["reset"]()
 
 
-def render_chatml(messages):
+def render_chatml(messages, enable_thinking=None):
     """ChatML（SmolLM2 与 ZAYA 同族）。★ 手写渲染而非 jinja：模板字段变了显式报错。
-    默认 system 按引擎取（SmolLM 有官方默认；ZAYA 不加）。"""
+
+    ★★ 生成前缀必须**逐字照模型自己的模板**（2026-09-14 用户报「无法关思考、思考撑满 max_tokens」）：
+        {%- if enable_thinking %}   <|im_start|>assistant\n<think>\n
+        {%- else %}                 <|im_start|>assistant\n<think>\n</think>\n\n
+    关思考靠的是**预填一个空的 think 块**（模型看到空块就直接作答）。我第一版只发
+    `<|im_start|>assistant\n`，既没读 enable_thinking 也没预填 ⇒ 永远雷霆大思考。
+    """
     parts = []
     msgs = list(messages)
     sysdef = AP.get("system_default")
@@ -221,7 +228,13 @@ def render_chatml(messages):
         msgs.insert(0, {"role": "system", "content": sysdef})
     for m in msgs:
         parts.append(f"<|im_start|>{m.get('role','user')}\n{m.get('content','')}<|im_end|>\n")
-    parts.append("<|im_start|>assistant\n")
+    # 思考开关：None = 按模型模板默认（ZAYA 模板默认 True）
+    think = AP.get("think_default", True) if enable_thinking is None else bool(enable_thinking)
+    if AP.get("think_block"):
+        parts.append("<|im_start|>assistant\n<think>\n" if think
+                     else "<|im_start|>assistant\n<think>\n</think>\n\n")
+    else:
+        parts.append("<|im_start|>assistant\n")
     return "".join(parts)
 
 
@@ -239,10 +252,12 @@ def sample(logits, temp, seed_rng, repeat_penalty, recent):
     return int(np.argmax(z))
 
 
-def generate(messages, max_tokens, temp, seed, repeat_penalty):
+def generate(messages, max_tokens, temp, seed, repeat_penalty, enable_thinking=None):
     """生成器：yield (文本增量, 计时dict)。最后一次 yield 后返回 timing。"""
     rng = random.Random(seed if seed and seed > 0 else None)
-    text = render_chatml(messages)
+    think_now = (AP.get("think_default", True) if enable_thinking is None
+                 else bool(enable_thinking))
+    text = render_chatml(messages, enable_thinking)
     ids = AP["encode"](text)
     if AP.get("bos"):
         ids = [AP["bos"]] + ids
@@ -274,7 +289,11 @@ def generate(messages, max_tokens, temp, seed, repeat_penalty):
         if len(full) > sent:
             if t_first is None:
                 t_first = time.time()
-            yield full[sent:], {}
+            for kind, piece in _split_think_stream(
+                    full, sent,
+                    start_inside=bool(AP.get("think_block")) and think_now):
+                if piece:
+                    yield kind, piece, {}
             sent = len(full)
         AP["forward"](nid, len(ids) + i)
     dec_s = time.time() - t1
@@ -284,7 +303,38 @@ def generate(messages, max_tokens, temp, seed, repeat_penalty):
         "predicted_n": len(out), "predicted_per_second": round(len(out) / dec_s, 1) if dec_s else 0,
         "ttft_ms": ttft_ms,
     }
-    yield "", timings
+    yield "content", "", timings
+
+
+def _split_think_stream(full, sent, start_inside=False):
+    """把**已生成全文**里 sent 之后的部分，按当前是否在 <think> 内切成 (kind, 文本)。
+
+    kind="reasoning" 落在 <think>...</think> 内（draco 会暗色加 [思考] 前缀显示），
+    其余为 "content" —— 与 llama-server 对推理模型的行为一致。
+
+    ★ start_inside：**开思考的 <think> 是提示词预填的**（ZAYA 模板的生成前缀就带 `<think>\n`），
+      所以模型输出里只有 `</think>`、没有开标签。只统计输出里的标签会判成"不在思考中"，
+      于是思考文本跑到 content 里（我第一版就是这样，用户看到的现象是"思考没被标出来"）。
+    """
+    out = []
+    i = sent
+    inside = start_inside
+    while i < len(full):
+        nxt_open = full.find("<think>", i)
+        nxt_close = full.find("</think>", i)
+        if nxt_open != -1 and (nxt_close == -1 or nxt_open < nxt_close):
+            out.append(("content", full[i:nxt_open]))
+            inside = True
+            i = nxt_open + len("<think>")
+            continue
+        if nxt_close != -1:
+            out.append(("reasoning" if inside else "content", full[i:nxt_close]))
+            inside = False
+            i = nxt_close + len("</think>")
+            continue
+        out.append(("reasoning" if inside else "content", full[i:]))
+        i = len(full)
+    return out
 
 
 def text_out_chunks(text, size=8):
@@ -326,6 +376,8 @@ class Handler(BaseHTTPRequestHandler):
         temp = float(req.get("temperature") or 0)
         seed = int(req.get("seed") or -1)
         rp = float(req.get("repeat_penalty") or 1.0)
+        ctk = req.get("chat_template_kwargs") or {}
+        think = ctk.get("enable_thinking")          # None = 按模型默认
         rid = f"draco-eng-{int(time.time()*1000)}"
         try:
             if req.get("stream"):
@@ -333,11 +385,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "text/event-stream")
                 self.end_headers()
                 timing = {}
-                for delta, tim in generate(msgs, mt, temp, seed, rp):
+                for kind, delta, tim in generate(msgs, mt, temp, seed, rp, think):
                     if tim:
                         timing = tim
+                    # kind=reasoning → reasoning_content（draco 会暗色显示为 [思考]）
+                    dkey = "reasoning_content" if kind == "reasoning" else "content"
                     chunk = {"id": rid, "object": "chat.completion.chunk",
-                             "choices": [{"index": 0, "delta": {"content": delta or None},
+                             "choices": [{"index": 0, "delta": {dkey: delta or None},
                                           "finish_reason": None}]}
                     if tim:      # 最后一片：附 usage/timings（draco 两种格式都认）
                         chunk["usage"] = {"completion_tokens": timing["predicted_n"],
@@ -349,14 +403,16 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
                 self.wfile.write(b"data: [DONE]\n\n")
             else:
-                parts, timing = [], {}
-                for delta, tim in generate(msgs, mt, temp, seed, rp):
+                parts, reasoning, timing = [], [], {}
+                for kind, delta, tim in generate(msgs, mt, temp, seed, rp, think):
                     if tim:
                         timing = tim
-                    parts.append(delta)   # 逐 token 增量 → 拼回全文（同一条 generate 路径）
+                    (reasoning if kind == "reasoning" else parts).append(delta)
                 return self._json(200, {
                     "id": rid, "object": "chat.completion",
-                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "".join(parts)},
+                    "choices": [{"index": 0, "message": {"role": "assistant",
+                                                         "content": "".join(parts) or None,
+                                                         "reasoning_content": "".join(reasoning) or None},
                                  "finish_reason": "stop"}],
                     "usage": {"completion_tokens": timing.get("predicted_n", 0),
                               "prompt_tokens": timing.get("prompt_n", 0),
