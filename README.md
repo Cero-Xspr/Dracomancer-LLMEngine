@@ -16,8 +16,10 @@ Dracomancer 是一个自研的 **GGUF 量化推理引擎**（端侧优先：内�
 | `models.d/` | 注册表本体：每个 `*.json` 是一份模型档案 |
 | `src/draco.py` | 启动器 / 聊天 CLI：`list` `chat` `serve` `perf` `selfcheck` `caps` `tune` |
 | `src/adapt_schema.py` | 档案 schema 的**唯一**实现（只依赖标准库） |
+| `src/gguf_fast.py` | **只读 GGUF 解析器**（gguf-py 的兼容子集）：元数据解析快 40~50×，见下 |
 | `src/gguf_probe.py` | **能力探针**：加载之前静态判定（类型被移除 / 架构未实现 / 可能可以） |
 | `src/hwprobe.py` | 功率传感器按 name+label 定位（不按 hwmon 编号——编号会变） |
+| `tests/` | 自带对账/单测：`gguf_fast_check.py`（逐字节对账 gguf-py）、`test_think_split.py`（思考分区不变式）、`backend_ab.py`（后端单轮对拍） |
 | `release/validate_submission.py` | 提交校验器（schema/白名单 + 可选 GGUF 匹配核对） |
 | `.github/` | 「模型适配」issue 表单 + 自动校验 bot（只做 schema 级过滤，不替代人工复核） |
 
@@ -36,6 +38,43 @@ Dracomancer 是一个自研的 **GGUF 量化推理引擎**（端侧优先：内�
 默认路径是本机布局；别人的机器用环境变量覆盖，无需改代码：
 `DRACO_GGUF_DIRS`（模型目录，冒号分隔）、`DRACO_LLAMA_ROOT`（llama.cpp 发布包）、
 `DRACO_LOCAL_BASE`（自研构建/源码树）、`DRACO_FLM_DIR`（FastFlowLM，npu 后端）。
+
+### 速度-能效倾向：`-P / --prefer`
+
+这台机器上**"更快"和"更省"不是同一个后端**（实测：iGPU 吞吐 ≈1.2~1.75× CPU，
+而 NPU 最省电却最慢），所以倾向是个显式选项，不是一个"自动最优"的黑箱：
+
+| 值 | 选什么 | 依据 |
+|---|---|---|
+| `balanced`（默认） | 自研引擎优先 / 档案推荐后端 | 主线是引擎，不做额外调 |
+| `speed` | 按实测 tok/s 挑最快的后端 | 有实测就用实测；没有才用先验（iGPU≈1.2×CPU），并在输出里写明"这是先验" |
+| `eco` | 按实测 J/token 挑最省的后端，线程取 4 | 没有能耗实测时按本机能耗序（NPU<iGPU<CPU） |
+
+```bash
+python3 src/draco.py chat -m zaya -P eco      # 要省电
+export DRACO_PREFER=speed                     # 也可以一次性设定
+```
+
+倾向只改**两个有实测支撑的旋钮**（后端、线程数）。量化格式、kernel 融合、LM head、
+NPU 整数 madd 这些真正的杠杆不是"调参"能动的——那是改代码，不做成假旋钮。
+每次启动都会把决策依据打出来（选定谁、候选怎么排、哪条是实测哪条是先验）。
+
+### 装载速度：元数据解析是隐藏的大头
+
+`gguf.GGUFReader` 在 ZAYA1-8B（5.19 GB / 262k 词表 / 1283 张量）上要 **13.6 s**，
+而且**磁盘读 0 字节**——cProfile 指认元凶是每个字符串元素一次 numpy 封装
+（词表三件套 78 万元素 ⇒ 830 万次 numpy 调用）。`src/gguf_fast.py` 用 `mmap` + `struct`
+直接切，**0.29 s（47×）**，并且逐字节对账 `gguf-py` 完全一致（`tests/gguf_fast_check.py`）。
+配合张量零拷贝（mmap 基址页对齐 ⇒ 文件偏移已 64 对齐的张量直接交给内核，不搬）
+与"适配器不再 import transformers"（2.83 s → 0.04 s），端到端：
+
+| 模型 | 改前 | 改后 |
+|---|---|---|
+| ZAYA1-8B（5.19 GB） | ~39 s | **3.05 s** |
+| Ling 3.0 Tiny（4.58 GB） | ~13 s | **1.62 s** |
+| SmolLM2-360M（0.25 GB） | 5.68 s | **0.29 s** |
+
+（同机 llama.cpp 装载 ZAYA 约 6 s，作参照。）
 
 ## 三档适配（为什么是"参数文件"，不是"代码"）
 
@@ -81,3 +120,7 @@ Dracomancer 是一个自研的 **GGUF 量化推理引擎**（端侧优先：内�
 适配数据来自一台 Ryzen AI 9 H365（Strix）笔记本，22 GB 内存、无独显（Radeon 890M 核显）、
 AMD XDNA2 NPU。性能数字是「此刻此机」，跨机不可比——档案里请写**相对结论**
 （哪个后端更好、安全上界在哪），而不是绝对 tok/s。
+
+实测口径：能耗用 APU 封装功率（hwmon 的 PPT，按 name+label 找，不按编号——编号会变），
+采样前静置 1.5 s、只取负载段、窗口拉到 ≥6 s、用中位数；同一配置两次跑可差 30%，
+所以**能耗结论只在机器安静时成立**，而 tok/s 随时可信。

@@ -441,6 +441,137 @@ def profile_backend(model):
     return hint if hint in BACKENDS else None
 
 
+# ═══════════════════ 速度-能效倾向（--prefer / -P） ═══════════════════
+# 用户 2026-09-15：「可以做一个可调参数去调整速度-能效倾向」。
+# 这台机器上"更快"与"更省"**不是同一个后端**，所以需要显式倾向：
+#   · 吞吐：iGPU ≈ 1.21~1.75× CPU（随模型增大而变大）；NPU 最慢（56.6 vs 89.8 tok/s）
+#   · 能耗：NPU 281 < iGPU 563 < CPU 679 mJ/token（Llama 3.2 1B 口径，见 STAGE1_NPU.md）
+# 倾向只改**两个有实测支撑的旋钮**：后端 与 线程数。别的（量化格式、kernel 融合、
+# LM head、NPU 整数 madd）不是"调参"能动的 —— 那是改代码，不该假装是旋钮。
+PREFER_CHOICES = ("speed", "balanced", "eco")
+PREFER_DOC = {
+    "speed":    "要吞吐 —— 按实测 tok/s 挑最快的后端（线程取后端默认）",
+    "balanced": "默认 —— 自研引擎（Darco）优先 / 档案推荐，不做额外调",
+    "eco":      "要能效 —— 按实测 J/token 挑最省的后端，线程取 4（实测 4~8 吞吐等价）",
+}
+# 无实测数据时的**能耗先验**：直接来自本机三方能耗定案（CPU 679 / iGPU 563 / NPU 281 mJ/token）。
+# local 与 dengine 都是"CPU 上的自己的实现"，能耗按 CPU 算。
+_ENERGY_RANK = {"npu": 0, "igpu": 1, "cpu": 2, "local": 2, "dengine": 2}
+# 无实测数据时的**吞吐先验**（iGPU 实测 1.21~1.75× CPU，取保守的 1.2）。
+# dengine/local 与 cpu 取平（1.0）：实测自研引擎与 llama.cpp 在 CPU 上同量级
+# （ZAYA 22~27 vs 21 tok/s）—— 既然是同量级就写 1.0，**不编一个"快 5%"的系数**；
+# 平局由 tie-break 决定，而 tie-break 按 balanced 次序 ⇒ 优先自研引擎。
+_SPEED_PRIOR = {"npu": 0.6, "igpu": 1.2, "cpu": 1.0, "local": 1.0, "dengine": 1.0}
+
+
+def _tune_best(m, backend):
+    """tune 缓存里该 (模型, 后端) 的最佳 J/token → (jtok, tps, 配置说明) 或 None。"""
+    try:
+        fp = _model_fingerprint(m)
+    except OSError:
+        return None
+    best = None
+    for k, e in (_load_tune_cache().get("entries") or {}).items():
+        if not k.startswith(f"{fp}|{backend}|") or not e.get("jtok"):
+            continue
+        if best is None or e["jtok"] < best[0]:
+            best = (e["jtok"], e.get("tps"), k.split("|", 2)[2])
+    return best
+
+
+def backend_metrics(m, backend):
+    """(tok/s, J/token, 来源串)。优先级：tune 实测 > MEASURED 表 > 空（用先验）。"""
+    t = _tune_best(m, backend)
+    if t:
+        return t[1], t[0], f"tune 实测（{t[2]}）"
+    v = MEASURED.get((m.name, backend))
+    if v:
+        tps, jtok = v
+        return tps, (None if jtok is None or jtok < 0 else jtok), "档案性能表"
+    return None, None, ""
+
+
+def rank_backends(m, prefer, cands=None):
+    """按倾向给候选后端排序 → [(backend, 依据串)]。
+
+    ★ 两条纪律（都是接线时踩出来的）：
+      1. **不自动挑 npu**：FLM 是另一套模型命名空间（tag），要用户显式 `-b npu`；
+         这里只排序候选，绝不会"顺手"把模型换成 NPU 上的另一个模型。
+      2. **有实测就用实测，没实测才用先验，并且把"这是先验"写在依据里** ——
+         绝不把先验系数包装成"实测更快"。MEASURED 表里的第二列是 **mJ/token**。
+    """
+    cands = list(cands if cands is not None else m.backends())
+    # ★ Darco（自研引擎）与 local（本地构建）也要进候选 —— 它们是我们**自己的链**；
+    #   否则 -P speed/eco 会把有 Darco 适配器的模型"悄悄"推给 llama.cpp（接线时实测到的反直觉）。
+    #   dengine 目前仍跑在 CPU 上（iGPU 未接线）⇒ 能耗先验按 CPU 算，通常排不过 igpu，
+    #   这正是"为什么不是自研引擎"必须在输出里说清楚的地方。
+    if dengine_adapter(m) and engine_view(getattr(m, "profile", None) or {},
+                                          "dracomancer").get("status") == "works":
+        cands.append("dengine")
+    if m.needs_local_build():
+        cands.append("local")
+    cands = [b for b in dict.fromkeys(cands) if b in BACKENDS]
+    if not cands:
+        cands = ["cpu"]
+    if prefer not in PREFER_CHOICES:
+        prefer = "balanced"
+    rows = [(b,) + backend_metrics(m, b) for b in cands]        # (backend, tps, mJ/tok, 来源)
+    bal = ["dengine", "local", "cpu", "igpu"]
+    bal_rank = lambda b: bal.index(b) if b in bal else 9
+
+    if prefer == "speed":
+        # 实测 tok/s 优先；同一后端族（CPU 上跑的 local/dengine/cpu）没有实测时，
+        # 用本机最佳实测 × 先验系数估一个量级；连一个实测都没有时直接用先验系数排序。
+        ref = max([r[1] for r in rows if r[1]] or [0])
+        def score(r):
+            if r[1]:
+                return r[1]
+            return (ref * _SPEED_PRIOR.get(r[0], 1.0)) if ref else _SPEED_PRIOR.get(r[0], 1.0)
+        rows.sort(key=lambda r: (-score(r), bal_rank(r[0])))
+    elif prefer == "eco":
+        # J/token 越小越省；没测过能耗的按本机能耗序先验（NPU<iGPU<CPU）
+        def escore(r):
+            if r[2]:
+                return r[2]
+            return 1e6 * (1 + _ENERGY_RANK.get(r[0], 3))        # 未测 ⇒ 排在所有实测之后
+        rows.sort(key=lambda r: (escore(r), bal_rank(r[0])))
+    else:
+        rows.sort(key=lambda r: bal_rank(r[0]))
+    out = []
+    for b, tps, jtok, src in rows:
+        bits = []
+        if tps:
+            bits.append(f"{tps:.1f} tok/s")
+        if jtok:
+            bits.append(f"{jtok:.0f} mJ/tok")
+        bits.append(src if src else
+                    f"无实测（先验：吞吐×{_SPEED_PRIOR.get(b, 1.0):.2f}、能耗序 {_ENERGY_RANK.get(b, 3)}）")
+        out.append((b, "，".join(bits)))
+    return out
+
+
+def choose_backend(m, prefer="balanced", backend_arg=None, threads_arg=None):
+    """解析"用哪个后端/几条线程" → (backend, threads, notes[])。
+
+    用户显式 `-b` 永远优先；否则按倾向排序取第一名。
+    线程：eco 取 4（实测 4~8 **吞吐等价**，少线程少发热 —— 功耗未单独实测，故不声称"更省电"）。
+    """
+    if backend_arg:
+        b = backend_arg
+        return b, threads_arg or BACKENDS[b]["threads_default"], [f"用户指定 -b {b}"]
+    ranks = rank_backends(m, prefer)
+    b, why = ranks[0]
+    th = threads_arg or BACKENDS[b]["threads_default"]
+    notes = [f"倾向 {prefer}：{PREFER_DOC[prefer]}"]
+    if len(ranks) > 1:
+        notes.append("候选排序：" + " > ".join(x for x, _ in ranks))
+    notes.append(f"选定 {b} —— {why}")
+    if threads_arg is None and prefer == "eco" and BACKENDS[b]["threads_default"] > 4:
+        th = 4
+        notes.append(f"eco 线程取 4（后端默认 {BACKENDS[b]['threads_default']}；实测 4~8 吞吐等价）")
+    return b, th, notes
+
+
 def pick_model(ms, want):
     """支持名字前缀/子串匹配（不区分大小写），也支持序号"""
     if want is None:
@@ -927,11 +1058,16 @@ def cmd_tune(args):
     m = pick_model(ms, args.model)
     if m is None:
         raise SystemExit("要指定模型：draco.py tune -m <模型>")
-    backend = args.backend or profile_backend(m) or "igpu"
     reasons = broken_reason(m)
     if reasons:
         raise SystemExit(f"'{m.name}' 在当前引擎上不可用 —— {reasons}")
-    threads = args.threads or BACKENDS[backend]["threads_default"]
+    # tune 的默认后端：balanced 时仍优先档案推荐（"我们已知最好"的那条，行为不变）；
+    # speed/eco 时让**倾向**来排（否则 -P 在 tune 上是哑的）。
+    _prefer = getattr(args, "prefer", None) or "balanced"
+    backend, threads, _n = choose_backend(
+        m, _prefer,
+        backend_arg=args.backend or (profile_backend(m) if _prefer == "balanced" else None),
+        threads_arg=args.threads)
 
     # 配置空间：**小**且离散。默认只在最有价值的三条轴上扫。
     base_extra = list(draco_view(m)["launch"].get("extra_args") or [])
@@ -1061,13 +1197,18 @@ def cmd_selfcheck(args):
     if args.backend == "npu":
         m = pick_flm(args.model)
         srv_model, backend = m, "npu"
+        threads = args.threads or BACKENDS["npu"]["threads_default"]
     else:
         ms = discover()
         m = pick_model(ms, args.model) or next((x for x in ms if x.supported), None)
         if m is None:
             raise SystemExit("没有可用模型")
-        srv_model, backend = m, args.backend or default_backend(m)
-    threads = args.threads or BACKENDS[backend]["threads_default"]
+        backend, threads, notes = choose_backend(
+            m, getattr(args, "prefer", None) or "balanced",
+            backend_arg=args.backend, threads_arg=args.threads)
+        srv_model = m
+        for n in notes:
+            print(f"  · {n}")
 
     prof = getattr(srv_model, "profile", None) or {}
     print(f"selfcheck：{srv_model.name}  后端={BACKENDS[backend]['desc']}"
@@ -1227,6 +1368,7 @@ def cmd_chat(args):
     ms = discover()
     m = pick_model(ms, args.model)
     backend = args.backend
+    prefer = getattr(args, "prefer", None) or "balanced"
     if m is None:
         print(BANNER)
         print("选择模型：")
@@ -1247,8 +1389,10 @@ def cmd_chat(args):
             else:
                 hint = "cpu/igpu"
             b = input(f"后端 [{hint}]（回车=默认）: ").strip().lower()
-            backend = b if b in BACKENDS else default_backend(m)
-    backend = backend or default_backend(m)
+            backend = b if b in BACKENDS else None
+    # ★ 后端/线程的最终裁决走 choose_backend（含 --prefer 倾向）
+    backend, threads, notes = choose_backend(
+        m, prefer, backend_arg=backend, threads_arg=args.threads)
 
     # ★ 支持性检查必须在"装载…"提示**之前** —— 否则会先打"装载 X"再报"X 跑不了"，
     #   自相矛盾（我实测看到过）。档案标 broken 的情况同理（也走这条更可读的理由）。
@@ -1260,8 +1404,9 @@ def cmd_chat(args):
             f"'{m.name}'（架构 {m.arch}）llama.cpp b10819 不支持，cpu/igpu 都跑不了。\n"
             f"  这类模型需要我们自己的内核（见 STAGE1_NPU.md）。"
             f"用 `draco.py list` 看哪些能跑。")
-    threads = args.threads or BACKENDS[backend]["threads_default"]
     apply_profile_defaults(args, m)
+    for n in notes:
+        print(f"  · {n}")
     print(f"\n装载 {m.name}（{m.size/1e9:.2f} GB） 后端={BACKENDS[backend]['desc']} "
           f"ctx={args.ctx} threads={threads}"
           + (f"  [档案 {m.profile.get('_file')}]" if m.profile else ""))
@@ -1431,9 +1576,12 @@ def cmd_serve(args):
     m = pick_model(ms, args.model) or next((x for x in ms if x.supported), None)
     if m is None:
         raise SystemExit("没有可用模型")
-    backend = args.backend or default_backend(m)
-    threads = args.threads or BACKENDS[backend]["threads_default"]
+    backend, threads, notes = choose_backend(
+        m, getattr(args, "prefer", None) or "balanced",
+        backend_arg=args.backend, threads_arg=args.threads)
     print(f"装载 {m.name}（{m.size/1e9:.2f} GB） 后端={BACKENDS[backend]['desc']}")
+    for n in notes:
+        print(f"  · {n}")
     srv = Server(m, backend, args.ctx, threads,
                  extra=(args.extra.split() if args.extra else None), verbose=args.verbose)
     install_cleanup(srv)
@@ -1488,6 +1636,9 @@ def main():
     p.add_argument("-t", "--threads", type=int, help="线程数（默认取后端默认）")
     p.add_argument("--tokens", type=int, default=320, help="每组生成多少 token（默认 320）")
     p.add_argument("--force", action="store_true", help="忽略缓存重测")
+    p.add_argument("-P", "--prefer", choices=PREFER_CHOICES,
+                   help="速度-能效倾向（默认取环境变量 DRACO_PREFER，否则 balanced）："
+                        "speed=挑最快后端 / eco=挑最省电后端且线程取 4 / balanced=不额外调")
     p.set_defaults(fn=cmd_tune)
 
     p = sub.add_parser("selfcheck",
@@ -1499,6 +1650,9 @@ def main():
     p.add_argument("--extra", help="额外传给 llama-server 的 flag（原样透传）")
     p.add_argument("-v", "--verbose", action="store_true", help="打印服务端命令与日志")
     p.add_argument("--json", help="把结果写成 JSON 文件（可贴进 issue）")
+    p.add_argument("-P", "--prefer", choices=PREFER_CHOICES,
+                   help="速度-能效倾向（默认取环境变量 DRACO_PREFER，否则 balanced）："
+                        "speed=挑最快后端 / eco=挑最省电后端且线程取 4 / balanced=不额外调")
     p.set_defaults(fn=cmd_selfcheck)
 
     for name, fn, h in (("chat", cmd_chat, "交互式聊天"), ("serve", cmd_serve, "起 HTTP 服务（带 Web UI）")):
@@ -1509,6 +1663,9 @@ def main():
         p.add_argument("-c", "--ctx", type=int, default=4096, help="上下文长度（默认 4096）")
         p.add_argument("--extra", help="额外传给 llama-server 的 flag（原样透传）")
         p.add_argument("-v", "--verbose", action="store_true", help="打印服务端命令与日志")
+        p.add_argument("-P", "--prefer", choices=PREFER_CHOICES,
+                       help="速度-能效倾向（默认取环境变量 DRACO_PREFER，否则 balanced）："
+                            "speed=挑最快后端 / eco=挑最省电后端且线程取 4 / balanced=不额外调")
         if name == "chat":
             p.add_argument("--temp", type=float, default=0.7, help="温度（0=贪心）")
             p.add_argument("--seed", type=int, default=-1, help="随机种子（-1=随机）")
@@ -1519,6 +1676,10 @@ def main():
         p.set_defaults(fn=fn)
 
     a = ap.parse_args()
+    # ★ 倾向默认值：环境变量 DRACO_PREFER（便于 shell 里一次性设定，如 `export DRACO_PREFER=eco`）
+    _envp = (os.environ.get("DRACO_PREFER") or "").strip().lower()
+    if _envp in PREFER_CHOICES and getattr(a, "prefer", None) is None:
+        a.prefer = _envp
     if not a.cmd:
         ap.print_help()
         return 0

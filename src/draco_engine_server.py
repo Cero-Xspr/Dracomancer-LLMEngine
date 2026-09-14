@@ -6,7 +6,7 @@
 draco 从此可以用 `-b dengine` 直接驱动**我们自己的引擎**跑 chat / serve / selfcheck / tune。
 
 设计（都是刻意的）：
-  · **只依赖**：标准库 + numpy + transformers(仅 tokenizer) + 引擎模块本体。不引 FastAPI。
+  · **只依赖**：标准库 + numpy + tokenizers(读 tokenizer.json) + 引擎模块本体。不引 FastAPI、不引 transformers。
   · **每请求全量重 prefill**：draco chat 每轮发完整历史，而 m6 的状态（KV）在 C 结构体里、
     没有 reset API —— 但状态本体（kc/vc/tlen）是 **Python 侧持有的 numpy 数组**，清零即可。
     135M 全量重 prefill 在本机 <1s，比引入会话状态管理简单一个量级。
@@ -32,11 +32,74 @@ sys.path.insert(0, BASE)
 sys.path.insert(0, "/media/xiao_/OverSys1/npu-direct/llama.cpp-b10819/gguf-py")
 
 import numpy as np  # noqa: E402
+import gguf_fast  # noqa: E402  ★ 元数据解析：gguf.GGUFReader 在 ZAYA(5.19GB/262k 词表) 上要 13.6s
+                 #   且是纯 CPU（磁盘读 0 字节）—— 全花在"每字符串元素一次 numpy 封装"。
+                 #   gguf_fast 0.29s；逐字节对账见 gguf_fast_check.py。适配器里两个 reader 都换掉。
 
 ARGS = None
 AP = None           # 引擎适配器（forward/logits/reset/encode/decode/eos/im_end）
 MAXT = 1024
 DEFAULT_SYSTEM = "You are a helpful AI assistant named SmolLM, trained by Hugging Face"
+
+
+def _tok_json(sub):
+    """★ 直接用 `tokenizers` 读 tokenizer.json，**不 import transformers**。
+
+    实测（2026-09-15）：`import transformers` 2.83s，而 `tokenizers` 0.01s + from_file 37~255ms。
+    省下的 2.8s 是 smol/ling 装载时间的一半以上。正确性已逐 id 对账：对同一份 tokenizer.json，
+    `tokenizers.Tokenizer.encode(s, add_special_tokens=True/False).ids` 与
+    `AutoTokenizer.encode(...)` **完全一致**（含 eos/im_end/decode），所以这不是"近似"替换。
+    """
+    import tokenizers
+    return tokenizers.Tokenizer.from_file(os.path.join(BASE, sub, "tokenizer.json"))
+
+
+def _gguf_ids(path, *names):
+    """从 GGUF 读 special token id（免 transformers 的 eos_token 查询）。"""
+    r = gguf_fast.FastGGUF(path)
+    out = []
+    for n in names:
+        f = r.fields.get(n)
+        out.append(int(f.value) if f is not None else None)
+    return out
+
+
+def _template_renderer(model_path, think_default=True):
+    """用模型**自带的** `tokenizer.chat_template` 渲染对话（jinja2）→ render(msgs, think)。
+
+    ★★ 为什么 ZAYA 不能用我手写的 ChatML（2026-09-15，用户报"开启思考后回答不变白"）：
+       ZAYA 的模板在生成前缀之前**固定**输出 `'\\n\\n<|im_start|>system\\n<|im_end|>\\n'`
+       —— 也就是**一个空的 system 轮**。我手写的渲染器把它整个漏掉（只发 user + assistant 前缀），
+       提示词于是偏离训练格式：模型照样答对，但**不写 `</think>`**，
+       于是整段回答都留在 reasoning_content 里 ⇒ 表现就是"思考完的答案不变白"。
+       （对账：smol 的模板与我手写的输出**逐字节一致**，所以 smol 没这个问题；
+         ling 的格式压根不是 ChatML，本来就走 jinja。）
+       ⇒ 结论：**有模板就用模板**，手写渲染只留作"GGUF 里没有 chat_template"的兜底。
+    返回 None 表示该 GGUF 无模板（调用方退回手写渲染）。
+    """
+    r = gguf_fast.FastGGUF(model_path)
+    f = r.fields.get("tokenizer.chat_template")
+    if f is None:
+        return None
+    import jinja2
+    tpl = jinja2.Environment().from_string(f.contents())
+    # 模板里可能引用 <role>/<|role_end|> 这类字面量 token —— 从 token_id 反查文本喂进去
+    vars_ = {}
+    tf = r.fields.get("tokenizer.ggml.tokens")
+    if tf is not None:
+        toks = tf.contents()
+        for name, ff in r.fields.items():
+            if name.startswith("tokenizer.ggml.") and name.endswith("_token_id"):
+                try:
+                    vars_[name.split(".")[-1][:-3]] = toks[int(ff.value)]
+                except Exception:
+                    pass
+
+    def render(msgs, think):
+        return tpl.render(messages=list(msgs), add_generation_prompt=True,
+                          enable_thinking=(think_default if think is None else bool(think)),
+                          **vars_)
+    return render
 
 
 def _load_smol():
@@ -46,10 +109,11 @@ def _load_smol():
     os.environ["MODEL"] = ARGS.model
     import smol_engine as E
     ENG = E
-    from transformers import AutoTokenizer
-    TOK = AutoTokenizer.from_pretrained(os.path.join(BASE, "tok-smol"))
-    EOS_ID = TOK.eos_token_id
-    IM_END = TOK.convert_tokens_to_ids("<|im_end|>")
+    TOK = _tok_json("tok-smol")
+    EOS_ID = _gguf_ids(ARGS.model, "tokenizer.ggml.eos_token_id")[0]
+    IM_END = TOK.token_to_id("<|im_end|>")
+    if IM_END is None:
+        IM_END = EOS_ID
     MAXT = int(getattr(E, "MAXT", 1024))
 
     def reset():
@@ -61,7 +125,7 @@ def _load_smol():
                 ct.memset(item.vcache, 0, n * 4)
                 item.tlen[0] = 0
     return dict(forward=E.forward, logits=E.logits_of_x, reset=reset,
-                encode=lambda t: TOK.encode(t, add_special_tokens=True),
+                encode=lambda t: TOK.encode(t, add_special_tokens=True).ids,
                 decode=lambda ids: TOK.decode(ids), eos=EOS_ID, im_end=IM_END, max_t=MAXT,
                 system_default=DEFAULT_SYSTEM, bos=None, think_block=False, think_default=False,
                 render=lambda msgs, think: render_chatml_generic(msgs, think, None, DEFAULT_SYSTEM, False))
@@ -82,6 +146,10 @@ def _load_zaya():
     global ENG, MAXT
     import os
     os.environ["MODEL"] = ARGS.model
+    # ★ SKIP_BENCH：zaya_gguf 导入时会跑一段基准（40 层上 ~3s，含 16 次 decode），
+    #   独立脚本/诊断要这些数字，桥接进程只要"装载 + forward" ⇒ 跳过。
+    #   （把 WARM/MEAS 调到 1 也省不掉：那段是固定的 16 次 decode + 剖面 + 逐 token 计时。）
+    os.environ["SKIP_BENCH"] = "1"
     os.environ.setdefault("WARM", "1")
     os.environ.setdefault("MEAS", "1")
     old_argv = sys.argv
@@ -107,7 +175,7 @@ def _load_zaya():
 
     # ---- head（共享词嵌入）：与 zaya_gguf GEN 块同源 ----
     onw = np.frombuffer(bytes(Z.T["output_norm.weight"].data), np.float32).copy()
-    _emb_al = Z.A(bytes(Z._EMB_T.data))    # 64 字节对齐（gemv 用对齐加载）
+    _emb_al = Z.tptr(Z._EMB_T)             # ★ 64 字节对齐；已对齐 ⇒ 零拷贝（省 420MB 常驻）
     _m5g = ct.CDLL(os.path.join(BASE, "m5", "m5_kern8.so"))
     _m5g.m5_gemv.restype = ct.c_int
     _m5g.m5_gemv.argtypes = [ct.c_int, ct.POINTER(ct.c_float), ct.c_void_p,
@@ -124,7 +192,7 @@ def _load_zaya():
         return lo
 
     # ---- tokenizer：全词表 Viterbi + 字节回退（GEN 块同源）----
-    _r = _g.GGUFReader(ARGS.model)
+    _r = gguf_fast.FastGGUF(ARGS.model)     # ★ 13.6s → 0.29s（同一个文件，gguf-py 每字符串一次 numpy 封装）
     _f = {t.name: t for t in _r.fields.values()}
     toks = [bytes(t) if isinstance(t, bytes) else t
             for t in _f["tokenizer.ggml.tokens"].contents()]
@@ -185,11 +253,16 @@ def _load_zaya():
     def logits():
         return logits_of(last["x"])
 
+    # ★★ 渲染改用模型自己的模板（见 _template_renderer 的注释：手写渲染漏了模板开头的
+    #    空 system 轮 ⇒ 模型不写 </think> ⇒ 回答不变白）。模板缺失才退回手写 ChatML。
+    _rt = _template_renderer(ARGS.model, think_default=True)
+    render = _rt or (lambda msgs, think:
+                     render_chatml_generic(msgs, think, None, None, True))
     return dict(forward=forward, logits=logits, reset=reset,
                 encode=enc, decode=decode, eos=eos, im_end=im_end, max_t=MAXT,
                 system_default=None, bos=2, vsz=vsz,
                 think_block=True, think_default=True,   # ZAYA 模板默认开思考，用空 think 块关
-                render=lambda msgs, think: render_chatml_generic(msgs, think, None, None, True))
+                render=render)
 
 
 def _load_ling():
@@ -209,27 +282,13 @@ def _load_ling():
     import ling_proto as LP
     import jinja2
     import gguf as _g
-    from transformers import AutoTokenizer
     ENG = E
-    tk = AutoTokenizer.from_pretrained(os.path.join(BASE, "tok-ling"))
+    tk = _tok_json("tok-ling")          # ★ 同 smol：免 transformers 的 2.8s 导入
 
-    # ---- 模板与特殊 token（从 GGUF 读，jinja2 渲染）----
-    _r = _g.GGUFReader(ARGS.model)
-    _f = {t.name: t for t in _r.fields.values()}
-    _toks = [t.decode("utf-8", "replace") if isinstance(t, bytes) else str(t)
-             for t in _f["tokenizer.ggml.tokens"].contents()]
-    _vars = {}
-    for _n, _t in _f.items():
-        if _n.startswith("tokenizer.ggml.") and _n.endswith("_token_id"):
-            try:
-                _vars[_n.split(".")[-1][:-3]] = _toks[int(_t.contents())]
-            except Exception:
-                pass
-    _tpl = jinja2.Environment().from_string(_f["tokenizer.chat_template"].contents())
-
-    def render(msgs, think):
-        return _tpl.render(messages=msgs, add_generation_prompt=True,
-                           enable_thinking=(True if think is None else bool(think)), **_vars)
+    # ---- 模板（从 GGUF 读，jinja2 渲染）----
+    render = _template_renderer(ARGS.model, think_default=True)
+    if render is None:
+        raise SystemExit("Ling 的 GGUF 里没有 chat_template —— 它的格式不是 ChatML，无法手写兜底")
 
     def reset():
         import ctypes as ct
@@ -245,12 +304,21 @@ def _load_ling():
                 ct.memset(ct.cast(item.S, ct.c_void_p), 0,
                           LP.NH * LP.KDA_HEAD * LP.KDA_HEAD * 4)
 
+    _eos = _gguf_ids(ARGS.model, "tokenizer.ggml.eos_token_id")[0]
     MAXT = E.MAXT
+    # ★★ think_block=True（2026-09-15 修正）：Bailing 模板的生成前缀同样是
+    #    换行 + `<think>`（thinking on）或换行 + `<think></think>`（thinking off），
+    #    也就是**开思考的 <think> 也是提示词预填的** —— 我先前设成 False，
+    #    于是思考段被判成 content（不加 [思考] 前缀、不暗色），正是用户说的"Ling 的问题"。
+    #    模板的历史格式也是 `<role>ASSISTANT</role>` + 换行 + `<think>{reasoning}</think>{content}`，
+    #    与 ZAYA 同族约定。
+    # think_default：模板里 enable_thinking 未给时 thinking_option='on' ⇒ 默认开，与模型一致
+    #    （要直接给答案用 `/think off`，那会渲染成空 think 块）。
     return dict(forward=E.forward, logits=E.logits_of_x, reset=reset,
-                encode=lambda t: tk.encode(t, add_special_tokens=False),
-                decode=lambda ids: tk.decode(ids), eos=tk.eos_token_id,
-                im_end=tk.eos_token_id, max_t=MAXT,
-                system_default=None, bos=None, think_block=False, think_default=False,
+                encode=lambda t: tk.encode(t, add_special_tokens=False).ids,
+                decode=lambda ids: tk.decode(ids), eos=_eos,
+                im_end=_eos, max_t=MAXT,
+                system_default=None, bos=None, think_block=True, think_default=True,
                 render=render)
 
 
@@ -343,8 +411,9 @@ def generate(messages, max_tokens, temp, seed, repeat_penalty, enable_thinking=N
     #   我之前是"整段生成完再切块 yield" —— 用户一眼看出没流式（而 llama-server 是流式的）。
     out, gen_ids = [], []
     t1 = time.time()
-    sent = 0                      # 已产出的字符数（前缀解码可能出现多字节片段，按字符增量发最稳）
     t_first = None
+    # ★ 分区分片是有状态的（见 ThinkSplitter：未闭合思考要挂起最后一段做兜底）
+    sp = ThinkSplitter(start_inside=bool(AP.get("think_block")) and think_now)
     for i in range(n_gen):
         lg = AP["logits"]()
         nid = sample(lg, temp, rng, repeat_penalty, gen_ids)
@@ -353,16 +422,17 @@ def generate(messages, max_tokens, temp, seed, repeat_penalty, enable_thinking=N
         out.append(nid)
         gen_ids.append(nid)
         full = AP["decode"](out)
-        if len(full) > sent:
+        if len(full) > sp.sent:
             if t_first is None:
                 t_first = time.time()
-            for kind, piece in _split_think_stream(
-                    full, sent,
-                    start_inside=bool(AP.get("think_block")) and think_now):
+            for kind, piece in sp.feed(full):
                 if piece:
                     yield kind, piece, {}
-            sent = len(full)
         AP["forward"](nid, len(ids) + i)
+    full = AP["decode"](out)
+    for kind, piece in sp.feed(full, final=True):    # ★ 收尾：未闭合的思考末段按 content 发出
+        if piece:
+            yield kind, piece, {}
     dec_s = time.time() - t1
     ttft_ms = round((t_first - t1) * 1000, 1) if t_first else None
     timings = {
@@ -373,35 +443,114 @@ def generate(messages, max_tokens, temp, seed, repeat_penalty, enable_thinking=N
     yield "content", "", timings
 
 
-def _split_think_stream(full, sent, start_inside=False):
-    """把**已生成全文**里 sent 之后的部分，按当前是否在 <think> 内切成 (kind, 文本)。
+class ThinkSplitter:
+    """把流式生成的文本切成 (kind, 文本)，kind ∈ {"reasoning","content"}。
 
-    kind="reasoning" 落在 <think>...</think> 内（draco 会暗色加 [思考] 前缀显示），
-    其余为 "content" —— 与 llama-server 对推理模型的行为一致。
+    规则主体与 llama-server 一致：`<think>...</think>` 内是 reasoning，其余是 content。
 
-    ★ start_inside：**开思考的 <think> 是提示词预填的**（ZAYA 模板的生成前缀就带 `<think>\n`），
+    ★ start_inside：**开思考的 `<think>` 是提示词预填的**（ZAYA 模板的生成前缀就带 `<think>\n`），
       所以模型输出里只有 `</think>`、没有开标签。只统计输出里的标签会判成"不在思考中"，
       于是思考文本跑到 content 里（我第一版就是这样，用户看到的现象是"思考没被标出来"）。
+
+    ★★★ 未闭合思考的兜底（2026-09-15，用户报"开思考后回答不变白，仅 zaya"）：
+      诊断结论 —— **ZAYA1-8B（本 GGUF）就是不写 `</think>`**，不是我们引擎的 bug：
+      用同一提示词跑 llama.cpp（`--jinja`，同一模型），它的回答同样整段落在 reasoning_content、
+      content 为空（实测记录见 /tmp/loadcpp 那次对拍）。模型自己的模板也承认这件事：
+        · 规范的 assistant 输出 = `{reasoning}\\n</think>\\n\\n{content}`（模板就是按这个把历史拼回去的）
+        · 模板注释原文："Allow downstream logic to take care of broken thought" ——
+          **坏掉的思考明确由下游处理**，而"下游"就是我们。
+      ⇒ 于是这里按同一约定兜底：思考中**只挂起最后一个空行段**（`\\n\\n` 之后的那段）。
+         出现新空行、或挂起段超过 PENDING_MAX 字符 ⇒ 确认为思考，立即吐出；
+         生成结束时仍未闭合 ⇒ 挂起的那段按 **content** 发出（于是回答会正常显示为白字）。
+      代价：思考区显示滞后一段（极通常不到一段）。收益：不写收尾标签的模型也能正确分区 ——
+      这一点上我们比 llama.cpp 的参考实现更好用（它会一直把回答显示成暗色思考）。
+
+    不变式（单测保证）：所有产出的 reasoning+content 拼接 **逐字等于**模型输出原文，
+    不丢字、不重复。
     """
-    out = []
-    i = sent
-    inside = start_inside
-    while i < len(full):
-        nxt_open = full.find("<think>", i)
-        nxt_close = full.find("</think>", i)
-        if nxt_open != -1 and (nxt_close == -1 or nxt_open < nxt_close):
-            out.append(("content", full[i:nxt_open]))
-            inside = True
-            i = nxt_open + len("<think>")
-            continue
-        if nxt_close != -1:
-            out.append(("reasoning" if inside else "content", full[i:nxt_close]))
-            inside = False
-            i = nxt_close + len("</think>")
-            continue
-        out.append(("reasoning" if inside else "content", full[i:]))
-        i = len(full)
-    return out
+    PENDING_MAX = 800          # 挂起段超过这么多字符 ⇒ 不可能是"最后一段回答"，确认是思考
+    _TAGS = ("<think>", "</think>")
+
+    def __init__(self, start_inside=False):
+        self.inside = start_inside
+        self.sent = 0            # 已确认并产出的字符数
+        self.sep_open = False    # 当前挂起段是否紧跟在一个"空行分隔符"之后
+
+    def _emit(self, full, upto):
+        """把 [sent, upto) 按当前所在区产出。"""
+        if upto <= self.sent:
+            return []
+        piece = full[self.sent:upto]
+        self.sent = upto
+        return [("reasoning" if self.inside else "content", piece)]
+
+    def _hold(self, full):
+        """末尾**还不能吐**的字符数。
+
+        ★ 流式标签的经典坑：不能吐出可能是标签前缀的尾巴。若把 `<` 当正文吐掉，
+          后面 `</think>` 补齐时 `find` 就从 sent 之后找不到了 ⇒ 永远不切换到正文区
+          （单测 "双边标签" 抓到的就是这个）。所以挂起"任意标签的最长真前缀"。
+        """
+        n = min(7, len(full) - self.sent)
+        for j in range(n, 0, -1):
+            suf = full[len(full) - j:]
+            if any(t.startswith(suf) for t in self._TAGS):
+                return j
+        return 0
+
+    def feed(self, full, final=False):
+        out = []
+        while True:
+            nxt_o = full.find("<think>", self.sent)
+            nxt_c = full.find("</think>", self.sent)
+            if nxt_o != -1 and (nxt_c == -1 or nxt_o < nxt_c):
+                out += self._emit(full, nxt_o)          # 标签前的文字按"当前区"确认
+                self.inside = True
+                self.sent = nxt_o + len("<think>")
+                self.sep_open = False
+                continue
+            if nxt_c != -1:
+                out += self._emit(full, nxt_c)
+                self.inside = False
+                self.sent = nxt_c + len("</think>")
+                self.sep_open = False
+                continue
+            break
+        # 后面没有标签了 —— 尾部处理
+        if not self.inside:
+            out += self._emit(full, len(full) if final else len(full) - self._hold(full))
+            return out
+        seg = full[self.sent:]
+        if self.sep_open:                               # ① 分隔符的延续：空行后可能还有换行
+            lead = len(seg) - len(seg.lstrip("\n"))
+            if lead:
+                out += self._emit(full, self.sent + lead)
+                seg = full[self.sent:]
+        p = seg.rfind("\n\n")
+        if p != -1:
+            # 最后一个空行（含其后连续的换行）之前确认为思考，空行之后的那段挂起
+            run_end = p
+            while run_end < len(seg) and seg[run_end] == "\n":
+                run_end += 1
+            out += self._emit(full, self.sent + run_end)
+            self.sep_open = True
+        elif len(seg) > self.PENDING_MAX:
+            out += self._emit(full, len(full) if final else len(full) - self._hold(full))
+            self.sep_open = False
+        if final and self.inside:
+            # ★ 收尾仍未闭合：只有当"空行分隔符之后的那一段"非空且够短，才把那段当回答；
+            #   否则（整段思考/没有分隔符/那段太长）保持 reasoning —— 别把思考误当回答。
+            if self.sep_open and 0 < len(full) - self.sent <= self.PENDING_MAX:
+                self.inside = False
+            out += self._emit(full, len(full))
+        return out
+
+
+def _split_think_stream(full, sent, start_inside=False):
+    """兼容旧签名的无状态版本（单测/复用场景）。"""
+    sp = ThinkSplitter(start_inside=start_inside)
+    sp.sent = sent
+    return sp.feed(full, final=True)
 
 
 def text_out_chunks(text, size=8):
