@@ -253,9 +253,17 @@
      写错维度就不会是 0）✓ ③ 强衰减(g=-30) 后 S == k⊗v（max|Δ|=0）✓ ④ 读出与缩放公式一致 ✓
 - ⇒ **C3 数值层 3/3 完成**：`unimplemented_ops()` 已返回**空**。
   （`unimplemented_ops()` 现在会自动报 `ssm: [ssm_scan]`、`kda: [kda_delta]`）
-- **剩余（C3 收尾）**：三个算子都有了，但还没**串起来跑真权重**（granite-h-tiny 的 SSM 族
-  与 Ling 的 KDA 族各跑一遍逐层对账）—— 这步才真正验证「声明式描述能复现真模型」。
-  另需把 `ssm_scan` 的公式与 `build_mamba2_layer` 逐行核对（目前只声称内部一致）。
+- **装置总验收（2026-09-15）**：`python3 archspec_spike.py --selftest` 一条命令跑完
+  ①语义事实完整性 ②三族层内步骤校验 ③三个算子 KAT ④缺口清单（自动）—— 可进 CI 当闸门。
+  实测全过：`ssm_conv`/`ssm_scan`/`kda_delta` KAT 通过、三族步骤通过、缺口为**空**。
+- **剩余（C3 收尾，明确且不小）**：三个算子还**没串进求值器的 op 分派**（现在只是各自的纯函数 + KAT），
+  所以还不能端到端跑一族的模型。要做：
+  ① 把 `ssm_conv`/`ssm_scan`/`kda_delta` 接进 `Evaluator` 的 `if op == ...` 分派（含状态键、pos 传递）；
+  ② 权重加载补 SSM/KDA 张量名（`ssm_conv1d`/`ssm_a`/`ssm_dt`/`ssm_d`/`ssm_beta`/`ssm_norm`…），
+     并对**权重布局**（如 `ssm_conv1d.weight` 是 [C,width] 还是 [width,C]）做显式断言 —— 拿错不报错才最危险；
+  ③ 用 **granite-h-tiny**（SSM 族）与 **Ling**（KDA 族）的真权重跑**逐层对账**，参考用 llama.cpp 的 dump；
+  ④ 把 `ssm_scan` 的公式与 `build_mamba2_layer` **逐行核对**（目前只声称内部一致）。
+  ⇒ 这四步做完，"声明式描述能复现真模型"才算被验证过（当前只验证了"描述完整 + 算子自身正确"）。
 
 ### C3（旧描述，保留）声明式表达力覆盖混合 SSM/KDA
 - archspec spike 已验证 llama 密集 + MoE（cos 0.999962 / 0.9998），但 granite-hybrid、bailingmoe3(KDA) 还没进。

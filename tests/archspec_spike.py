@@ -832,8 +832,37 @@ def selftest_validate():
     print("  ✅ 校验器自证通过：完整规格通过、缺字段/未确定都被拦")
 
 
-if __name__ == "__main__" and os.environ.get("SELFTEST_SPEC"):
+def c3_selftest():
+    """C3 装置总验收：事实完整性 + 层内步骤 + 算子 KAT + 缺口清单，一条命令跑完（可进 CI）。
+
+    ★ 为什么要有它：C3 的产物是"数据 + 校验 + 算子 KAT"三层，散着跑很容易漏掉一层。
+    """
+    print("== ① 语义事实完整性校验 ==")
     selftest_validate()
+    print("== ② 层内步骤校验（三族）==")
+    validate_steps(LAYER_STEPS, SEMANTICS_LLAMA, "llama")
+    validate_steps(LAYER_STEPS_SSM, SEMANTICS_SSM, "ssm")
+    validate_steps(LAYER_STEPS_KDA, SEMANTICS_KDA, "kda")
+    print("  OK llama / ssm / kda 三族层内步骤均通过（含 semantics 引用存在性）")
+    print("== ③ 算子 KAT ==")
+    kat_ssm_conv()
+    kat_ssm_scan()
+    kat_kda_delta()
+    print("== ④ 求值器缺口（自动从声明算出）==")
+    gap = unimplemented_ops()
+    print(f"  {gap or '空 —— C3 数值层三算子齐备'}")
+    if gap:
+        raise SystemExit("C3 未完成：仍有未实现的算子（见上）")
+    print("")
+    print("C3 装置自检全部通过（事实 / 步骤 / 算子三层 + 缺口清单）")
+
+
+if __name__ == "__main__":
+    import sys as _sys
+    if "--selftest" in _sys.argv or os.environ.get("SELFTEST_SPEC"):
+        c3_selftest()
+    else:
+        main()
 
 
 def main():
