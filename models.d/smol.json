@@ -9,7 +9,7 @@
     "llama_cpp": {
       "backend_hint": "igpu",
       "status": "works",
-      "notes": "iGPU 上 135M 实测 315 tok/s（selfcheck 2026-09-13，指纹稳定、健康问句 1/3——模型小，能力所限）。无特殊参数。"
+      "notes": "iGPU 上 135M 实测 315 tok/s（selfcheck 2026-09-13，指纹稳定、健康问句 1/3——模型小，能力所限）。无特殊参数。\n★ 2026-09-15 `draco tune` J/token 实测（iGPU，档案推荐后端）：`-ub 1` 246.1 t/s / 0.106 J/tok（最优）、基线 234.8 / 0.111、线程4 235.8 / 0.123、`-fa 0` 192.6 / 0.151。**最优与基线只差 5%（噪声内）**，故未改档案参数；`-fa 0` 明确更差（-18%）。"
     },
     "dracomancer": {
       "backend_hint": "dengine",

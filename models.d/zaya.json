@@ -14,7 +14,7 @@
         ]
       },
       "status": "works",
-      "notes": "官方预编译二进制没有 zaya 实现，必须本地构建（build-vk 带 Vulkan 时自动 -ngl 99 上 iGPU）。必须逐 token prefill（-ub 1）：批量 prefill 会被 Q8_K 量化台阶放大成 1e-3 级跳变，-ub 16 起 prompt 编码直接崩（实测 -ub 16 输出乱码、-ub 32/64 幻觉出没给过的问题）。根因与退化曲线见 STAGE1_NPU.md 里程碑 18。 ★ 2026-09-15 对拍（同一提示词、贪心、--jinja）：**llama.cpp 也不写 </think>** —— 整段推理落在 reasoning_content、content 为空。也就是说『开着思考时回答不变白』是**这个模型的行为**，不是引擎差异；本档案 dracomancer 段的兜底分区就是为了让它仍能正确显示（见 draco_engine_server.ThinkSplitter）。"
+      "notes": "官方预编译二进制没有 zaya 实现，必须本地构建（build-vk 带 Vulkan 时自动 -ngl 99 上 iGPU）。必须逐 token prefill（-ub 1）：批量 prefill 会被 Q8_K 量化台阶放大成 1e-3 级跳变，-ub 16 起 prompt 编码直接崩（实测 -ub 16 输出乱码、-ub 32/64 幻觉出没给过的问题）。根因与退化曲线见 STAGE1_NPU.md 里程碑 18。 ★ 2026-09-15 对拍（同一提示词、贪心、--jinja）：**llama.cpp 也不写 </think>** —— 整段推理落在 reasoning_content、content 为空。也就是说『开着思考时回答不变白』是**这个模型的行为**，不是引擎差异；本档案 dracomancer 段的兜底分区就是为了让它仍能正确显示（见 draco_engine_server.ThinkSplitter）。\n★ 2026-09-15 `draco tune` J/token 实测（iGPU）：基线 30.0 t/s / 0.833 J/tok、`-ub 1` 30.0 / 0.834（与基线相同 —— 档案本来就带 `-ub 1`，互为验证）、`-fa 0` 28.1 / 0.891、线程4 26.5 / 0.942。⇒ 档案参数（`-ub 1` + 8 线程）确认为最优，无需调整。"
     },
     "dracomancer": {
       "backend_hint": "dengine",

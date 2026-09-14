@@ -480,14 +480,19 @@ def _tune_best(m, backend):
 
 
 def backend_metrics(m, backend):
-    """(tok/s, J/token, 来源串)。优先级：tune 实测 > MEASURED 表 > 空（用先验）。"""
+    """(tok/s, **mJ/token**, 来源串)。优先级：tune 实测 > MEASURED 表 > 空（用先验）。
+
+    ★ 单位：tune 缓存里存的是 **J/token**（`_measure_config` 用 W/(tok/s)），而 MEASURED 表是
+      **mJ/token** —— 必须在这里统一成 mJ，否则打印出来是"0 mJ/tok"（我第一版就踩了，
+      和早先 `cmd_perf` 把 mJ 标成 J 是同一类单位错）。
+    """
     t = _tune_best(m, backend)
     if t:
-        return t[1], t[0], f"tune 实测（{t[2]}）"
+        return t[1], t[0] * 1000.0, f"tune 实测（{t[2]}）"
     v = MEASURED.get((m.name, backend))
     if v:
-        tps, jtok = v
-        return tps, (None if jtok is None or jtok < 0 else jtok), "档案性能表"
+        tps, mj = v
+        return tps, (None if mj is None or mj < 0 else float(mj)), "档案性能表"
     return None, None, ""
 
 
@@ -543,7 +548,7 @@ def rank_backends(m, prefer, cands=None):
         if tps:
             bits.append(f"{tps:.1f} tok/s")
         if jtok:
-            bits.append(f"{jtok:.0f} mJ/tok")
+            bits.append(f"{jtok:.0f} mJ/tok")   # mJ/token（见 backend_metrics 的单位说明）
         bits.append(src if src else
                     f"无实测（先验：吞吐×{_SPEED_PRIOR.get(b, 1.0):.2f}、能耗序 {_ENERGY_RANK.get(b, 3)}）")
         out.append((b, "，".join(bits)))
@@ -1071,12 +1076,19 @@ def cmd_tune(args):
 
     # 配置空间：**小**且离散。默认只在最有价值的三条轴上扫。
     base_extra = list(draco_view(m)["launch"].get("extra_args") or [])
-    space = [
-        ("基线（档案参数）", base_extra + []),
-        ("prefill 逐 token -ub 1", base_extra + ["-ub", "1"]),
-        ("prefill 小批 -ub 4", base_extra + ["-ub", "4"]),
-        ("关 flash-attn", base_extra + ["-fa", "0"]),
-    ]
+    if backend == "dengine":
+        # ★ dengine 的旋钮**不是** llama.cpp 的启动参数（桥接只认 --threads/--ctx）——
+        #   硬塞 -ub/-fa 会让模型桥接的 argparse 报错退出（`-ub 1` 反而是 llama.cpp 侧才需要的）。
+        #   所以这里清空档案里的 llama.cpp 参数，只扫"线程数"这一条真旋钮。
+        base_extra = []
+        space = [("基线（档案参数）", base_extra + [])]
+    else:
+        space = [
+            ("基线（档案参数）", base_extra + []),
+            ("prefill 逐 token -ub 1", base_extra + ["-ub", "1"]),
+            ("prefill 小批 -ub 4", base_extra + ["-ub", "4"]),
+            ("关 flash-attn", base_extra + ["-fa", "0"]),
+        ]
     if args.threads is None:
         space.append((f"线程 {max(2, threads//2)}", base_extra + [], max(2, threads // 2)))
 

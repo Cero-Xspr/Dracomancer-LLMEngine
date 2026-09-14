@@ -8,7 +8,7 @@
     "llama_cpp": {
       "backend_hint": "igpu",
       "status": "works",
-      "notes": "iGPU 走官方 vulkan 二进制（bailingmoe3 在官方构建里有实现）。无特殊参数。"
+      "notes": "iGPU 走官方 vulkan 二进制（bailingmoe3 在官方构建里有实现）。无特殊参数。\n★ 2026-09-15 `draco tune` J/token 实测（iGPU）：`-fa 0` 41.5 t/s / 0.603 J/tok、`-ub 4` 40.9 / 0.612、线程4 36.8 / 0.680、基线 41.0 / 0.782（总口径）。**但边际口径下基线最好（0.051）** —— 两个口径结论相反，说明这一轮的能耗结论**不可用**（工具自己也警告 J/token 排序要求机器安静）。**故不改档案参数。**"
     },
     "dracomancer": {
       "backend_hint": "dengine",

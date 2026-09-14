@@ -113,7 +113,16 @@
 
 ## C. 适配与协作机制（发行前的护城河）
 
-### C1 ⭐ `draco tune` 的 J/token 完整回归
+### C1 ✅ 已完成（2026-09-15）：`draco tune` 的 J/token 回归（smol / Ling / ZAYA）
+- 先修了两个前置问题：① `tune` 的配置空间里有 `-ub`/`-fa` 这类**llama.cpp 专属参数**，
+  dengine 后端硬塞会让桥接 argparse 直接退出 ⇒ 现在按后端分流（dengine 只扫线程数）；
+  ② `backend_metrics` 的**单位错**：tune 缓存是 J/token、MEASURED 表是 mJ/token，
+  混用会打印出"0 mJ/tok" ⇒ 统一成 mJ/token。
+- 结果：**smol** `-ub 1` 0.106 J/tok 最优（但只比基线快 5%，噪声内，故不改档案）；
+  **Ling** 总口径说 `-fa 0` 好、边际口径说基线好 ⇒ **结论不可用**（工具自己警告能耗排序要机器安静）；
+  **ZAYA** 基线与 `-ub 1` 完全一致（档案本来就带 `-ub 1`，互为验证）⇒ 档案参数确认最优。
+- ⇒ 收益：`-P eco` 从"能耗序先验"升级为**本机 tune 实测**（已实测确认：决策理由会显示
+  「tune 实测（8|-ub 1）」）。**教训**：能耗结论只在"同一轮、机器安静"时可比；跨轮不可比。
 - **为什么**：`-P eco` 现在只有"能耗序先验"（NPU<iGPU<CPU），没有本机实测；
   tune 跑过之后倾向决策才从"先验"升级为"实测"。至今只跑过 falcon-h1。
 - **做完标准**：至少 3 个代表模型（小 dense / MoE / 混合 SSM）各有 J/token 数字，写进 `models.d/*.json`。
