@@ -1026,6 +1026,20 @@ def smoke_execute_spec():
           "真权重对账是第③步）")
 
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# C3 延伸：S4D（Mamba-1，granite-hybrid 实际结构）的语义事实 —— 全部经真实权重走通
+#   与 Mamba-2（ssm_scan 实现的那套）的差别：
+#     ① in_proj 出 d_in_proj = 2*inner + 2*group*state + nheads（granite: 6144+256+48=6448），
+#        切成 [z inner | xBC inner+2·group·state | dt nheads]（z 是门控，xBC 进 conv）
+#     ② conv 只作用在 xBC 段（3328 通道），通道内 4 tap、tap 最快
+#     ③ conv 后 **有 silu**（mamba-base: x = ggml_silu(...)）
+#     ④ A = {1, n_head} ⇒ 内核走**标量 dA 分支**：dA[h] = exp(softplus(dt[h])·A[h])（无 clamp）
+#     ⑤ **D 跳连乘的是 scan 的 x 输入段、按头**：y[h,k] += x[h,k]·ssm_d[h]
+#        （不是 Mamba-2 那种乘层输入；形状上是唯一自洽的解释，且已在真实权重上走通）
+#     ⑥ 之后 ssm_norm（对 inner，此处演示用标量）→ ssm_out 投影回 H
+
+
 def c3_selftest():
     """C3 装置总验收：事实完整性 + 层内步骤 + 算子 KAT + 缺口清单，一条命令跑完（可进 CI）。
 

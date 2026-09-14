@@ -282,8 +282,17 @@
      `ssm_a` 形状 (1, 48) 是 **[1, dt_rank]**（A 作用在 dt 秩上，每 state 列共享），
      而声明式求值器的 `ssm_scan` 实现的是 Mamba-2（A={d_state, n_head}，作用在 state 维）。
      `ssm_in` 6448 = dt_rank 48 + inner 3072 + 2·state·group 佐证（llama.cpp mamba-base 同款）。
-     ⇒ **不能拿现算子直接对账**；待办 = 给求值器加 S4D 分支（A 取 [1,dt_rank]、Δ/B/C 分组共享）后再对。
-     「先纸上对账再写代码」再次避免了一轮白干。
+     ⇒ 不能拿现算子直接对账。
+     **✅ S4D 语义链已在真实权重上走通（2026-09-15）**：完整链 =
+     in_proj(6448) → 切 [z 3072 | xBC 3328 | dt 48] → conv(3328 通道、4 tap、**只作用在 xBC**) →
+     **silu** → 再切 [B 128 | C 128 | x 3072] → softplus(dt)·A（A={1,n_head} ⇒ **标量 dA 分支**）→
+     状态 → 读出 → **y += x·ssm_d（按头，D 跳连乘的是 scan 输入段 x）** → ssm_norm → ssm_out。
+     实测：输出 (1536,) 全有限、dA∈[0.699,1.000]（<1 衰减正确）。
+     语义事实已写进 `archspec_spike.py`（S4D 节）。
+     **剩余（真正的对账）**：把这条链的输出与 llama.cpp 的 `mamba-base` dump 对数
+     （需要 gdump 夹具支持 granite —— 张量名清单要加 ssm_* 系）。
+     过程小坑：xBC 切片一度写成 2·G·ST(=256)（正确是 DI+2·G·ST=3328）、
+     D 跳连对象试错了两版（乘层输入 z 不成立，乘 scan 输入 x 按头才形状自洽且语义合理）。
      `ssm_a` 形状 (1, 48) 是 **[1, dt_rank]**（A 作用在 dt 秩上，每 state 列共享），
      而声明式求值器的 `ssm_scan` 实现的是 Mamba-2（A={d_state, n_head}，作用在 state 维）。
      `ssm_in` 6448 = dt_rank 48 + inner 3072 + 2·state·group 佐证了这一点（llama.cpp mamba-base 同款）。
