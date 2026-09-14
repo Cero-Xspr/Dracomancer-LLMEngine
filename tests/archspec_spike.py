@@ -278,25 +278,36 @@ def kat_ssm_conv():
 #     x'   = dt * x                          # 离散化输入
 #     h    = dA * h + x' ⊗ b                 # 状态递推（h: [n_head, state]）
 #     y    = Σ_state h * c  + d * x          # 读出头 + D 跳连
-#   ⚠️⚠️ **本实现只做了"内部一致性"验证**（KAT：与朴素逐帧循环逐位相同、状态复位、
-#      形状与边界），**公式本身尚未与 llama.cpp 对账** —— a 的取法、softplus 的 clamp 界、
-#      D 跳连是否在门控之前，都必须读 `build_mamba2_layer` 逐行核对后回填（见 ROADMAP C3）。
-#      这是有意的诚实标注：B1 那次"四个自写实现互相打架"就是自写参考自证的代价。
+#   ✅ 2026-09-15 已与 llama.cpp **逐行核对**（models/mamba-base.cpp 的图 + ggml-cpu/ops.cpp 的
+#      ggml_compute_forward_ssm_scan_f32），修正三处凭常识写错的地方：
+#      ①内核无 clamp（我旧版加了 ±4）②A 形状 {d_state, n_head}，d_state>0 时 dA 逐 state 元素
+#      （我旧版写成逐头标量）③内核**没有 D 跳连**（y = Σ h·c 而已；我旧版加了 d*x）。
+#      ⇒ 之前"只声称内部一致"是对的：如果直接拿旧版去对 granite-h-tiny，会白对一轮才发现这三处。
 # ═══════════════════════════════════════════════════════════════════════════
-def ssm_scan_step(x, dt_pre, dt_bias, a, b, c, d, h, clamp=(-4.0, 4.0)):
+def ssm_scan_step(x, dt_pre, dt_bias, a, b, c, d, h, clamp=None):
     """单步 SSM 递推。h: [n_head, state] **就地更新**并返回；返回 (y, h)。
 
-    x/dt_pre: [n_head]；b/c: [n_head, state]；a/dt_bias/d: [n_head]。
-    clamp: dt 的上下界（Mamba2 里通常是 dt 限幅；值待与参考核对）。
+    ★★ 2026-09-15 与 llama.cpp 逐行核对后修正（来源：models/mamba-base.cpp 的 build 图 +
+       ggml-cpu/ops.cpp 的 ggml_compute_forward_ssm_scan_f32）。与旧版（凭 Mamba2 常识写的）有
+       **三处实质差异**：
+       ① **没有 clamp**：内核只做 `softplus(dt + dt_bias)`，无上下界（我旧版凭印象加了 ±4）；
+       ② **A 的形状是 {d_state, n_head} 或 {1, n_head}** —— d_state>0 时 `dA = exp(dt*a)` 是
+          **逐 state 元素**的（a[h, s]），不是逐头标量；{1,nh} 才退化成逐头；
+       ③ **没有 D 跳连**！`y = Σ_state h*c`，内核里根本没有 d*x 项 —— Mamba 原论文的 D 项在
+          llama.cpp 里是**不在 ssm_scan 里**的（granite-hybrid 若有 D，它在别处加）。
+       （保留：softplus 用 log1p(exp) 的稳定写法与内核一致；状态/输出布局 h[n_head, d_state]。）
     """
-    dt = np.log1p(np.exp(dt_pre + dt_bias))                  # softplus（数值稳定写法）
-    dt = np.clip(dt, clamp[0], clamp[1])
-    dA = np.exp(dt * a)                                      # [n_head]
-    xp = dt * x                                              # [n_head]
-    nh, st = h.shape
-    for j in range(nh):                                      # 逐头递推（状态小、无需并行）
-        h[j] = dA[j] * h[j] + xp[j] * b[j]
-    y = np.einsum("js,js->j", h, c) + d * x
+    dt = np.log1p(np.exp(dt_pre + dt_bias))                  # softplus（内核同款：无 clamp）
+    # ② A={d_state,n_head} ⇒ dA 逐 state 元素（[n_head, state]）；A={1,n_head} 时退化成逐头
+    if a.ndim == 2 and a.shape[0] == h.shape[1]:             # [state, n_head]（GGUF 存储序）
+        dA = np.exp(dt[:, None] * a.T)
+    elif a.ndim == 2:                                        # [n_head, state]
+        dA = np.exp(dt[:, None] * a)
+    else:                                                    # [n_head]（= {1, n_head} 的退化）
+        dA = np.exp(dt * a)[:, None]
+    xp = dt * x
+    h[:] = dA * h + xp[:, None] * b
+    y = np.einsum("js,js->j", h, c)                          # ③无 D 跳连
     return y, h
 
 
@@ -304,7 +315,7 @@ def kat_ssm_scan():
     """内部一致性 KAT：与朴素逐帧循环逐位相同 + 状态复位语义 + 形状。"""
     rng = np.random.RandomState(1)
     nh, st, T = 4, 6, 5
-    a = -np.abs(rng.randn(nh).astype(np.float32))            # a ≤ 0
+    a = -np.abs(rng.randn(st, nh).astype(np.float32))        # ★ A = {d_state, n_head}（内核同款）
     dt_bias = (rng.randn(nh).astype(np.float32) * 0.1)
     d = (rng.randn(nh).astype(np.float32) * 0.1)
     xs = [rng.randn(nh).astype(np.float32) * 0.5 for _ in range(T)]
@@ -316,10 +327,11 @@ def kat_ssm_scan():
     h_ref = np.zeros((nh, st), np.float32)
     ys_ref = []
     for t in range(T):
-        dt = np.log1p(np.exp(dts[t] + dt_bias))
-        dt = np.clip(dt, -4.0, 4.0)
-        h_ref = np.exp(dt * a)[:, None] * h_ref + (dt * xs[t])[:, None] * bs[t]
-        ys_ref.append(np.einsum("js,js->j", h_ref, cs[t]) + d * xs[t])
+        dt = np.log1p(np.exp(dts[t] + dt_bias))              # 无 clamp（同内核）
+        # a: [state, n_head] ⇒ dA = exp(dt[a 头维] * a) 再转置成 [n_head, state]
+        dA_ref = np.exp(dt[:, None] * a.T)
+        h_ref = dA_ref * h_ref + (dt * xs[t])[:, None] * bs[t]
+        ys_ref.append(np.einsum("js,js->j", h_ref, cs[t]))   # 无 D 跳连（同内核）
     ys_ref = np.array(ys_ref)
 
     # ② 被测
@@ -343,10 +355,10 @@ def kat_ssm_scan():
     for t in range(50):
         _, h3 = ssm_scan_step(xs[t % T], dts[t % T], dt_bias, a, bs[t % T], cs[t % T], d, h3)
     finite = bool(np.isfinite(h3).all()) and float(np.abs(h3).max()) < 1e3
-    print(f"  ③ 稳态有界（a≤0，50 步）：{'✓' if finite else '✗'}  |h|max={float(np.abs(h3).max()):.2f}")
+    print(f"  ③ 稳态有界（A≤0 逐元素，50 步）：{'✓' if finite else '✗'}  |h|max={float(np.abs(h3).max()):.2f}")
     if not (same and diff > 1e-6 and finite):
         raise SystemExit("ssm_scan KAT 失败")
-    print("  ✅ ssm_scan KAT（**内部一致性**）通过 —— 注意：公式本身尚未与 llama.cpp 对账")
+    print("  ✅ ssm_scan KAT 通过（公式已与 llama.cpp 逐行核对；内部一致性同样成立）")
 
 
 
