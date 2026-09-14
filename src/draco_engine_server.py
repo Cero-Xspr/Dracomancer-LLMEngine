@@ -506,8 +506,20 @@ class ThinkSplitter:
     LINE_MAX = 240             # 挂起的那一行超过这么多字符就吐出去，别一直憋着
     _TAGS = ("<think>", "</think>")
 
+    # ★★ 挂起粒度（环境变量 DRACO_THINK_HOLD，2026-09-15 用户问"能分得更细吗/完全逐 token 吗"）：
+    #   "line"（默认）—— 按行挂起：思考延迟一行，收尾能把末行当回答（回答变白字）。
+    #   "token"  —— **完全直出**（不挂起，思考逐 token 实时可见），代价是收尾**不做兜底**
+    #               ⇒ 不写 </think> 的模型（ZAYA）回答会一直是暗色。
+    #   "dup"    —— 完全直出 + 收尾把末行**再发一次**作为 content：思考实时、回答也变白，
+    #               代价是那一小段会**显示两次**（先暗后白）。
+    #   为什么必须二选一：把某段判成"回答"要**事后**才知道（模型可能写出 </think>），
+    #   所以"零延迟"与"零重复地正确分区"在流式协议下不可兼得 —— 让用户挑，而不是我替他挑。
+    HOLD = (os.environ.get("DRACO_THINK_HOLD") or "line").strip().lower()
+
     def __init__(self, start_inside=False):
         self.inside = start_inside
+        self.live = self.HOLD in ("token", "dup")     # 完全直出（不挂起）
+        self.dup = self.HOLD == "dup"                 # 收尾补发末行（会有一次重复）
         self.sent = 0            # 已确认并产出的字符数
         self.capped = False      # 当前挂起的这一行是否已被 LINE_MAX 截断过（截断过的不能再当回答）
 
@@ -552,6 +564,16 @@ class ThinkSplitter:
         # 后面没有标签了 —— 尾部处理
         if not self.inside:
             out += self._emit(full, len(full) if final else len(full) - self._hold(full))
+            return out
+        if self.live:                       # 完全直出：思考逐 token 实时送出（见 HOLD 的说明）
+            out += self._emit(full, len(full) if final else len(full) - self._hold(full))
+            if final and self.inside and self.dup:
+                # 收尾补发：把**最后一行**当回答再发一次（这一次是 content，所以是白字）
+                tail = full[self.sent:]
+                i = tail.rfind("\n")
+                if i != -1:
+                    out.append(("content", tail[i + 1:]))
+                    self.sent = len(full)
             return out
         seg = full[self.sent:]
         k = seg.rfind("\n")
