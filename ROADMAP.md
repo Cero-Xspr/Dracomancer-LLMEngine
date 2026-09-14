@@ -230,8 +230,17 @@
   并加 `validate_steps()`：每个 op 名合法、每条 `semantics` 引用都能在事实表里找到。
   ⇒ **描述层三族齐全且可校验**。新增 `unimplemented_ops()` **自动列出求值器缺口**：
   `ssm_conv`、`ssm_scan`、`kda_delta` —— 这就是 C3 的剩余工作清单（而不是靠人记）。
-- **剩余（数值层）**：给求值器实现这 3 个算子（SSM 因果卷积 + scan 递推；KDA 的三分支卷积 + delta-net
-  递推），再拿 granite-h-tiny / Ling 的真权重跑逐层对账 —— 这步才真正验证"声明式描述能复现真模型"。
+- **数值层进度（2026-09-15）**：
+  ① ✅ **`ssm_conv`**（因果深度可分离 conv1d，SSM 与 KDA 共用）：纯函数 `ssm_conv_step()` +
+     **KAT 已知答案测试**（随机权重/序列，与朴素参考**逐位相同**；含状态推进与 `pos==0` 复位，
+     且测试自证"复位确实改变数值"以免测试无效）。已登记进 `IMPLEMENTED_OPS`。
+     坑：偏置必须**最后**加 —— 我先写成"从 b 起累加"，差 **1 ULP**，而判据是逐位相同
+     （对账用：差 1 ULP 说明顺序没对齐，不是"精度问题"）。
+  ② `ssm_scan`（SSM 递推：离散化 dt/A/B + 选择性扫描）—— **待做**
+  ③ `kda_delta`（KDA 三分支卷积 + delta-net 递推 + o_norm/out_gate）—— **待做**
+  （`unimplemented_ops()` 现在会自动报 `ssm: [ssm_scan]`、`kda: [kda_delta]`）
+- **剩余（数值层收尾）**：实现上述 2 个算子后，拿 granite-h-tiny / Ling 的真权重跑逐层对账 ——
+  这步才真正验证「声明式描述能复现真模型」。
 
 ### C3（旧描述，保留）声明式表达力覆盖混合 SSM/KDA
 - archspec spike 已验证 llama 密集 + MoE（cos 0.999962 / 0.9998），但 granite-hybrid、bailingmoe3(KDA) 还没进。

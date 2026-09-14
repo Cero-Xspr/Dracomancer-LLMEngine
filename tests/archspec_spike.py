@@ -177,7 +177,96 @@ LAYER_STEPS_KDA = [
 ]
 
 # 求值器**已实现**的 op（其余 op 就是 C3 剩下的工作清单）
-IMPLEMENTED_OPS = ("rms_norm", "mul_mat", "rope", "attn_gqa", "silu_mul", "add", "moe_ffn")
+IMPLEMENTED_OPS = ("rms_norm", "mul_mat", "rope", "attn_gqa", "silu_mul", "add", "moe_ffn",
+                   "ssm_conv")   # ← C3 数值层第①个（2026-09-15，KAT 通过）
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# C3 数值层 ①：ssm_conv —— 因果深度可分离 conv1d（SSM 与 KDA 共用）
+#   语义（对应事实 ssm_conv_width / ssm_state_reset）：
+#     y[c] = Σ_{k=0}^{width-1} w[c][k] * x_{t-k}[c] + b[c]      （t-k < 0 视作 0，即**零初始化状态**）
+#   状态 = 最近 (width-1) 帧，按通道；**pos==0 时清零**（"状态由上下文持有、创建时零初始化"）。
+#   ★ 为什么先做它：SSM 与 KDA 都要用（KDA 是 q/k/v 三分支各来一次），是这两个族的前置。
+# ═══════════════════════════════════════════════════════════════════════════
+def ssm_conv_step(x, w, b, state, width):
+    """单步因果 conv1d。
+
+    x: [C] 当前帧；w: [C, width]（每通道自己的 width 个抽头）；b: [C] 或 None；
+    state: [width-1, C] 就地更新（第 0 行最新）。
+    返回 y: [C]。
+    ★ **偏置最后加**（Σ w*x 之后再 + b）—— 顺序影响**逐位**结果，与引擎对账时必须一致；
+    ★ 权重布局：GGUF 里 `ssm_conv1d.weight` 有 [C,width] 与 [width,C] 两种可能，
+      调用方必须**显式确认**（本函数只认 [C,width]；拿错布局不会报错、只会算错 —— 所以由调用方 assert）。
+    """
+    C = x.shape[0]
+    y = np.zeros(C, np.float32)
+    # 组装"最近 width 帧"：当前帧 + 状态里的 width-1 帧
+    for k in range(width):
+        if k == 0:
+            src = x
+        else:
+            src = state[k - 1]
+        y += w[:, k] * src
+    if b is not None:
+        y += b
+    # 状态推进：最新的进第 0 行，其余后移
+    if width > 1:
+        state[1:] = state[:-1]
+        state[0] = x
+    return y
+
+
+def kat_ssm_conv():
+    """已知答案测试：随机权重 + 随机序列，与**朴素参考实现**逐位比对。
+
+    参考实现（可读的那份定义）：y[t] = Σ_k w[:,k]*x[t-k] + b，t-k<0 时用 0。
+    判据 = **逐位相同**（两边都只做乘加，顺序一致就应该逐位相同；不同说明状态推进错了）。
+    """
+    rng = np.random.RandomState(0)
+    for width in (2, 4):
+        for C in (3, 8):
+            w = rng.randn(C, width).astype(np.float32) * 0.5
+            b = (rng.randn(C).astype(np.float32) * 0.1)
+            seq = [rng.randn(C).astype(np.float32) for _ in range(6)]
+            # 参考：先把状态（width-1 帧零）摊平算
+            # ★ 偏置必须在**最后**加（与 ssm_conv_step 的累积顺序一致）—— 否则差 1 ULP，
+            #   而本 KAT 的判据是**逐位相同**（对账用；差 1 ULP 说明顺序没对齐，不是错）。
+            def _ref_step(x, st):
+                yy = np.zeros(C, np.float32)
+                for k in range(width):
+                    yy = yy + w[:, k] * (x if k == 0 else st[k - 1])
+                return yy + b
+            ref, st = [], [np.zeros(C, np.float32) for _ in range(width - 1)]
+            for x in seq:
+                ref.append(_ref_step(x, st))
+                if width > 1:
+                    st = [x] + st[:-1]
+            # 被测：状态就地更新版，且**中途复位一次**验 pos==0 语义
+            st2 = np.zeros((width - 1, C), np.float32) if width > 1 else np.zeros((0, C), np.float32)
+            got = []
+            for i, x in enumerate(seq):
+                if i == 3:                       # 模拟新序列：pos==0 ⇒ 状态清零
+                    if width > 1:
+                        st2[:] = 0
+                got.append(ssm_conv_step(x, w, b, st2, width))
+            got = np.array(got)
+            # 参考也要按同样方式复位后再比（i>=3 段重算）
+            ref2, st3 = [], [np.zeros(C, np.float32) for _ in range(width - 1)]
+            for i, x in enumerate(seq):
+                if i == 3:
+                    st3 = [np.zeros(C, np.float32) for _ in range(width - 1)]
+                ref2.append(_ref_step(x, st3))
+                if width > 1:
+                    st3 = [x] + st3[:-1]
+            ref2 = np.array(ref2)
+            same = np.array_equal(got, ref2)
+            d0 = float(np.abs(np.array(ref) - ref2).max())      # 复位确实改变了数值（否则这条测试没意义）
+            print(f"  width={width} C={C}: 逐位相同={same}  max|Δ|={np.abs(got-ref2).max():.2e}"
+                  f"  复位带来的差异={d0:.3f}" + ("" if d0 > 1e-6 else "  ⚠️ 复位没起作用，测试无效"))
+            if not same:
+                raise SystemExit("ssm_conv KAT 失败：与朴素参考不逐位相同")
+    print("  ✅ ssm_conv KAT 通过（含状态推进与 pos==0 复位语义）")
 
 
 def unimplemented_ops():
