@@ -833,8 +833,7 @@ class Server:
 # ─────────────────────────── 聊天（流式 SSE） ───────────────────────────
 
 def stream_chat(url, messages, temp, seed, max_tokens, system=None, think=None,
-                hold=None,
-                repeat_penalty=1.1):
+                repeat_penalty=1.1, hold=None):
     """POST /v1/chat/completions，逐块 yield (文本增量, timing)。
 
     ★ 必须同时处理 `reasoning_content`：这类模型（Ling、Qwen3.5 系等）在"思考模式"下
@@ -855,8 +854,14 @@ def stream_chat(url, messages, temp, seed, max_tokens, system=None, think=None,
         req_body["max_tokens"] = max_tokens
     if think is not None:                     # 关闭/开启思考（多数模板认这个开关）
         req_body["chat_template_kwargs"] = {"enable_thinking": think}
-    if hold:                                  # ★ 思考流式粒度（只有自研引擎的桥接认这个字段）
+    if hold in ("line", "token", "dup"):      # ★ 思考流式粒度（只有自研引擎的桥接认这个字段）
         req_body["draco_think_hold"] = hold
+    elif hold:
+        # ★★ 这里曾经踩过：`hold` 插在 `repeat_penalty` 前面 ⇒ 位置调用把 1.1 传成 hold，
+        #    桥接收到浮点数、对 float 调 .strip() 抛 AttributeError ⇒ **客户端只看到空回复**
+        #    （selfcheck 因此"两轮逐字一致"地全空、指纹相同、还没有 timings）。
+        #    ⇒ 两道防线：① 签名把 hold 放到**最后**（不改既有位置参数）；② 只接受三种合法值。
+        print(f"[警告] 忽略非法的思考粒度取值 {hold!r}（应为 line/token/dup）", file=sys.stderr)
     body = json.dumps(req_body).encode()
     req = urllib.request.Request(
         url + "/v1/chat/completions", data=body,

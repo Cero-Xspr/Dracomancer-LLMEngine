@@ -518,7 +518,10 @@ class ThinkSplitter:
     HOLD_DEFAULT = (os.environ.get("DRACO_THINK_HOLD") or "line").strip().lower()
 
     def __init__(self, start_inside=False, hold=None):
-        hold = (hold or "").strip().lower() or self.HOLD_DEFAULT
+        # ★ 类型兜底：客户端可能把数字/None 之类发进来（实测踩过：Float 导致 .strip() 抛异常，
+        #   生成器中途崩 ⇒ 客户端收到"空回复"）。**桥接不该因为一个可选字段的坏值崩掉**。
+        hold = str(hold).strip().lower() if hold is not None else ""
+        hold = hold or self.HOLD_DEFAULT
         if hold not in ("line", "token", "dup"):
             hold = "line"
         self.inside = start_inside
