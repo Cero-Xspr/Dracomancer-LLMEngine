@@ -19,7 +19,7 @@
     "dracomancer": {
       "backend_hint": "dengine",
       "status": "works",
-      "notes": "自研引擎（m6 内核 zaya 路径）2026-09-14 对账通过：与 llama.cpp（本地构建，同 token 同 prompt 渲染）logits cos 0.999597、top-3 一致。dengine 走 `draco_engine_server.py --engine zaya`（自包含 head=共享词嵌入 Q6_K gemv + 全词表 Viterbi tokenizer）。ZAYA 是推理模型，回答以 <think> 开头属正常行为（draco 界面会原样显示，enable_thinking 过滤是待办）。 实测（dengine，8 线程）：decode ~35 tok/s、prefill ~126 tok/s；装载 ~36s。ZAYA 的 LM head 是共享词嵌入 Q6_K（262144×2048，每 token ~74ms）——速度的主要项，属已知引擎课题。"
+      "notes": "自研引擎（m6 内核 zaya 路径）2026-09-14 对账通过：与 llama.cpp（本地构建，同 token）logits cos 0.999597、top-3 一致；draco chat -m zaya -b dengine 多轮 ✓。★ 速度（OMP=8，3 次中位）：max_tokens=24 → 27.3、100 → 25.9、300 → 24.7 t/s。**瓶颈是 LM head**：共享词嵌入 Q6_K 262144×2048 ≈ 440MB/token，按 35GB/s 算约 15ms 已是硬下限（占约 40%）；纯层部分裸测 65 t/s（不含 head）。★ 之前记录的 35.6 t/s 是错的：那时 -b dengine 被 needs_local_build 的自动切换悄悄改成了 local（llama.cpp），2026-09-14 已修（local 与 dengine 都是我们自己的实现，不该互相覆盖）。★ ZAYA 是推理模型，<think> 原样显示（UI 侧过滤是待办）。"
     }
   },
   "sampling": {

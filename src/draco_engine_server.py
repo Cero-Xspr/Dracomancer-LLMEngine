@@ -257,8 +257,12 @@ def generate(messages, max_tokens, temp, seed, repeat_penalty):
         AP["forward"](int(tid), pos)
     prefill_s = time.time() - t0
 
+    # ★ 真·逐 token 流式：每步解码"已生成前缀"再产出**新增的那段**。
+    #   我之前是"整段生成完再切块 yield" —— 用户一眼看出没流式（而 llama-server 是流式的）。
     out, gen_ids = [], []
     t1 = time.time()
+    sent = 0                      # 已产出的字符数（前缀解码可能出现多字节片段，按字符增量发最稳）
+    t_first = None
     for i in range(n_gen):
         lg = AP["logits"]()
         nid = sample(lg, temp, rng, repeat_penalty, gen_ids)
@@ -266,15 +270,20 @@ def generate(messages, max_tokens, temp, seed, repeat_penalty):
             break
         out.append(nid)
         gen_ids.append(nid)
+        full = AP["decode"](out)
+        if len(full) > sent:
+            if t_first is None:
+                t_first = time.time()
+            yield full[sent:], {}
+            sent = len(full)
         AP["forward"](nid, len(ids) + i)
     dec_s = time.time() - t1
-    text_out = AP["decode"](out) if out else ""
+    ttft_ms = round((t_first - t1) * 1000, 1) if t_first else None
     timings = {
         "prompt_n": len(ids), "prompt_per_second": round(len(ids) / prefill_s, 1) if prefill_s else 0,
         "predicted_n": len(out), "predicted_per_second": round(len(out) / dec_s, 1) if dec_s else 0,
+        "ttft_ms": ttft_ms,
     }
-    for chunk in text_out_chunks(text_out):
-        yield chunk, {}
     yield "", timings
 
 
@@ -344,7 +353,7 @@ class Handler(BaseHTTPRequestHandler):
                 for delta, tim in generate(msgs, mt, temp, seed, rp):
                     if tim:
                         timing = tim
-                    parts.append(delta)
+                    parts.append(delta)   # 逐 token 增量 → 拼回全文（同一条 generate 路径）
                 return self._json(200, {
                     "id": rid, "object": "chat.completion",
                     "choices": [{"index": 0, "message": {"role": "assistant", "content": "".join(parts)},

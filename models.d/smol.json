@@ -14,8 +14,8 @@
     "dracomancer": {
       "backend_hint": "dengine",
       "status": "works",
-      "notes": "2026-09-14 修复并对账通过。根因：m6_llama_attn_op 误用 rope_neox（半分裂，ZAYA/NEOX 系的变体），llama 家族需要连续成对 rope（ggml 的 GGML_ROPE_TYPE_NORMAL）——正是『rope 变体是形状看不出来的语义事实』这一结论的又一实例；当年只测了 tok/s（135M 327.7 vs 329.4 追平）没做数值对账所以漏网。修复=换用引擎里已有的 rope_norm_rot（连续成对，与 ggml 语义一致）。修复后与 llama.cpp 同 token 对账：40 token ChatML 提示 logits cos 0.999911、top-1 一致（504==504），逐算子隔离测试（m6_op_isolate.py：gemv 按量化类型/rms/head/attn pos0+pos1/dense）全过。draco.py -b dengine 走这条。 修复后 dengine 实测（selfcheck 2026-09-14，OMP=4）：指纹稳定、健康问句 3/3、decode 287 tok/s（线程修复前 54——小 gemv 上 OpenMP 全核同步开销反而 2.5× 慢）；360M 同样对账通过（cos 0.9985、top-1 一致）。",
-      "selfcheck_ref": "selfcheck:smol135:dengine+igpu"
+      "notes": "2026-09-14 修复并对账通过。根因：m6_llama_attn_op 误用 rope_neox（半分裂，ZAYA/NEOX 系的变体），llama 家族需要连续成对 rope（ggml 的 GGML_ROPE_TYPE_NORMAL）——正是「rope 变体是形状看不出来的语义事实」的又一实例；当年只测了 tok/s（135M 327.7 vs 329.4 追平）没做数值对账所以漏网。修复=换用引擎里已有的 rope_norm_rot。修复后与 llama.cpp 同 token 对账：40 token ChatML cos 0.999911、top-1 一致（504==504）；360M 同法 0.998547、top-1 一致。逐算子隔离套件（m6_op_isolate.py）全过。★ 速度（OMP=8，3 次取中位；引擎报告的 t/s 口径是「生成段」）：max_tokens=24 → 227、100 → 222、300 → 169 tok/s。**注意长度依赖与波动**：24 token 的短生成比 300 token 快约 35%（KV 越长每步注意力越贵），单次抽样波动可达 ±15% ⇒ **任何单次数都别当吞吐**。我一度报过 287，那是短窗口中位值，复现不出来就是这个原因。",
+      "selfcheck_ref": "selfcheck:smol135:dengine(OMP=8)"
     }
   },
   "sampling": {

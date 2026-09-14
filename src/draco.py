@@ -170,7 +170,7 @@ BACKENDS = {
         dir=os.path.dirname(os.path.abspath(__file__)),
         ngl="0",
         desc="自研引擎（m6 内核桥，OpenAI 兼容）",
-        threads_default=4,             # ★ 实测 135M：OMP=4 317 tok/s；默认全核 20 反而 204（小 gemv 同步开销）
+        threads_default=8,             # ★ 实测：4~8 等价（135M 217~227 / ZAYA 25~27 t/s）；**全核(20) 是灾难**（135M 掉到 204、ZAYA 掉到 23）——每算子 OpenMP 同步开销
     ),
 }
 
@@ -380,6 +380,18 @@ def discover():
     return ms
 
 
+# ★ 自研引擎（Darco）的适配器映射：按 GGUF 名匹配 —— 只有这份表里的模型能走 dengine。
+#   新增模型/架构必须先在 draco_engine_server.py 里写适配器并**过数值对账**，再登记到这里
+#   （见 models.d/*.json 的 engines.dracomancer 段）。
+_DENGINE_ADAPTERS = (("zaya", "zaya"), ("smollm2", "smol"))
+
+
+def dengine_adapter(model):
+    """该模型在 Darco 里的适配器名；没有则 None（= 不能走 dengine）。"""
+    name = getattr(model, "gguf_name", model.name).lower()
+    return next((e for k, e in _DENGINE_ADAPTERS if k in name), None)
+
+
 def draco_view(model):
     """档案在 **draco 现在驱动的那个引擎** 视角下的扁平视图。"""
     return engine_view(getattr(model, "profile", None) or {}, "llama_cpp")
@@ -397,6 +409,25 @@ def broken_reason(model, engine="llama_cpp"):
         return None
     src = prof.get("_file", "档案")
     return f"{src}：{v.get('notes') or '（档案未写 notes）'}"
+
+
+def default_backend(model):
+    """默认后端：**Darco（自研引擎）优先** —— 主线是引擎不是启动器（用户 2026-09-14 定）。
+
+    顺序：
+      ① 有 Darco 适配器 且 档案 engines.dracomancer.status == "works"
+         → 用该段的 backend_hint（通常 dengine）；
+      ② 否则用 llama_cpp 视角的 backend_hint（cpu/igpu/local）；
+      ③ 都没有 → igpu。
+    没有适配器（未过对账的架构）**绝不硬闯** Darco，回落是对的。
+    """
+    prof = getattr(model, "profile", None) or {}
+    if dengine_adapter(model):
+        dv = engine_view(prof, "dracomancer")
+        if dv.get("status") == "works":
+            hint = dv.get("backend_hint")
+            return hint if hint in BACKENDS else "dengine"
+    return profile_backend(model) or "igpu"
 
 
 def profile_backend(model):
@@ -481,7 +512,10 @@ class Server:
             raise SystemExit(f"未知后端 {backend}；可用：{', '.join(BACKENDS)}")
         # ★ 架构需要本地构建时自动切换（官方二进制里没有 zaya 这类自写架构的实现）。
         #   名单来自两处：内置 _NEEDS_LOCAL + 注册表档案的 requires_local_build。
-        if model.needs_local_build() and backend != "local":
+        # ★ 只有"官方预编译二进制"那几个后端才需要自动切 —— local 和 dengine 都是
+        #   **我们自己的实现**，不该被覆盖。之前这里把 `-b dengine` 也换成了 local，
+        #   导致 `-m zaya -b dengine` 实际跑的是 llama.cpp（2026-09-14 用户发现）。
+        if model.needs_local_build() and backend not in ("local", "dengine"):
             src = (model.profile or {}).get("_file", "内置档案")
             print(f"[draco] {model.arch} 只有**本地构建**里有实现（官方二进制没有；"
                   f"档案 {src}）→ 后端 {backend} 自动换成 local")
@@ -513,13 +547,11 @@ class Server:
             if not os.path.exists(exe):
                 raise SystemExit(f"找不到 {exe}")
             self.url = f"http://127.0.0.1:{self.port}"
-            gguf_name = getattr(model, "gguf_name", model.name).lower()
-            # ★ 引擎适配器映射（逐个对账后接入；见 models.d 各档案的 engines.dracomancer 段）
-            _ENG_MAP = (("zaya", "zaya"), ("smollm2", "smol"))
-            eng_adapter = next((e for k, e in _ENG_MAP if k in gguf_name), None)
+            eng_adapter = dengine_adapter(model)
             if eng_adapter is None:
-                raise SystemExit("自研引擎的桥目前只接了 SmolLM2 与 ZAYA1（其余模型/架构待逐个"
-                                 "对账后接线；ling 走独立脚本，见 hybrid/README.md）")
+                raise SystemExit("自研引擎（Darco）目前只接了 SmolLM2 与 ZAYA1"
+                                 "（其余模型/架构待逐个过数值对账后再接线；"
+                                 "清单见 draco._DENGINE_ADAPTERS 与各档案的 engines.dracomancer 段）")
             self.cmd = [sys.executable, exe, "--model", model.path,
                         "--port", str(self.port), "--engine", eng_adapter,
                         "--threads", str(threads)]
@@ -1016,7 +1048,7 @@ def cmd_selfcheck(args):
         m = pick_model(ms, args.model) or next((x for x in ms if x.supported), None)
         if m is None:
             raise SystemExit("没有可用模型")
-        srv_model, backend = m, args.backend or profile_backend(m) or "igpu"
+        srv_model, backend = m, args.backend or default_backend(m)
     threads = args.threads or BACKENDS[backend]["threads_default"]
 
     prof = getattr(srv_model, "profile", None) or {}
@@ -1185,9 +1217,9 @@ def cmd_chat(args):
                 hint = f"{profile_backend(m)}（模型档案推荐的默认后端）"
             else:
                 hint = "cpu/igpu"
-            b = input(f"后端 [{hint}]（回车=档案推荐/igpu）: ").strip().lower()
-            backend = b if b in BACKENDS else (profile_backend(m) or "igpu")
-    backend = backend or profile_backend(m) or "igpu"
+            b = input(f"后端 [{hint}]（回车=默认）: ").strip().lower()
+            backend = b if b in BACKENDS else default_backend(m)
+    backend = backend or default_backend(m)
 
     # ★ 支持性检查必须在"装载…"提示**之前** —— 否则会先打"装载 X"再报"X 跑不了"，
     #   自相矛盾（我实测看到过）。档案标 broken 的情况同理（也走这条更可读的理由）。
@@ -1370,7 +1402,7 @@ def cmd_serve(args):
     m = pick_model(ms, args.model) or next((x for x in ms if x.supported), None)
     if m is None:
         raise SystemExit("没有可用模型")
-    backend = args.backend or profile_backend(m) or "igpu"
+    backend = args.backend or default_backend(m)
     threads = args.threads or BACKENDS[backend]["threads_default"]
     print(f"装载 {m.name}（{m.size/1e9:.2f} GB） 后端={BACKENDS[backend]['desc']}")
     srv = Server(m, backend, args.ctx, threads,
