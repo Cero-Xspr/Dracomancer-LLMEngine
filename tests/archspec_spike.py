@@ -129,6 +129,83 @@ LAYER_STEPS = [
 ]
 
 
+# ── SSM 层的层内步骤（granite-hybrid / Mamba 系）───────────────────────────
+#    ★ 与 llama 密集层的差别只在**子层**：SSM 子层（conv1d → dt/b/c → scan → out）替代注意力子层，
+#      FFN 子层同构。每一步都能声明它依赖哪些语义事实（semantics 列表）——
+#      校验器会检查引用是否存在 ⇒ 「描述层」完整且可查，缺什么一眼可见。
+LAYER_STEPS_SSM = [
+    ("rms_norm",  {"src": "x", "w": "blk.{i}.attn_norm.weight", "out": "xn"}),
+    ("mul_mat",   {"w": "blk.{i}.ssm_in.weight", "src": "xn", "out": "zxbcdt"}),
+    ("ssm_conv",  {"w": "blk.{i}.ssm_conv1d.weight", "src": "zxbcdt", "out": "conv",
+                   "semantics": ["ssm_conv_width", "ssm_state_reset"]}),
+    ("ssm_scan",  {"src": "conv", "a": "blk.{i}.ssm_a.weight", "dt": "blk.{i}.ssm_dt.bias",
+                   "d": "blk.{i}.ssm_d.weight", "out": "y",
+                   "semantics": ["ssm_dt_rank", "ssm_gate_clamp", "ssm_state_reset"]}),
+    ("mul_mat",   {"w": "blk.{i}.ssm_out.weight", "src": "y", "out": "s"}),
+    ("add",       {"a": "x", "b": "s", "out": "x"}),
+    ("rms_norm",  {"src": "x", "w": "blk.{i}.ffn_norm.weight", "out": "xn2"}),
+    ("mul_mat",   {"w": "blk.{i}.ffn_gate.weight", "src": "xn2", "out": "g"}),
+    ("mul_mat",   {"w": "blk.{i}.ffn_up.weight", "src": "xn2", "out": "u"}),
+    ("silu_mul",  {"g": "g", "u": "u", "out": "h"}),
+    ("mul_mat",   {"w": "blk.{i}.ffn_down.weight", "src": "h", "out": "d"}),
+    ("add",       {"a": "x", "b": "d", "out": "x"}),
+]
+
+# ── KDA 层的层内步骤（bailingmoe3 线性注意力）───────────────────────────
+LAYER_STEPS_KDA = [
+    ("rms_norm",   {"src": "x", "w": "blk.{i}.attn_norm.weight", "out": "xn"}),
+    ("mul_mat",    {"w": "blk.{i}.attn_q.weight", "src": "xn", "out": "q"}),
+    ("mul_mat",    {"w": "blk.{i}.attn_k.weight", "src": "xn", "out": "k"}),
+    ("mul_mat",    {"w": "blk.{i}.attn_v.weight", "src": "xn", "out": "v"}),
+    ("ssm_conv",   {"w": "blk.{i}.ssm_conv1d", "src": "q", "out": "qc",
+                    "semantics": ["kda_norm_placement", "kda_layer_indexing"]}),
+    ("ssm_conv",   {"w": "blk.{i}.ssm_conv1d", "src": "k", "out": "kc",
+                    "semantics": ["kda_norm_placement", "kda_layer_indexing"]}),
+    ("ssm_conv",   {"w": "blk.{i}.ssm_conv1d", "src": "v", "out": "vc",
+                    "semantics": ["kda_norm_placement", "kda_layer_indexing"]}),
+    ("kda_delta",  {"q": "qc", "k": "kc", "v": "vc", "beta": "blk.{i}.ssm_beta.weight",
+                    "a": "blk.{i}.ssm_a.weight", "out": "o",
+                    "semantics": ["kda_decay_param", "kda_beta_activation", "kda_head_dim"]}),
+    ("rms_norm",   {"src": "o", "w": "blk.{i}.ssm_norm.weight", "out": "o2",
+                    "semantics": ["kda_norm_placement"]}),
+    ("mul_mat",    {"w": "blk.{i}.attn_output.weight", "src": "o2", "out": "s"}),
+    ("add",        {"a": "x", "b": "s", "out": "x"}),
+    ("rms_norm",   {"src": "x", "w": "blk.{i}.ffn_norm.weight", "out": "xn2"}),
+    # bailingmoe3 的 FFN 是分组 MoE（128 专家选 8 + 共享专家）—— 与已实现的 MoE 同构，这里只占位
+    ("moe_ffn",    {"w": "blk.{i}.ffn_gate_exps.weight", "src": "xn2", "out": "d"}),
+    ("add",        {"a": "x", "b": "d", "out": "x"}),
+]
+
+# 求值器**已实现**的 op（其余 op 就是 C3 剩下的工作清单）
+IMPLEMENTED_OPS = ("rms_norm", "mul_mat", "rope", "attn_gqa", "silu_mul", "add", "moe_ffn")
+
+
+def unimplemented_ops():
+    """列出声明了但求值器还没实现的 op —— 直接就是 C3 的剩余工作清单。"""
+    out = {}
+    for nm, steps in (("llama", LAYER_STEPS), ("ssm", LAYER_STEPS_SSM), ("kda", LAYER_STEPS_KDA)):
+        miss = sorted({op for op, _ in steps if op not in IMPLEMENTED_OPS})
+        if miss:
+            out[nm] = miss
+    return out
+
+
+def validate_steps(steps, semantics, name):
+    """校验一份层内步骤：每个 op 名合法；每条 semantics 引用都能在事实表里找到。"""
+    bad = []
+    for op, args in steps:
+        if not isinstance(op, str) or not op:
+            bad.append("步骤缺 op 名")
+        for ref in args.get("semantics", []):
+            if ref not in semantics:
+                bad.append(f"{op}: 引用了不存在的事实 {ref}")
+        if args.get("heads") not in (None, "n_head", "n_head_kv"):
+            bad.append(f"{op}: heads 只能是 n_head / n_head_kv")
+    if bad:
+        raise SystemExit(f"层内步骤 {name} 不合法（{len(bad)} 处）：\n  - " + "\n  - ".join(bad))
+    return True
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # 二、通用求值器（op 只管张量，不含任何 llama 专属逻辑）
 # ═══════════════════════════════════════════════════════════════════════

@@ -206,8 +206,15 @@
   这正是"没覆盖"该有的样子。
 - **自证**：`selftest_validate()` 证明拦得住 —— 完整规格通过；SSM/KDA 被拦；删掉一条事实的 `how_found`
   也被拦（避免"校验器自己不报错"的假通过）。
-- **剩余**：把这 10 条待定事实逐条测定（读 llama.cpp 参考实现 + 对照 GGUF 张量/超参）后回填 `value`，
-  再让 spike 真跑一遍这两族、与参考实现对数。
+- **已完成（第二小步，提交 72a9bf2）**：10 条事实**测定回填**（KDA 5 条取自**已对账过**的 ling_proto
+  —— vs llama.cpp cos 0.998814；SSM 5 条取自 GGUF KV + llama.cpp 算子表 + 本地 granite-h-tiny 实测）
+  ⇒ 两族现在**能通过校验**；保留"删掉一条 how_found 也会被拦"的探测。
+- **已完成（第三小步）**：补上 `LAYER_STEPS_SSM` / `LAYER_STEPS_KDA`（层内步骤数据），
+  并加 `validate_steps()`：每个 op 名合法、每条 `semantics` 引用都能在事实表里找到。
+  ⇒ **描述层三族齐全且可校验**。新增 `unimplemented_ops()` **自动列出求值器缺口**：
+  `ssm_conv`、`ssm_scan`、`kda_delta` —— 这就是 C3 的剩余工作清单（而不是靠人记）。
+- **剩余（数值层）**：给求值器实现这 3 个算子（SSM 因果卷积 + scan 递推；KDA 的三分支卷积 + delta-net
+  递推），再拿 granite-h-tiny / Ling 的真权重跑逐层对账 —— 这步才真正验证"声明式描述能复现真模型"。
 
 ### C3（旧描述，保留）声明式表达力覆盖混合 SSM/KDA
 - archspec spike 已验证 llama 密集 + MoE（cos 0.999962 / 0.9998），但 granite-hybrid、bailingmoe3(KDA) 还没进。
