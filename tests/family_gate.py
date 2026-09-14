@@ -121,7 +121,7 @@ def main():
             q, exp = draco._SELFCHECK_SANITY[1]        # "1+1=?" 最不容易受上下文干扰
             ref, _ = ask(srv, q)
             print(f"  上下文 0      → {ref!r}（基准）")
-            for c in (256, a.ctx // 2, a.ctx):
+            for c in sorted({256, a.ctx // 2, a.ctx}):      # 去重（ctx=512 时 256 会出现两次）
                 if c <= 0:
                     continue
                 try:

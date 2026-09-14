@@ -1356,6 +1356,27 @@ def apply_profile_defaults(args, model):
     args.think_default = sp.get("think_default", False)
 
 
+def cmd_family(args):
+    """家族级合规闸门（实现在 family_gate.py；这里只做 CLI 包装，避免逻辑两份）。
+
+    与 selfcheck 的分工：selfcheck 答「这个模型现在跑起来对不对」（单模型、单后端）；
+    family 答三个结构性问题：跨后端是否同答 / 跨量化是否一致 / 长上下文是否退化。
+    """
+    import family_gate
+    argv = [args.model]
+    if args.backends:
+        argv += ["--backends", args.backends]
+    argv += ["--ctx", str(args.ctx)]
+    if args.json:
+        argv += ["--json", args.json]
+    old = sys.argv
+    sys.argv = ["draco family"] + argv
+    try:
+        return family_gate.main()
+    finally:
+        sys.argv = old
+
+
 def cmd_chat(args):
     # ── NPU 后端：模型走 FLM 的 tag 命名空间，不走 GGUF 发现 ──
     if args.backend == "npu":
@@ -1442,6 +1463,8 @@ HELP = """斜杠命令：
   /temp <x>        改温度（0 = 贪心）
   /maxtok <n>      改单次最多生成 token（默认 2048，0 = 不限）
   /think on|off|auto  开/关思考模式（默认=模板决定）
+  /params 里会显示思考流式的粒度；粒度本身用环境变量 DRACO_THINK_HOLD 控制
+  （line=按行挂起(默认) / token=完全逐 token 直出 / dup=直出+收尾补发末行）—— 见 README
   /rep <x>         重复惩罚（默认 1.1；1.0 = 关）
   /system <文本>   设置/清除系统提示
   /help            本帮助"""
@@ -1683,6 +1706,14 @@ def main():
                    help="速度-能效倾向（默认取环境变量 DRACO_PREFER，否则 balanced）："
                         "speed=挑最快后端 / eco=挑最省电后端且线程取 4 / balanced=不额外调")
     p.set_defaults(fn=cmd_selfcheck)
+
+    p = sub.add_parser("family",
+                       help="家族级合规闸门：跨后端一致 / 跨量化 / 长上下文退化曲线")
+    p.add_argument("-m", "--model", required=True, help="模型名（前缀/子串）")
+    p.add_argument("--backends", help="逗号分隔（默认 cpu,igpu,dengine）")
+    p.add_argument("-c", "--ctx", type=int, default=2048, help="上下文长度（默认 2048）")
+    p.add_argument("--json", help="把结果写成 JSON（可贴进 issue）")
+    p.set_defaults(fn=cmd_family)
 
     for name, fn, h in (("chat", cmd_chat, "交互式聊天"), ("serve", cmd_serve, "起 HTTP 服务（带 Web UI）")):
         p = sub.add_parser(name, help=h)
