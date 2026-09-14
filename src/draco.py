@@ -1011,6 +1011,24 @@ def cmd_tune(args):
 #   的累加次序都不同），所以指纹是「同机同后端可复现」的诊断 + 给维护者比对用的参考，
 #   不是通过/失败的判据。判据是健康问句 + 维护者复跑。
 
+def _strip_think(txt):
+    """去掉思考段，只留最终答案。返回 (答案, 状态)：
+      "ok"        —— 思考已闭合（或本来就没有），答案是后面的部分
+      "thinking"  —— 有 <think> 但没闭合 ⇒ **仍在上思考、预算不足**，不能把思考当答案
+      "no_think"  —— 没有思考标记，全文即答案
+    ★ 我第一版在"剥完为空"时 `or txt.strip()` 兜底 ⇒ 把未闭合的思考块当答案，
+      于是思考文本里出现的数字被当成了正确回答（**假通过**）。这种静默错是本项目一直在防的。
+    """
+    import re
+    has_open = bool(re.search(r"<think>", txt, re.I))
+    has_close = bool(re.search(r"</think>", txt, re.I))
+    if has_open and not has_close:
+        return "", "thinking"
+    out = re.sub(r"<think>.*?</think>", "", txt, flags=re.S | re.I)
+    out = re.sub(r"^.*?\[/?think\]", "", out, flags=re.S | re.I)
+    return out.strip(), ("ok" if has_open else "no_think")
+
+
 _SELFCHECK_PROMPTS = [
     # 可复现性用（内容不重要，重要的是固定）
     ("repro-1", "The quick brown fox", 24),
@@ -1102,16 +1120,27 @@ def cmd_selfcheck(args):
                 print(f"      {'':7s}  第二轮: {fps[1][i][:48]!r}")
 
         # ── (b) 健康问句（instruct 模型才有意义）──
+        #   ★ 两个坑（ZAYA 上实测出来的）：
+        #     ① 推理模型会把答案放在 <think>...</think> **之后** ⇒ 预算太小会截在思考里，
+        #        判据却去 greps 可见文本 ⇒ 假失败（我用 32 token 时 ZAYA 0/3，其实是没轮到答案）；
+        #     ② 判据要把思考块剥掉再匹配，否则思考里引用了问题也会误判"通过"。
         sanity = []
         for p, expect in _SELFCHECK_SANITY:
             txt, _ = _complete_once(srv.url, [{"role": "user", "content": p}],
-                                    0.0, 42, 32)
-            ok = any(e in txt for e in expect)
-            sanity.append({"prompt": p, "expect_any": expect, "got_head": txt[:64], "pass": ok})
-            print(f"[2] 健康问句：{'✅' if ok else '❌'}  {p[:36]!r} → {txt[:48]!r}")
+                                    0.0, 42, 512)          # 给推理留足预算
+            vis, st = _strip_think(txt)
+            ok = st != "thinking" and any(e in vis for e in expect)
+            sanity.append({"prompt": p, "expect_any": expect, "got": txt[:200],
+                           "visible": vis[:64], "think_state": st, "pass": ok})
+            mark = "✅" if ok else ("⚠" if st == "thinking" else "❌")
+            note = "（仍在上思考：预算不足，未给答案）" if st == "thinking" else ""
+            print(f"[2] 健康问句：{mark}  {p[:36]!r} → {(vis or txt)[:60]!r}{note}")
         result["sanity"] = sanity
         n_ok = sum(1 for s in sanity if s["pass"])
-        print(f"    小结 {n_ok}/{len(sanity)}（base/非 instruct 模型可能天然失败，仅参考）")
+        n_th = sum(1 for s in sanity if s.get("think_state") == "thinking")
+        print(f"    小结 {n_ok}/{len(sanity)}"
+              + (f"，另有 {n_th} 条预算不足（思考未结束）" if n_th else "")
+              + "（base/非 instruct 模型可能天然失败，仅参考）")
 
         # ── (c) 速度：固定 6 次请求的 server 侧计时中位 ──
         tps, pps = [], []
