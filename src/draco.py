@@ -833,6 +833,7 @@ class Server:
 # ─────────────────────────── 聊天（流式 SSE） ───────────────────────────
 
 def stream_chat(url, messages, temp, seed, max_tokens, system=None, think=None,
+                hold=None,
                 repeat_penalty=1.1):
     """POST /v1/chat/completions，逐块 yield (文本增量, timing)。
 
@@ -854,6 +855,8 @@ def stream_chat(url, messages, temp, seed, max_tokens, system=None, think=None,
         req_body["max_tokens"] = max_tokens
     if think is not None:                     # 关闭/开启思考（多数模板认这个开关）
         req_body["chat_template_kwargs"] = {"enable_thinking": think}
+    if hold:                                  # ★ 思考流式粒度（只有自研引擎的桥接认这个字段）
+        req_body["draco_think_hold"] = hold
     body = json.dumps(req_body).encode()
     req = urllib.request.Request(
         url + "/v1/chat/completions", data=body,
@@ -1468,7 +1471,7 @@ HELP = """斜杠命令：
   /temp <x>        改温度（0 = 贪心）
   /maxtok <n>      改单次最多生成 token（默认 2048，0 = 不限）
   /think on|off|auto  开/关思考模式（默认=模板决定）
-  /params 里会显示思考流式的粒度；粒度本身用环境变量 DRACO_THINK_HOLD 控制
+  /hold line|token|dup  思考流式粒度（line=按行挂起(默认)/token=完全逐 token/dup=直出+补发末行）
   （line=按行挂起(默认) / token=完全逐 token 直出 / dup=直出+收尾补发末行）—— 见 README
   /rep <x>         重复惩罚（默认 1.1；1.0 = 关）
   /system <文本>   设置/清除系统提示
@@ -1483,6 +1486,7 @@ def loop_chat(srv, args):
     #   不支持该开关的模板会忽略这个 kwargs（已用 Llama-3.2 验证无害）。
     #   注册表档案可用 sampling.think_default 覆盖这个默认。
     think = getattr(args, "think_default", False)
+    hold = None            # 思考流式粒度（/hold 设置；仅自研引擎 dengine 生效）
     rep = args.repeat_penalty
     in_think = [False]
     while True:
@@ -1524,6 +1528,13 @@ def loop_chat(srv, args):
                     rep = float(rest); print(f"  重复惩罚 → {rep}")
                 except ValueError:
                     print("  用法：/rep 1.1（1.0 = 关闭）")
+            elif c in ("hold", "粒度"):
+                if rest not in ("line", "token", "dup"):
+                    print("  用法：/hold line（按行挂起，默认）| token（完全逐 token 直出）| "
+                          "dup（直出 + 收尾补发末行）")
+                else:
+                    hold = rest
+                    print(f"  思考流式粒度 → {rest}（仅自研引擎 dengine 生效，其它后端忽略）")
             elif c == "think":
                 v = rest.lower()
                 think = None if v in ("", "auto") else (v in ("on", "1", "true", "yes"))
@@ -1539,7 +1550,7 @@ def loop_chat(srv, args):
         rst = "\x1b[0m" if sys.stdout.isatty() else ""
         try:
             for kind, delta, tim in stream_chat(
-                    srv.url, msgs, temp, seed, maxtok, system, think, rep):
+                    srv.url, msgs, temp, seed, maxtok, system, think, rep, hold):
                 if delta:
                     if t_last is None:
                         t_last = time.time()          # 首 token 到达

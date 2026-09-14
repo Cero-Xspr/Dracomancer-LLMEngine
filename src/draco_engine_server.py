@@ -385,7 +385,7 @@ def sample(logits, temp, seed_rng, repeat_penalty, recent):
     return int(np.argmax(z))
 
 
-def generate(messages, max_tokens, temp, seed, repeat_penalty, enable_thinking=None):
+def generate(messages, max_tokens, temp, seed, repeat_penalty, enable_thinking=None, hold=None):
     """**同步**做完准备工作（渲染/分词/上下文预算），返回真正的生成器。
 
     ★ 为什么拆两层（2026-09-15 实测）：整个函数若是生成器，异常要等第一次 next() 才抛 ——
@@ -406,10 +406,10 @@ def generate(messages, max_tokens, temp, seed, repeat_penalty, enable_thinking=N
         raise ValueError(f"提示词太长：{len(ids)} token > 本引擎上下文 {MAXT}。"
                          f"（draco 侧可用 -c 调大，桥接会用同一个值）")
     n_gen = min(max_tokens if max_tokens and max_tokens > 0 else 256, budget)
-    return _gen(ids, n_gen, temp, seed, repeat_penalty, think_now)
+    return _gen(ids, n_gen, temp, seed, repeat_penalty, think_now, hold)
 
 
-def _gen(ids, n_gen, temp, seed, repeat_penalty, think_now):
+def _gen(ids, n_gen, temp, seed, repeat_penalty, think_now, hold=None):
     """生成器：yield (kind, 文本增量, 计时dict)。"""
     rng = random.Random(seed if seed and seed > 0 else None)
 
@@ -429,7 +429,7 @@ def _gen(ids, n_gen, temp, seed, repeat_penalty, think_now):
     _prof = os.environ.get("DRACO_ENG_PROF") == "1"
     _p = {"logits": 0.0, "sample": 0.0, "decode": 0.0, "split": 0.0, "fwd": 0.0}
     # ★ 分区分片是有状态的（见 ThinkSplitter：未闭合思考要挂起最后一段做兜底）
-    sp = ThinkSplitter(start_inside=bool(AP.get("think_block")) and think_now)
+    sp = ThinkSplitter(start_inside=bool(AP.get("think_block")) and think_now, hold=hold)
     for i in range(n_gen):
         _q = time.perf_counter()
         lg = AP["logits"]()
@@ -514,12 +514,17 @@ class ThinkSplitter:
     #               代价是那一小段会**显示两次**（先暗后白）。
     #   为什么必须二选一：把某段判成"回答"要**事后**才知道（模型可能写出 </think>），
     #   所以"零延迟"与"零重复地正确分区"在流式协议下不可兼得 —— 让用户挑，而不是我替他挑。
-    HOLD = (os.environ.get("DRACO_THINK_HOLD") or "line").strip().lower()
+    # 默认值取环境变量；**每请求可用请求体字段 `draco_think_hold` 覆盖**（draco 的 `/hold` 命令走这条）。
+    HOLD_DEFAULT = (os.environ.get("DRACO_THINK_HOLD") or "line").strip().lower()
 
-    def __init__(self, start_inside=False):
+    def __init__(self, start_inside=False, hold=None):
+        hold = (hold or "").strip().lower() or self.HOLD_DEFAULT
+        if hold not in ("line", "token", "dup"):
+            hold = "line"
         self.inside = start_inside
-        self.live = self.HOLD in ("token", "dup")     # 完全直出（不挂起）
-        self.dup = self.HOLD == "dup"                 # 收尾补发末行（会有一次重复）
+        self.live = hold in ("token", "dup")          # 完全直出（不挂起）
+        self.dup = hold == "dup"                      # 收尾补发末行（会有一次重复）
+        self.hold_mode = hold
         self.sent = 0            # 已确认并产出的字符数
         self.capped = False      # 当前挂起的这一行是否已被 LINE_MAX 截断过（截断过的不能再当回答）
 
@@ -642,10 +647,11 @@ class Handler(BaseHTTPRequestHandler):
         rp = float(req.get("repeat_penalty") or 1.0)
         ctk = req.get("chat_template_kwargs") or {}
         think = ctk.get("enable_thinking")          # None = 按模型默认
+        hold = req.get("draco_think_hold")          # 思考流式粒度（line/token/dup）；None=按环境变量
         rid = f"draco-eng-{int(time.time()*1000)}"
         # ★ 准备阶段在发响应头之前完成 ⇒ 超长/渲染失败都能回一个像样的 400
         try:
-            gen = generate(msgs, mt, temp, seed, rp, think)
+            gen = generate(msgs, mt, temp, seed, rp, think, hold)
         except ValueError as e:
             return self._json(400, {"error": {"message": str(e), "type": "invalid_request_error"}})
         except Exception as e:
