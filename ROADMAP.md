@@ -273,7 +273,13 @@
   ② 权重加载补 SSM/KDA 张量名（`ssm_conv1d`/`ssm_a`/`ssm_dt`/`ssm_d`/`ssm_beta`/`ssm_norm`…），
      并对**权重布局**（如 `ssm_conv1d.weight` 是 [C,width] 还是 [width,C]）做显式断言 —— 拿错不报错才最危险；
   ③ 用 **granite-h-tiny**（SSM 族）与 **Ling**（KDA 族）的真权重跑**逐层对账**，参考用 llama.cpp 的 dump；
-  ④ 把 `ssm_scan` 的公式与 `build_mamba2_layer` **逐行核对**（目前只声称内部一致）。
+  ④ ✅ **`ssm_scan` 公式已与 llama.cpp 逐行核对**（来源：`models/mamba-base.cpp` 的图 +
+     `ggml-cpu/ops.cpp` 的 `ggml_compute_forward_ssm_scan_f32`），**修正三处凭常识写错的地方**：
+     ①内核**无 clamp**（旧版凭印象加了 ±4）；②**A 形状 {d_state, n_head}**，d_state>0 时
+     `dA = exp(dt*a)` **逐 state 元素**（旧版写成逐头标量）；③内核**没有 D 跳连**
+     （`y = Σ h·c` 而已，旧版加了 `d*x`；Mamba 论文的 D 项在 llama.cpp 里不在 ssm_scan 内）。
+     KAT 同步更新后全绿（被测与朴素参考逐位相同；复位 |Δ|=0.169；A≤0 稳态有界）。
+     ⇒ 「先核对再对账」的顺序被证明正确：带旧公式去对 granite-h-tiny 会白对一轮才发现这三处。
   ⇒ 这四步做完，"声明式描述能复现真模型"才算被验证过（当前只验证了"描述完整 + 算子自身正确"）。
 
 ### C3（旧描述，保留）声明式表达力覆盖混合 SSM/KDA
