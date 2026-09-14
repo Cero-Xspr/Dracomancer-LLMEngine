@@ -79,6 +79,16 @@ check("思考区多段", "P1 line.\n\nP2 line.\n\n</think>\n\nfin", True, "\n\nf
 # ⑧ 空输出
 check("空输出", "", True, "", "")
 
+# ⑩ 流式活性：喂到 "第一行\n第二行还没完" 时，"第一行\n" 必须**已经**产出
+#    （这条是 2026-09-15 用户报"思考不流式"的回归测试：挂起粒度必须是"一行"而不是"一段"）
+sp = ThinkSplitter(start_inside=True)
+ev = sp.feed("第一行已经写完\n第二行")
+got = "".join(x for k, x in ev if k == "reasoning")
+if got != "第一行已经写完\n":
+    FAIL.append("流式活性"); print(f"✗ 流式活性：期望立刻产出首行，实际 {got!r}")
+else:
+    print(f"✓ 流式活性（首行立刻产出，只挂起半行）\n    已产出={got!r}")
+
 # ⑨ 生成结束恰好停在空行后（挂起段为空 ⇒ 不该产出垃圾）
 R, C, _ = run("thinking...\n\n", True)
 if R + C != "thinking...\n\n":

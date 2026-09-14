@@ -239,7 +239,7 @@ def _load_zaya():
     eos = int(_f["tokenizer.ggml.eos_token_id"].contents())
     tbl = {t: i for i, t in enumerate(toks)}
     im_end = tbl.get("<|im_end|>", eos)
-    MAXT = 1024
+    MAXT = int(getattr(Z, "ZMAXT", 1024))     # ★ 取引擎真实上下文（跟随 --ctx），别写死
     H_Z = Z.H
 
     # ★ zaya 的 step 返回隐状态、logits_of 需要它 ⇒ 闭包里存"最后隐状态"，
@@ -491,22 +491,25 @@ class ThinkSplitter:
         · 规范的 assistant 输出 = `{reasoning}\\n</think>\\n\\n{content}`（模板就是按这个把历史拼回去的）
         · 模板注释原文："Allow downstream logic to take care of broken thought" ——
           **坏掉的思考明确由下游处理**，而"下游"就是我们。
-      ⇒ 于是这里按同一约定兜底：思考中**只挂起最后一个空行段**（`\\n\\n` 之后的那段）。
-         出现新空行、或挂起段超过 PENDING_MAX 字符 ⇒ 确认为思考，立即吐出；
-         生成结束时仍未闭合 ⇒ 挂起的那段按 **content** 发出（于是回答会正常显示为白字）。
-      代价：思考区显示滞后一段（极通常不到一段）。收益：不写收尾标签的模型也能正确分区 ——
-      这一点上我们比 llama.cpp 的参考实现更好用（它会一直把回答显示成暗色思考）。
+      ⇒ 于是这里按同一约定兜底：思考中**只挂起"当前这一行"**（最后一个换行之后还没结束的那段）。
+         出现换行、或这一行超过 LINE_MAX 字符 ⇒ 确认为思考并**立即吐出**；
+         生成结束时仍未闭合 ⇒ 挂起的那一行按 **content** 发出（回答于是显示为白字）。
+      ★★ 2026-09-15 用户报"思考内容不会流式传输进来"——根因是**我第一版挂起粒度过粗**：
+         当时挂起的是"最后一个**空行段**"，而思考常常整段没有空行 ⇒ 用户要等到生成结束
+         （或憋够 800 字符）才看到思考一次性蹦出来。实测：整段 382 字的思考只送来 **6 个分片**，
+         首个分片在 t=6.05s 且一次 270 字符。改成"按行挂起"后显示延迟降到一行，
+         而兜底仍能捞到回答 —— 因为要捞的那段本来就在最后一行（ZAYA 的 "391" 就是）。
 
     不变式（单测保证）：所有产出的 reasoning+content 拼接 **逐字等于**模型输出原文，
     不丢字、不重复。
     """
-    PENDING_MAX = 800          # 挂起段超过这么多字符 ⇒ 不可能是"最后一段回答"，确认是思考
+    LINE_MAX = 240             # 挂起的那一行超过这么多字符就吐出去，别一直憋着
     _TAGS = ("<think>", "</think>")
 
     def __init__(self, start_inside=False):
         self.inside = start_inside
         self.sent = 0            # 已确认并产出的字符数
-        self.sep_open = False    # 当前挂起段是否紧跟在一个"空行分隔符"之后
+        self.capped = False      # 当前挂起的这一行是否已被 LINE_MAX 截断过（截断过的不能再当回答）
 
     def _emit(self, full, upto):
         """把 [sent, upto) 按当前所在区产出。"""
@@ -539,13 +542,11 @@ class ThinkSplitter:
                 out += self._emit(full, nxt_o)          # 标签前的文字按"当前区"确认
                 self.inside = True
                 self.sent = nxt_o + len("<think>")
-                self.sep_open = False
                 continue
             if nxt_c != -1:
                 out += self._emit(full, nxt_c)
                 self.inside = False
                 self.sent = nxt_c + len("</think>")
-                self.sep_open = False
                 continue
             break
         # 后面没有标签了 —— 尾部处理
@@ -553,26 +554,19 @@ class ThinkSplitter:
             out += self._emit(full, len(full) if final else len(full) - self._hold(full))
             return out
         seg = full[self.sent:]
-        if self.sep_open:                               # ① 分隔符的延续：空行后可能还有换行
-            lead = len(seg) - len(seg.lstrip("\n"))
-            if lead:
-                out += self._emit(full, self.sent + lead)
-                seg = full[self.sent:]
-        p = seg.rfind("\n\n")
-        if p != -1:
-            # 最后一个空行（含其后连续的换行）之前确认为思考，空行之后的那段挂起
-            run_end = p
-            while run_end < len(seg) and seg[run_end] == "\n":
-                run_end += 1
-            out += self._emit(full, self.sent + run_end)
-            self.sep_open = True
-        elif len(seg) > self.PENDING_MAX:
+        k = seg.rfind("\n")
+        if k != -1:
+            # 按行确认：最后一个换行（含）之前都算思考，换行之后的那半行先挂起
+            out += self._emit(full, self.sent + k + 1)
+            self.capped = False          # 新的一行开始了，重新计数
+        elif len(seg) > self.LINE_MAX:
+            # 单行太长（模型一口气写一大段没有换行）⇒ 不能一直憋着，先吐出去
             out += self._emit(full, len(full) if final else len(full) - self._hold(full))
-            self.sep_open = False
+            self.capped = True           # ★ 这一行被截断过 ⇒ 收尾时不能再把残段当"回答"
         if final and self.inside:
-            # ★ 收尾仍未闭合：只有当"空行分隔符之后的那一段"非空且够短，才把那段当回答；
-            #   否则（整段思考/没有分隔符/那段太长）保持 reasoning —— 别把思考误当回答。
-            if self.sep_open and 0 < len(full) - self.sent <= self.PENDING_MAX:
+            # ★ 收尾仍未闭合：挂起的那一行（非空且不长）就是回答，按 content 发出；
+            #   否则保持 reasoning（空/太长都可能 —— 单行太长的话上面已经吐过、这里挂起为空）
+            if not self.capped and 0 < len(full) - self.sent <= self.LINE_MAX:
                 self.inside = False
             out += self._emit(full, len(full))
         return out

@@ -1494,7 +1494,7 @@ def loop_chat(srv, args):
 
         msgs.append({"role": "user", "content": user})
         print()
-        buf, t0, t_last, ntok, timings = [], time.time(), None, 0, {}
+        buf, rbuf, t0, t_last, ntok, timings = [], [], time.time(), None, 0, {}
         dim = "\x1b[2m" if sys.stdout.isatty() else ""
         rst = "\x1b[0m" if sys.stdout.isatty() else ""
         try:
@@ -1512,13 +1512,22 @@ def loop_chat(srv, args):
                             sys.stdout.write(f"{rst}\n"); in_think[0] = False
                         sys.stdout.write(delta)
                     sys.stdout.flush()
-                    if kind == "content":
-                        buf.append(delta)
+                    (rbuf if kind == "reasoning" else buf).append(delta)
                     ntok += 1
                 if tim:
                     timings = tim
             if in_think[0]:
                 sys.stdout.write(rst); in_think[0] = False
+        except urllib.error.HTTPError as e:
+            # ★ 把服务端的正文打出来：桥接/llama-server 的报错正文里才有真原因
+            #   （实测：ZAYA 上下文超限时只显示 "HTTP Error 400" 是没法排查的）
+            try:
+                body = e.read().decode("utf-8", "replace")[:400]
+            except Exception:
+                body = ""
+            print(f"\n[错误] 请求失败：HTTP {e.code}\n  {body}")
+            msgs.pop()
+            continue
         except urllib.error.URLError as e:
             print(f"\n[错误] 请求失败：{e}")
             msgs.pop()
@@ -1529,9 +1538,17 @@ def loop_chat(srv, args):
         if maxtok and lim >= maxtok:
             print(f"{dim}[已达单次上限 max_tokens={maxtok}（回答可能在半句被截断）"
                   f"；用 /maxtok 4096 调大，或 /maxtok 0 设为不限]{rst}")
-        reply = "".join(buf)
-        if reply:
-            msgs.append({"role": "assistant", "content": reply})
+        reply, reason = "".join(buf), "".join(rbuf)
+        # ★★ 必须把 reasoning_content 一起带回历史（2026-09-15 用户报"ZAYA 第一问会思考，
+        #    接下来就不思考了"）。原因在模板里：ZAYA/Bailing 这类模板对"没有 reasoning_content 的
+        #    assistant 历史"会渲染成**空 think 块**（`<think>\n</think>\n\n{content}`），
+        #    模型看到"上一轮我没思考直接答了"就跟着模仿 —— 于是第二问起思考归零。
+        #    实测（同一模型、同一问题）：历史只带 content → 思考 0 字符；带 reasoning_content → 思考 565 字符。
+        if reply or reason:
+            m = {"role": "assistant", "content": reply}
+            if reason:
+                m["reasoning_content"] = reason
+            msgs.append(m)
         # 速度：优先用 server 给的 timings，否则用本地计时
         if timings.get("predicted_per_second"):
             gps = timings["predicted_per_second"]
