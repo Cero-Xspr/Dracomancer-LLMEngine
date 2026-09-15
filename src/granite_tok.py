@@ -60,8 +60,11 @@ if __name__ == "__main__":
         cases = ["The capital of France is", "中国的首都是北京", "Hello   world!\n\nSecond line.",
                  "It's a 1234 number, isn't it?", "def foo(x):  # comment\n    return x**2",
                  "<|start_of_role|>user<|end_of_role|>hi<|end_of_text|>", "  leading spaces",
-                 "tab\there", "emoji 🎉 and ünïcödé", ""]
+                 "tab\there", "emoji 🎉 and ünïcödé"]
         bad = 0
+        # 空串单独测：llama-tokenize 不接受 -p ""（退出码 1），拿不到参考 ⇒ 只本地断言
+        assert tk.encode("", add_special_tokens=False).ids == [], "空串应当切成 0 个 token"
+        print("✓ ''（空串）本地断言：0 个 token（llama-tokenize 拒绝 -p ''，无法给参考）")
         for s in cases:
             mine = tk.encode(s, add_special_tokens=False).ids
             ref = llama_ids(s)

@@ -1,0 +1,4 @@
+{
+  "min_cos_threshold": 0.999,
+  "source": "s4d_reconcile2.py 实测最小 0.999147（pos0）；阈值取 0.9990 留一点余量"
+}

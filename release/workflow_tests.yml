@@ -1,0 +1,25 @@
+# 分层测试的 CI 入口。**只跑 T0**：T0 不需要模型权重、不需要引擎 .so、不需要任何 pip 依赖
+# （本机实测 0.2 秒），所以能在 GitHub runner 上跑；T1/T2 要本地模型，见 tests/run.py 的分层说明。
+# ★ 与 workflow_validate.yml 一样，这个文件放在 release/ 是因为推送 .github/workflows/ 需要
+#   token 带 workflow scope；维护者手工把它放到 .github/workflows/tests.yml。
+name: tests-t0
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tier0:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: T0（免模型：思考分区+UTF-8 流式不变式 / 档案 schema / MEASURED 查表 / 后端排序）
+        run: python3 tests/run.py --tier 0
+      - name: 列出全部用例与手工项（失败时也能一眼看到覆盖面）
+        if: always()
+        run: python3 tests/run.py --list
