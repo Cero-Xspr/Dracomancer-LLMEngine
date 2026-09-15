@@ -485,7 +485,11 @@
 - **实测（granite serve，A/B 两会话交替）**：A1 cached=0 → B1 cached=30 → B2 cached=47 →
   **A2 切回 cached=40**，答案全对（Euro）——交替会话不再互相打掉缓存。
 - smol_engine 补了 STATES 清单（kc/vc；tl 由适配器 reset 兜底）。
-- 待做：并发压测脚本化进套件（现在是手工 e2e）；zaya/ling 的 STATES 化。
+- ✅ 并发压测已脚本化：`tests/concurrency_e2e.py`（并发 N 会话：全部完成/答案无串线/
+  缓存命中；granite 3 会话实测 22.4s 全过）。仍为手工 e2e（要起服务），不进自动套件。
+- ✅ AVX-512 守卫（E 组第一小步）：无 AVX-512 的机器在装载前得到干净报错与 llama.cpp
+  替代建议，而不是 SIGILL 假段错误（`_require_avx512`，读 /proc/cpuinfo）。
+- 待做：zaya/ling 的 STATES 化（回退单会话复用中）。
 
 ## 阶段 2 ✅ 第一批（2026-09-16）：上下文增量复用 + 整代串行锁
 

@@ -494,9 +494,24 @@ def _load_qwen35():
                 render=render)
 
 
+def _require_avx512():
+    """发布前硬需求的第一步：m5/m6 内核是 -march=native + AVX-512 手写，没有 AVX-512
+    的机器 dlopen 后首条 SIMD 指令就是 SIGILL（段错误样子的崩溃）。这里在装载前给出
+    干净的报错与解释（真正的 AVX2 回退内核是 E 组待办）。"""
+    try:
+        flags = open("/proc/cpuinfo").read()
+    except OSError:
+        return
+    if "avx512f" not in flags:
+        raise SystemExit("本机 CPU 不支持 AVX-512，而当前引擎内核是 AVX-512 手写实现。\n"
+                         "  （AVX2 回退内核在计划中；在此之前此引擎无法在这台机器上运行。）\n"
+                         "  可改用 llama.cpp 后端：draco.py chat -m <模型> -b cpu 或 -b igpu")
+
+
 def load_engine():
     """按 --engine 分派到适配器。每个适配器返回统一的算子接口 dict。"""
     global AP, MAXT
+    _require_avx512()
     if ARGS.engine == "smol":
         AP = _load_smol()
     elif ARGS.engine == "zaya":
