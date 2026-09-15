@@ -96,6 +96,57 @@ if R + C != "thinking...\n\n":
 else:
     print(f"✓ 尾部空行\n    reasoning={R!r}\n    content={C!r}")
 
+# ⑩ 流式增量解码的 UTF-8 悬挂（用户实测：draco 的中文回答里出现 11 个 �，llama.cpp 不会）
+#    机制：一个汉字 3 字节，被切在两个 token 之间时第一轮 decode 出 `...�`（1 字符），
+#    补全后仍 1 字符 ⇒ 按"已确认字符数"算增量得到空串 ⇒ **该汉字被永久丢掉**。
+#    这里用**不变式**测：对一段 UTF-8 文本的**任意** token 切分，挂起式增量解码都必须还原原文。
+from draco_engine_server import _decodable_prefix   # noqa: E402
+
+TXT = "很高兴见到你，我是一个人工智能助手。"
+raw = TXT.encode("utf-8")
+
+
+class _FakeTok:
+    """按给定字节切分当 token；decode 复刻 HF/byte-level 分词器的 lossy 行为。"""
+    def __init__(self, cuts): self.cuts = cuts
+    def decode(self, ids):
+        return b"".join(self.cuts[i] for i in ids).decode("utf-8", "replace")
+
+
+def _stream_incremental(tok, n, hold_back):
+    sent, got = 0, ""
+    for k in range(1, n + 1):
+        full = tok.decode(list(range(k)))
+        safe = _decodable_prefix(full) if hold_back else full
+        if len(safe) > sent:
+            got += safe[sent:]
+            sent = len(safe)
+    return got
+
+
+# 遍历所有"把字节串切成 ≤3 段"的切法（含把汉字劈开的最坏情况）
+bad = 0
+cases = 0
+for a in range(1, len(raw)):
+    for b in range(a + 1, len(raw) + 1):
+        cuts = [raw[:a], raw[a:b], raw[b:]]
+        cuts = [c for c in cuts if c]
+        tok = _FakeTok(cuts)
+        cases += 1
+        if _stream_incremental(tok, len(cuts), True) != TXT:
+            bad += 1
+            if bad <= 3:
+                print(f"  ✗ 切分 {[len(c) for c in cuts]} 还原失败")
+if bad or cases == 0:
+    FAIL.append("UTF-8 悬挂不变式"); print(f"✗ UTF-8 悬挂：{bad}/{cases} 种切分还原失败")
+else:
+    print(f"✓ UTF-8 悬挂不变式（{cases} 种任意字节切分都还原原文，含把汉字劈成两半）")
+
+# ①① 反面对照：不挂起时**必然**丢字（证明这个测试真的在测东西，而不是恒真）
+lost = sum(1 for a in range(1, len(raw)) if "�" in _stream_incremental(
+    _FakeTok([c for c in [raw[:a], raw[a:]] if c]), 2, False))
+print(f"✓ 反面对照：不挂起的写法在 {lost}/{len(raw)-1} 种切分下丢字（说明不变式非恒真）")
+
 print()
 if FAIL:
     print(f"❌ {len(FAIL)} 项失败: {FAIL}")

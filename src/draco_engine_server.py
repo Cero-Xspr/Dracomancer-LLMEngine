@@ -452,6 +452,23 @@ def generate(messages, max_tokens, temp, seed, repeat_penalty, enable_thinking=N
     return _gen(ids, n_gen, temp, seed, repeat_penalty, think_now, hold)
 
 
+def _decodable_prefix(text):
+    """去掉尾部**可能不完整**的 UTF-8 字符（分词器解码时它已经被写成 U+FFFD 了）。
+
+    ★ 为什么流式增量解码必须挂起它：一个汉字是 3 字节，如果被切在两个 token 之间，
+      第一轮 `decode(ids)` 出来是 `...�`（1 个字符），第二轮补齐后是 `...很`（**还是 1 个字符**）
+      ⇒ 按"已确认字符数"算增量会得到空串，**那个汉字被永久丢掉，只剩一个 �**。
+      实测（granite 分词器）：`很高兴见到你` 切 8 个 token，现在写法产出 `�高�见到你`，
+      挂起尾部后产出 `很高兴见到你` ✓。
+    粒度是"尾部连续的一段 �"：只可能是"结尾处尚未补全的字节序列"（合法的 � 字符只会出现在
+    正文中间），挂起最多延迟一轮；生成结束时 `feed(..., final=True)` 用完整文本冲刷，不丢东西。
+    """
+    n = 0
+    while n < len(text) and text[-1 - n] == "\ufffd":
+        n += 1
+    return text[:len(text) - n] if n else text
+
+
 def _gen(ids, n_gen, temp, seed, repeat_penalty, think_now, hold=None):
     """生成器：yield (kind, 文本增量, 计时dict)。"""
     rng = random.Random(seed if seed and seed > 0 else None)
@@ -487,10 +504,11 @@ def _gen(ids, n_gen, temp, seed, repeat_penalty, think_now, hold=None):
         full = AP["decode"](out)
         if _prof:
             _q2 = time.perf_counter(); _p["decode"] += _q2 - _q; _q = _q2
-        if len(full) > sp.sent:
+        full_safe = _decodable_prefix(full)      # ★ 见 _decodable_prefix：不挂起就会丢汉字
+        if len(full_safe) > sp.sent:
             if t_first is None:
                 t_first = time.time()
-            for kind, piece in sp.feed(full):
+            for kind, piece in sp.feed(full_safe):
                 if piece:
                     yield kind, piece, {}
         if _prof:
