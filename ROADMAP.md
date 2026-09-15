@@ -489,7 +489,11 @@
   缓存命中；granite 3 会话实测 22.4s 全过）。仍为手工 e2e（要起服务），不进自动套件。
 - ✅ AVX-512 守卫（E 组第一小步）：无 AVX-512 的机器在装载前得到干净报错与 llama.cpp
   替代建议，而不是 SIGILL 假段错误（`_require_avx512`，读 /proc/cpuinfo）。
-- 待做：zaya/ling 的 STATES 化（回退单会话复用中）。
+- 待做：zaya/ling 的 STATES 化（回退单会话复用中）——**不是机械补丁**（2026-09-16 侦察）：
+  两者的状态是 C 侧指针（ling 的 MLA kcache/vcache/conv_state/S 经 ct.memset 复位、
+  zaya 的状态深埋 zaya_gguf 的结构体），不在裸 numpy 清单里。做法二选一：
+  (a) 在两引擎里补"状态数组清单"（找到每个 numpy 本体），或 (b) 快照走 ctypes
+  （memread/memwrite 按结构体尺寸）。(b) 更通用但要按结构体逐个核尺寸——盲改会静默破坏快照。
 
 ## 阶段 2 ✅ 第一批（2026-09-16）：上下文增量复用 + 整代串行锁
 
