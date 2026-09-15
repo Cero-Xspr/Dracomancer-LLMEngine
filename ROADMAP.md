@@ -289,8 +289,18 @@
      状态 → 读出 → **y += x·ssm_d（按头，D 跳连乘的是 scan 输入段 x）** → ssm_norm → ssm_out。
      实测：输出 (1536,) 全有限、dA∈[0.699,1.000]（<1 衰减正确）。
      语义事实已写进 `archspec_spike.py`（S4D 节）。
-     **剩余（真正的对账）**：把这条链的输出与 llama.cpp 的 `mamba-base` dump 对数
-     （需要 gdump 夹具支持 granite —— 张量名清单要加 ssm_* 系）。
+     **对账进展（2026-09-15，未完成但重大推进）**：
+     ① 给 `zaya_gdump.cpp` 加了 `mamba2_y_add_d` / `mamba_out` 两个名字（granite 图里仅有的 cb 名），
+        编译并成功 dump granite 40 层；
+     ② **链尾验证通过**：`swiglu(z, dump_y_add_d) → rms_norm → ssm_out` vs `mamba_out-0`
+        **cos=0.99968** ⇒ 链尾语义（swiglu 位置、norm、投影）确认；
+     ③ **链头仍有分歧**（in_proj/conv/scan 段，cos≈0.06）—— 已排除：A 符号、dt bias、切分顺序
+        （x|B|C 已按源码 238-244 行修正：**x 段在前**）、D 跳连对象（scan 输入按头）、两种布局。
+        未排除：**输入锚点语义**（`attn_norm-0` 是否真是层 0 SSM 分支的输入）与 conv 的 tap 顺序细节。
+        ⇒ **要继续必须给夹具补链头锚点**（`ssm_in`/`ssm_conv` 的 cb 名 —— mamba-base.cpp 目前
+        只 cb 了这两个名字，需要给 build_lora_mm/ssm_conv 处加 cb 或改用别的对账手段）。
+     ④ 已确认的新语义（写进 S4D 节）：**y = swiglu_split(z, y_add_d)**——z 段是门（silu(z)·y），
+        位置在 D 跳连之后、norm 之前；这是本轮从 dump 内部一致性里钉死的。
      过程小坑：xBC 切片一度写成 2·G·ST(=256)（正确是 DI+2·G·ST=3328）、
      D 跳连对象试错了两版（乘层输入 z 不成立，乘 scan 输入 x 按头才形状自洽且语义合理）。
      `ssm_a` 形状 (1, 48) 是 **[1, dt_rank]**（A 作用在 dt 秩上，每 state 列共享），
