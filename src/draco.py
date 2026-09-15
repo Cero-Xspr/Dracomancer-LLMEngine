@@ -258,6 +258,12 @@ MEASURED = {
     #   cpu  19.4~23.2（取决构建/负载）  igpu 24.3（build-vk + -ngl 99）
     ("ZAYA1 8B", "cpu"):  (21.0, -1),
     ("ZAYA1 8B", "igpu"): (24.3, -1),
+    # Granite 4.0 h-tiny（2026-09-15，同会话交替 3 轮中位；AC + 平台档 low-power）
+    #   ★ iGPU 21.9 远优于 CPU 9.4；dengine 是自研引擎（纯 CPU/AVX-512，无 GPU 路径）
+    #   能耗未测（-1）；dengine 那行的 tok/s 是修掉"每 token 复制 125MB 词嵌入"之后的值
+    ("Granite 4.0 h-tiny", "igpu"):    (21.9, -1),
+    ("Granite 4.0 h-tiny", "cpu"):     (9.4,  -1),
+    ("Granite 4.0 h-tiny", "dengine"): (12.2, -1),
 }
 MEASURED_NPU = ("Llama-3.2-1B（合成权重、仅延迟）", 56.6, 281)
 
@@ -490,11 +496,24 @@ def backend_metrics(m, backend):
     t = _tune_best(m, backend)
     if t:
         return t[1], t[0] * 1000.0, f"tune 实测（{t[2]}）"
-    v = MEASURED.get((m.name, backend))
+    v = MEASURED.get(_measured_key(m, backend))
     if v:
         tps, mj = v
         return tps, (None if mj is None or mj < 0 else float(mj)), "档案性能表"
     return None, None, ""
+
+
+def _measured_key(m, backend):
+    """MEASURED 表的查表键。★ 不能直接用 m.name：档案的 display_name 带架构后缀
+    （"Ling 3.0 Tiny（bailingmoe3）"），而表里的键是干净名（"Ling 3.0 Tiny"）——
+    实测两者**查不中**，于是 Ling 的实测吞吐/能耗一直没被用上（-P speed/eco 静默退化成先验）。
+    这里按 全名 → 去掉括号后缀 → GGUF 原名 依次试。"""
+    nm = m.name or ""
+    cands = [nm, nm.split("（")[0].split("(")[0].strip(), getattr(m, "gguf_name", "") or ""]
+    for c in cands:
+        if c and (c, backend) in MEASURED:
+            return (c, backend)
+    return (nm, backend)
 
 
 def rank_backends(m, prefer, cands=None):

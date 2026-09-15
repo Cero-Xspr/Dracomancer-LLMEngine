@@ -370,6 +370,14 @@
   llama.cpp + iGPU**。已在 `models.d/granite.json` 把 granite 的 llama_cpp 默认后端改成 `igpu`。
   dengine 要不要接 GPU 是另一个量级的工程（且早前的 iGPU 内核实验结论是"带宽受限、仅重载时胜出"，
   与这里 llama.cpp 走 fp16 拿到 2.3× 的机制不同）——记为待议，不要顺手开工。
+- **★ 后端政策（实测后的现状，别搞混）**：`draco chat/serve -m granite` 默认（balanced）仍然
+  **走 dengine**（"自研引擎优先"是有意设计）；要 iGPU 得显式 `-b igpu` 或 `-P speed`。
+  已把实测灌进 `MEASURED`（granite: igpu 21.9 / dengine 12.2 / cpu 9.4，能耗列 -1=未测），
+  于是 `-P speed` 实测确认会选 igpu（日志："选定 igpu —— 21.9 tok/s，档案性能表"）。
+- **★ 顺带修掉一个静默失效**：`MEASURED` 表原来用 `m.name` 直接查，而档案的 display_name 带架构
+  后缀（`Ling 3.0 Tiny（bailingmoe3）`）⇒ **查不中**，Ling 的实测吞吐/能耗一直没被用上
+  （被 tune 缓存掩盖了，所以没暴露）。改成 `_measured_key()` 依次试 全名 → 去括号后缀 → GGUF 原名。
+  教训与 C1 的单位错同类：**"表里有数据"不等于"数据被用上了"**，加条目后必须回读一次命中。
 - **修后的真实分段账**（AC / 平台档 low-power / load ~10；`m6_prof_t[8..23]` 是这段的专用槽）：
   wall 75.9ms = MoE 32.8（**43%**：gate+up 17.6 + down 11.2 + silu 0.9 + 加权 1.3 + 路由 1.4）
   + 分支 27.3（S4D 36 层：in_proj 14.0 / ssm_out 6.6 / scan 4.3 / conv 0.8 / norm 0.2，attn 4 层在内）
