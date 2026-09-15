@@ -469,6 +469,36 @@
   这次的烟测我只看"命令跑起来了、`/hold` 提示打出来了"，**没有断言答案内容**，所以放过了它。
   ⇒ 规矩：碰流式/请求路径后，**必须断言真实答案**（指纹/健康问句），不能只看"没报错"。
 
+## 阶段 1 续：qwen35（Qwen3.5-2B-f16）—— 侦察已完成，精确开工说明（2026-09-15）
+
+**模型**：general.name="Master"（无意义名 ⇒ 适配器按架构 qwen35 匹配），25 层 = 19 GDN + 6 全注意力
+（recurrent_layers [1,1,1,0]×6+[0]，即第 3/7/11/15/19/23 层是全注意力），H=2048 FF=6144，
+head_dim 256（全注意力层）、GQA 8/2，**rope 分段 [11,11,10,0]**，SSM：d_inner 2048 / dt_rank(=n_v_heads)
+16 / n_group(=n_k_heads) 16 / state 128 / conv 4，**全 f16**（kernF，code 7），vocab 248047，
+**无 bos 键**（falcon_tok 已修为容错），pre=qwen35（正则待查 llama-vocab.cpp）。
+
+**已就位的复用件**：
+  · `m6_gdn_attn`（GdnW）——注释就是按 2B 维度写的（6144/16/2048）；**GdnW 填法与陷阱在
+    `m4f_v5.py` 225-660 行**（beta_wt/alpha_wt 要预转置成 float；码打包在 _c1/_c2/_c3 字段——
+    ctypes 未知关键字会被静默忽略 ⇒ 码恒 0；conv 重排成 (NQKV,4)）
+  · 夹具锚点已加：linear_attn_qkv_mixed / z / Qcur_normed / Kcur_normed / gate_reshaped /
+    attn_residual / attn_post_norm / post_ffn / h_nextn（**已重编译**）
+  · **参考 dump 已生成**：`/tmp/qrec0`（pos0，tokens 760,6511,314,9338,369，251 个文件）；
+    分支参考 = attn_residual-{il} − l_out-{il-1}（层0 减 model.input_embed）
+  · 分词器 falcon_tok 已兼容无 bos 键的 GGUF
+
+**待做（新代码集中在全注意力层）**：
+  ① 19 个 GDN 层：m6_gdn_attn 直接用，逐层对账（attn_norm 输入 → attn_residual 差分参考）
+  ② 6 个全注意力层：**qk-norm + 分段 rope + head_dim 256** 是新语义——看 qwen35.cpp 的
+     build_layer_attn（Qcur_full→reshaped→normed→rope sections），大概率要新写
+     m6_qwen35_attn_op（可复用 llama_attn_core 的头并行骨架 + qk-norm 前置 + 分段 rope 表）
+  ③ dense FFN 复用 m6_dense_op；管线是「attn → 残差 → post_attention_norm? → FFN → 残差」
+     —— 注意 qwen35 有 **post_attention_norm**（granite/falcon 没有），顺序照图核对
+  ④ f16 权重的 emb/head 读法照 smol（kernF code 7）；head 是 248k×2048 f16 ≈ 1GB/token
+     —— 性能上 head 会是大头（ZAYA 同款问题）
+  ⑤ 对账 → 贪心金标准（夹具 ZGREEDY，注意 ids 不要带方括号）→ 登记（_DENGINE_ADAPTERS_ARCH
+     或档案 match.arch=qwen35 + name Master 无意义）→ T1 金标准
+
 ## 阶段 1 ✅ 家族 #6（2026-09-15）：Llama 3.2 1B（llama 架构）接入——复用率最高的一个
 
 - **零新代码**：引擎固化管线就是 llama 形状（smol 同管线）；只写了适配器（_load_llama）+

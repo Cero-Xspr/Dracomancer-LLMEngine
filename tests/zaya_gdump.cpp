@@ -48,6 +48,10 @@ static const char * const CB_NAMES[] = {
     // ★ falcon-h1 的图名（每层 attn∥ssm 并行）：分支级对账锚点
     "Qcur-post-rope", "Kcur-post-rope", "Vcur-post-rope", "attn_out", "ssm_in",
     "layer_out", "ffn_out",
+    // ★ qwen35 的图名（19 GDN + 6 全注意力；分支级锚点 + linear_attn 内部量）
+    "attn_residual", "attn_post_norm", "post_ffn", "linear_attn_qkv_mixed", "z",
+    "Qcur_full", "Qcur_reshaped", "Qcur_normed", "Kcur", "Vcur", "Kcur_normed",
+    "gate_reshaped", "h_nextn",
 };
 static const char * const BARE_NAMES[] = {
     "model.input_embed", "zaya_inp_scaled", "result_norm", "result_output",

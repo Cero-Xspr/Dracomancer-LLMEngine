@@ -40,7 +40,8 @@ def build(model=MODEL, add_bos=True):
     tk.decoder = decoders.ByteLevel()
     specials = [t for i, t in enumerate(toks) if int(ttypes[i]) != 1]
     tk.add_special_tokens(specials)
-    bos = int(R.fields["tokenizer.ggml.bos_token_id"].value)     # 17
+    bf = R.fields.get("tokenizer.ggml.bos_token_id")
+    bos = int(bf.value) if bf is not None else None    # ★ qwen35 等没有 bos 键 ⇒ None（不前置）
     eos = int(R.fields["tokenizer.ggml.eos_token_id"].value)     # 11
 
     class _Enc:
@@ -50,17 +51,19 @@ def build(model=MODEL, add_bos=True):
 
         def encode(self, text, add_special_tokens=False):
             e = tk.encode(text, add_special_tokens=False)
-            ids = ([bos] + e.ids) if self._ab else e.ids
+            ids = ([bos] + e.ids) if (self._ab and bos is not None) else e.ids
             return type("R", (), {"ids": ids})()
 
         def decode(self, ids, skip_special_tokens=False):
-            return tk.decode([i for i in ids if i != bos], skip_special_tokens=skip_special_tokens)
+            return tk.decode([i for i in ids if bos is None or i != bos],
+                             skip_special_tokens=skip_special_tokens)
 
         def id_to_token(self, i):
             return toks[i]
 
+    bs = f"{bos}({toks[bos]!r})" if bos is not None else "无"
     print(f"[tok] vocab={len(toks)} merges={len(merges)} special={len(specials)} "
-          f"bos={bos}({toks[bos]!r}) eos={eos}({toks[eos]!r})", flush=True)
+          f"bos={bs} eos={eos}({toks[eos]!r})", flush=True)
     return _Enc(add_bos), R
 
 
