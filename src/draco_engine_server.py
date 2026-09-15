@@ -24,6 +24,7 @@ import json
 import os
 import random
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -511,12 +512,32 @@ def load_engine():
     print(f"[SRV] 引擎就绪：{ARGS.model}  ctx<={MAXT}", flush=True)
 
 
+# ── 阶段 2：会话前缀缓存 + 引擎串行锁 ──────────────────────────────────────
+# 引擎只有一份跨 token 状态（KV/卷积态/GDN 态）。不变式：**状态精确对应 _CTX_CACHE["ids"]
+# 这个已转发序列**。新请求与缓存有公共前缀 L（且新序列更长）⇒ 状态对前 L 个 token 依然精确
+# ⇒ 只 prefill 增量 ids[L:]，不 reset。任何不匹配 ⇒ 全量 reset（永远正确，只是慢）。
+_CTX_CACHE = {"ids": None, "valid": False}
+# ★ 锁必须罩住**整代**（prefill+采样循环的所有 forward）：ThreadingHTTPServer 下两个并发
+#   流若交错 forward 会互写状态。代价：客户端中途卡住会占住引擎（与 llama-server 的排队同性质）。
+_ENG_LOCK = threading.Lock()
+
+
+def _common_prefix_len(a, b):
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
 def reset_state():
-    """清零跨 token 状态（KV/卷积态/EDA）。每请求都调（全量重 prefill 语义）。
+    """清零跨 token 状态（KV/卷积态/GDN 态），并失效前缀缓存。
 
     ★ 各引擎的状态本体都是 Python 侧持有的 numpy 数组，C 结构体里只存指针 ⇒
     不改 C 引擎就有 reset；具体清什么由适配器的 reset() 决定。
     """
+    _CTX_CACHE["valid"] = False
+    _CTX_CACHE["ids"] = None
     AP["reset"]()
 
 
@@ -601,14 +622,33 @@ def _decodable_prefix(text):
 
 
 def _gen(ids, n_gen, temp, seed, repeat_penalty, think_now, hold=None):
-    """生成器：yield (kind, 文本增量, 计时dict)。"""
+    """持锁整代串行：锁横跨内部生成器的整个生命周期（yield 挂起时不释放——并发第二个
+    请求只会排队；客户端断连时 GeneratorExit 走 with 退出，锁照样释放）。"""
+    with _ENG_LOCK:
+        yield from _gen_locked(ids, n_gen, temp, seed, repeat_penalty, think_now, hold)
+
+
+def _gen_locked(ids, n_gen, temp, seed, repeat_penalty, think_now, hold=None):
+    """生成器：yield (kind, 文本增量, 计时dict)。调用方必须已持 _ENG_LOCK。"""
     rng = random.Random(seed if seed and seed > 0 else None)
 
-    reset_state()
+    # ★ 上下文增量复用：与缓存的公共前缀 L 直接复用状态，只转 L 之后的增量
+    #   （调用方持 _ENG_LOCK 整代串行，见端点处的 with）。
+    #   特例 L == len(ids)（与缓存完全同头的短/等长 prompt）：状态已越过该前缀
+    #   （多生了缓存里的后续 token），没有 rewind ⇒ 老实全量重跑。
+    reuse = 0
+    if _CTX_CACHE["valid"] and _CTX_CACHE["ids"]:
+        reuse = _common_prefix_len(ids, _CTX_CACHE["ids"])
+        if reuse >= len(ids):
+            reuse = 0
+    if reuse == 0:
+        reset_state()
     t0 = time.time()
-    for pos, tid in enumerate(ids):
-        AP["forward"](int(tid), pos)
+    for pos in range(reuse, len(ids)):
+        AP["forward"](int(ids[pos]), pos)
     prefill_s = time.time() - t0
+    _CTX_CACHE["ids"] = list(ids)
+    _CTX_CACHE["valid"] = True
 
     # ★ 真·逐 token 流式：每步解码"已生成前缀"再产出**新增的那段**。
     #   我之前是"整段生成完再切块 yield" —— 用户一眼看出没流式（而 llama-server 是流式的）。
@@ -645,6 +685,7 @@ def _gen(ids, n_gen, temp, seed, repeat_penalty, think_now, hold=None):
         if _prof:
             _q2 = time.perf_counter(); _p["split"] += _q2 - _q; _q = _q2
         AP["forward"](nid, len(ids) + i)
+        _CTX_CACHE["ids"].append(int(nid))   # ★ 状态已包含该 token ⇒ 缓存同步延长
         if _prof:
             _p["fwd"] += time.perf_counter() - _q
     full = AP["decode"](out)
@@ -660,7 +701,8 @@ def _gen(ids, n_gen, temp, seed, repeat_penalty, think_now, hold=None):
               + "  ".join(f"{k}={v / n * 1000:.3f}" for k, v in _p.items())
               + f"  |  合计 {dec_s / n * 1000:.3f}", file=sys.stderr, flush=True)
     timings = {
-        "prompt_n": len(ids), "prompt_per_second": round(len(ids) / prefill_s, 1) if prefill_s else 0,
+        "prompt_n": len(ids) - reuse, "prompt_cached": reuse,   # ★ 实际只转了增量
+        "prompt_per_second": round((len(ids) - reuse) / prefill_s, 1) if prefill_s else 0,
         "predicted_n": len(out), "predicted_per_second": round(len(out) / dec_s, 1) if dec_s else 0,
         "ttft_ms": ttft_ms,
     }

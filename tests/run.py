@@ -379,6 +379,45 @@ print(f'QWEN35_OK {n} {worst[0]:.6f} {worst[1]}')
     return True, f"pos0..3 × 24 层全部 ≥0.9999；最差 cos={w:.6f}（{loc}）"
 
 
+def t1_incremental_state():
+    """阶段 2 的核心不变式：**增量续转 ≡ 全量重跑（逐位）**。
+
+    上下文复用的依据是「引擎状态精确对应已转发 token 序列」——如果跨位置状态里
+    有任何顺序依赖没维护好（conv 移位/KV 写行/位置编号），这条就会红。
+    用 granite（S4D 卷积态 + KV + MoE，状态种类最多）验证。
+    """
+    m = os.environ.get("GRANITE_MODEL",
+                       "/media/xiao_/OverSys1/gguf/granite/granite-h-tiny-Q4_K_M.gguf")
+    if not os.path.isfile(m):
+        return False, f"缺 granite 模型（{m}）"
+    rc, out = _run([PY, "-c", """
+import sys, os
+import numpy as np
+sys.path.insert(0, '/media/xiao_/OverSys1/npu-direct/hybrid')
+sys.path.insert(0, '/media/xiao_/OverSys1/npu-direct/llama.cpp-b10819/gguf-py')
+import granite_engine as G
+P = [791, 6864, 315, 9822, 374, 12366, 13, 12366]
+GEN = [374, 3967, 369, 1202]
+G.reset()
+for pos, t in enumerate(P + GEN):
+    G.forward(t, pos)
+LA = G.logits_of_x().copy()
+G.reset()
+for pos, t in enumerate(P[:5]):
+    G.forward(t, pos)
+for pos, t in enumerate(P[5:] + GEN, start=5):
+    G.forward(t, pos)
+LB = G.logits_of_x().copy()
+print(f"INC_EQ={np.array_equal(LA, LB)} DMAX={np.abs(LA-LB).max():.2e}")
+""", m], timeout=1800, env={"MODEL": m})
+    mm = re.search(r"INC_EQ=(True|False) DMAX=([0-9.e+-]+)", out)
+    if not mm:
+        return False, "脚本失败: " + out[-200:]
+    if mm.group(1) != "True":
+        return False, f"增量续转与全量重跑不一致（max|Δ|={mm.group(2)}）——前缀复用不安全！"
+    return True, "增量续转 ≡ 全量重跑（logits 逐位相同，max|Δ|=0）"
+
+
 def t2_granite_s4d_layers():
     """S4D 逐层对账：pos 0..3 × 全部 36 个 SSM 层的链头 cos 必须 ≥ 0.9990。
     阈值取自实测（本轮记录的最小值 0.999147），不另立标准。"""
@@ -443,6 +482,7 @@ def main():
              ("t1_smol_fingerprint", 1, t1_smol_fingerprint), ("t1_granite_tok", 1, t1_granite_tok),
              ("t1_granite_greedy", 1, t1_granite_greedy), ("t1_falcon_greedy", 1, t1_falcon_greedy),
              ("t1_llama_greedy", 1, t1_llama_greedy), ("t1_qwen35_greedy", 1, t1_qwen35_greedy),
+             ("t1_incremental_state", 1, t1_incremental_state),
              ("t2_granite_s4d_layers", 2, t2_granite_s4d_layers),
              ("t2_qwen35_layers", 2, t2_qwen35_layers),
              ("t2_falcon_layers", 2, t2_falcon_layers),
