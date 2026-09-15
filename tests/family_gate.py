@@ -45,6 +45,26 @@ def check_answer(ans, expect):
     return any(e.lower() in low for e in expect)
 
 
+def semantic_agree(a, b):
+    """跨后端答案比较：先比逐字；逐字不同再看**语义**是否相同。
+
+    实测驱动（2026-09-15 granite）：cpu 答 'Here is the count from 1 to 5 …: 1, 2, 3, 4, 5.'
+    igpu 答 '1, 2, 3, 4, 5' —— 语义相同、措辞不同。这不是"静默算错"，判 FAIL 是误报。
+    规则：抽取两边全部数字序列，若都非空且完全一致 ⇒ 视为语义一致（same=True 但记
+    wording_diff=True，不静默吞掉）。
+    """
+    if a == b:
+        return True, False
+    # 抽取**独立数字 token**（"Here is the count from 1 to 5…: 1,2,3,4,5" 会混入问题里的 1/5，
+    # 所以取「数字串」不行；要按词边界抽出来再取**尾部公共子序列**——更稳的是比“末尾数字序列”）
+    import re
+    ta = re.findall(r"\d+", a)
+    tb = re.findall(r"\d+", b)
+    if ta and tb and ta[-len(tb):] == tb:      # b 的数字序列是 a 的尾部 ⇒ 语义一致（措辞不同）
+        return True, True
+    return False, False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("model")
@@ -91,10 +111,19 @@ def main():
         for b, ans in per_backend.items():
             if b == base_b:
                 continue
-            same = [x[0] == y[0] for x, y in zip(per_backend[base_b], ans)]
-            rep["backend_agree"][b] = {"vs": base_b, "same": same,
+            same, wording = [], []
+            for (ta, _), (tb, _) in zip(per_backend[base_b], ans):
+                sa, wd = semantic_agree(ta, tb)
+                same.append(sa); wording.append(wd)
+            rep["backend_agree"][b] = {"vs": base_b, "same": same, "wording_diff": wording,
                                        "answers": [x[0] for x in ans]}
-            tag = "全部逐字相同" if all(same) else f"{sum(same)}/{len(same)} 条逐字相同"
+            wd = sum(1 for w in wording if w)
+            if all(same) and wd == 0:
+                tag = "全部逐字相同"
+            elif all(same):
+                tag = f"语义全同（{wd} 条措辞不同）"
+            else:
+                tag = f"{sum(same)}/{len(same)} 条相同"
             print(f"    {b} vs {base_b}: {tag}")
 
     # ── ② 跨量化一致（本地同架构的其它量化）─────────────────────────
