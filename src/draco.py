@@ -266,6 +266,8 @@ MEASURED = {
     ("Granite 4.0 h-tiny", "dengine"): (12.2, -1),
     # Llama 3.2 1B（2026-09-15，省电档；dengine 接 autotune 后 OMP=6，贪心口径）
     ("Llama 3.2 1B Instruct", "dengine"): (33.0, -1),
+    # Qwen3.5 2B f16（2026-09-16，省电档；248k f16 head 是大头，~1GB/token）
+    ("Master", "dengine"): (16.0, -1),
 }
 MEASURED_NPU = ("Llama-3.2-1B（合成权重、仅延迟）", 56.6, 281)
 
@@ -394,7 +396,7 @@ def discover():
 _DENGINE_ADAPTERS = (("zaya", "zaya"), ("smollm2", "smol"), ("ling", "ling"),
                      ("granite 4.0 h", "granite"), ("llama 3.2", "llama"))
 # ★ 有些模型 general.name 无意义（falcon-h1 的叫 "Original"），名字匹配不可用 ⇒ 按架构兜底。
-_DENGINE_ADAPTERS_ARCH = {"falcon-h1": "falcon"}
+_DENGINE_ADAPTERS_ARCH = {"falcon-h1": "falcon", "qwen35": "qwen35"}
 
 
 def dengine_adapter(model):

@@ -20,9 +20,13 @@ LDP = "/media/xiao_/OverSys1/npu-direct/llama.cpp-b10819/build-dbg/bin"
 # llama-vocab.cpp 的 LLAMA_VOCAB_PRE_TYPE_LLAMA3 正则（falcon-h1 与 llama3 共用）
 LLAMA3_PAT = (r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|"
               r"[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+")
+# LLAMA_VOCAB_PRE_TYPE_QWEN35：字母含 \p{M}、数字只有单个 \p{N}、标点类排除 \p{M}
+QWEN35_PAT = (r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|"
+              r"[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+")
+PRE_MAP = {"llama3": LLAMA3_PAT, "qwen35": QWEN35_PAT}
 
 
-def build(model=MODEL, add_bos=True):
+def build(model=MODEL, add_bos=True, pre="llama3"):
     """add_bos=True：encode 前置 BOS（falcon/llama 的裸文本口径，与 llama-tokenize 默认一致）。
     add_bos=False：原样 BPE——给「模板渲染文本已含 bos_token」的适配器用（llama 3.2 模板
     以 {{- bos_token }} 开头，前置会变成双 BOS）。"""
@@ -34,7 +38,7 @@ def build(model=MODEL, add_bos=True):
     vocab = {t: i for i, t in enumerate(toks)}
     tk = Tokenizer(models.BPE(vocab=vocab, merges=merges, fuse_unk=False))
     tk.pre_tokenizer = pre_tokenizers.Sequence([
-        pre_tokenizers.Split(Regex(LLAMA3_PAT), behavior="isolated"),
+        pre_tokenizers.Split(Regex(PRE_MAP[pre]), behavior="isolated"),
         pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
     ])
     tk.decoder = decoders.ByteLevel()

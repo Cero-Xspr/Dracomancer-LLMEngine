@@ -21,6 +21,7 @@
 `tests/golden/*.json` 由 `--freeze` 生成；生成前必须确认当前 .so 是被验证过的那一版。
 """
 import argparse
+import glob
 import importlib.util
 import json
 import os
@@ -305,6 +306,79 @@ def t1_llama_greedy():
 
 
 # ═══════════════════════════ T2：大模型对账（十分钟级） ═══════════════════════════
+def t1_qwen35_greedy():
+    """qwen35 端到端：金标准 = llama.cpp ZGREEDY 12 token。全 f16 ⇒ 无量化误差。"""
+    gold = _load_golden("qwen35_greedy")
+    if gold is None:
+        return False, "缺 tests/golden/qwen35_greedy.json"
+    m = os.environ.get("QWEN35_MODEL", "/media/xiao_/OverSys1/gguf/Qwen3.5-2B-f16.gguf")
+    if not os.path.isfile(m):
+        return False, f"缺 qwen35 模型（{m}）"
+    s = _find_script("qwen35_engine.py")
+    rc, out = _run([PY, s], timeout=1800,
+                   env={"TOKS": ",".join(map(str, gold["prompt"])),
+                        "NSTEPS": str(len(gold["tokens"])), "MODEL": m})
+    mm = re.search(r"\[GEN\] 贪心 token: \[([0-9, ]+)\]", out)
+    if not mm:
+        return False, "拿不到贪心输出: " + out[-200:]
+    got = [int(x) for x in mm.group(1).split(",")]
+    exp = gold["tokens"]
+    if got[:len(exp)] != exp:
+        bad = next(i for i, (a, b) in enumerate(zip(got, exp)) if a != b)
+        return False, f"第 {bad} 个 token 分叉：得到 {got[bad:bad+4]} 期望 {exp[bad:bad+4]}"
+    return True, f"{len(exp)}/{len(exp)} token 与 llama.cpp 贪心一致"
+
+
+def t2_qwen35_layers():
+    """qwen35 逐层对账：pos 0..3 × 24 层，阈值 0.9999（全 f16 ⇒ 实测 cos≈1.00000）。
+    参考 dump 缺失时用夹具现场生成。"""
+    for p in range(4):
+        d = f"/tmp/qrec{p}"
+        if not glob.glob(d + "/l_out-0.*.bin"):
+            fix = _find_script("zaya_gdump")
+            if fix is None:
+                return False, "缺夹具 zaya_gdump 且无缓存 dump（/tmp/qrec*）"
+            S = "/media/xiao_/OverSys1/npu-direct/llama.cpp-b10819/build-dbg/bin"
+            os.makedirs(d, exist_ok=True)
+            r = subprocess.run([fix, "/media/xiao_/OverSys1/gguf/Qwen3.5-2B-f16.gguf",
+                                "760,6511,314,9338,369", d],
+                               env={**os.environ, "LD_LIBRARY_PATH": S, "ZDUMP_POS": str(p)},
+                               capture_output=True, text=True, timeout=1200)
+            if r.returncode != 0:
+                return False, f"夹具失败 pos{p}: {r.stderr[-150:]}"
+    m = os.environ.get("QWEN35_MODEL", "/media/xiao_/OverSys1/gguf/Qwen3.5-2B-f16.gguf")
+    if not os.path.isfile(m):
+        return False, f"缺 qwen35 模型（{m}）"
+    rc, out = _run([PY, "-c", """
+import sys, glob, os
+import numpy as np
+sys.path.insert(0, '/media/xiao_/OverSys1/npu-direct/hybrid')
+sys.path.insert(0, '/media/xiao_/OverSys1/npu-direct/llama.cpp-b10819/gguf-py')
+os.environ['GPROBE'] = '1'
+import qwen35_engine as Q
+IDS = [760, 6511, 314, 9338, 369]
+for pos, t in enumerate(IDS):
+    Q.forward(t, pos)
+cos = lambda a, b: float(np.dot(a/np.linalg.norm(a), b/np.linalg.norm(b)))
+worst = (1.0, None); n = 0
+for pos in range(4):
+    mine = Q.PROBE['by_pos'][pos]
+    for il in range(Q.NL):
+        ref = np.frombuffer(open(sorted(glob.glob(f'/tmp/qrec{pos}/l_out-{il}.*.bin'))[0], 'rb').read(), np.float32)
+        c = cos(mine[il], ref)
+        if c < worst[0]: worst = (c, (pos, il))
+        n += 1
+print(f'QWEN35_OK {n} {worst[0]:.6f} {worst[1]}')
+""", m], timeout=1800, env={"MODEL": m})
+    mm = re.search(r"QWEN35_OK (\d+) ([0-9.]+) (\(.*?\))", out)
+    if rc != 0 or not mm:
+        return False, "对账脚本失败: " + out[-200:]
+    n, w, loc = int(mm.group(1)), float(mm.group(2)), mm.group(3)
+    if w < 0.9999:
+        return False, f"{n} 个 (pos,层) 最差 cos={w:.6f}（{loc}）< 0.9999"
+    return True, f"pos0..3 × 24 层全部 ≥0.9999；最差 cos={w:.6f}（{loc}）"
+
+
 def t2_granite_s4d_layers():
     """S4D 逐层对账：pos 0..3 × 全部 36 个 SSM 层的链头 cos 必须 ≥ 0.9990。
     阈值取自实测（本轮记录的最小值 0.999147），不另立标准。"""
@@ -368,8 +442,9 @@ def main():
              ("t0_measured_lookup", 0, t0_measured_lookup), ("t0_rank_prefer", 0, t0_rank_prefer),
              ("t1_smol_fingerprint", 1, t1_smol_fingerprint), ("t1_granite_tok", 1, t1_granite_tok),
              ("t1_granite_greedy", 1, t1_granite_greedy), ("t1_falcon_greedy", 1, t1_falcon_greedy),
-             ("t1_llama_greedy", 1, t1_llama_greedy),
+             ("t1_llama_greedy", 1, t1_llama_greedy), ("t1_qwen35_greedy", 1, t1_qwen35_greedy),
              ("t2_granite_s4d_layers", 2, t2_granite_s4d_layers),
+             ("t2_qwen35_layers", 2, t2_qwen35_layers),
              ("t2_falcon_layers", 2, t2_falcon_layers),
              ("t2_ling_fingerprint", 2, t2_ling_fingerprint)]
     if A.list:

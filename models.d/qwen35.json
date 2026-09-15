@@ -1,0 +1,27 @@
+{
+  "schema_version": 2,
+  "match": {
+    "arch": "qwen35",
+    "name_contains": "master"
+  },
+  "display_name": "Qwen3.5 2B（Master，f16）",
+  "engines": {
+    "llama_cpp": {
+      "status": "works",
+      "notes": "官方构建原生支持 qwen35（含 MRoPE 分段与 GDN）。f16 全精度 ~3.9GB。"
+    },
+    "dracomancer": {
+      "backend_hint": "dengine",
+      "status": "works",
+      "notes": "自研引擎（m6_gdn_attn × 18 + m6_full_attn × 6 + dense FFN）2026-09-16 接入。\n★★ 对账（全 f16 ⇒ 无量化误差，判据可以到顶）：pos 0..3 × 全部 24 层 **cos 全 1.00000**（阈值 0.9999）；端到端贪心 **12/12 token 与 llama.cpp 一致**（金标准 tests/golden/qwen35_greedy.json）。\n★ qwen35 专属语义（别照抄别家）：全注意力层是 **joint QG 投影**（每头 512=q256|gate256，attn ⊙sigmoid(gate) 才过 wo）+ q/k 各自 RMSNorm + **MRoPE 分段 [11,11,10,0]**——文本输入时分段退化为普通成对 rope（用 dump 的 Qcur-post-rope 判定）；GDN 层 conv 无 bias（qwen35 的 ssm_conv1d 只有 weight）；第 25 块是 MTP（nextn）不进主图；无 output.weight（head=词嵌入绑定 F16）；无 bos 键；pre=qwen35 正则（数字单字符切分，与 llama3 不同）。\n★★★ 大坑：**ssm_beta/ssm_alpha 的 GGUF ne=[2048,16] ne0 最快 ⇒ 预转置必须 reshape(16,2048).T**——直接 reshape(2048,16) 是错位布局，cos 0.99 级静默偏差（端到端都还能答对 Paris 级问题！），首层逐段对账才抓到。修复后层 0 attn_residual/l_out 范数逐位一致（1.746）。\n★ 性能（省电档）：dengine ~16 tok/s；大头是 248k×2048 的 f16 head（~1GB/token，ZAYA 同款问题）。\n★ 注意：本地这份是 **Base 底模**（general.base_model=Qwen3.5 2B Base）——聊天会输出思维链式的长回答（引擎忠实复现，贪心与 llama.cpp 逐 token 一致可证）；要对话体验请换 Instruct 权重（同架构同档案适配）。",
+      "selfcheck_ref": "reconcile:qwen35:layers-cos1.00000:greedy-12/12"
+    }
+  },
+  "notes": "Qwen3.5 2B（general.name=Master 无意义，按架构匹配）。25 块 = 24 主图层（19 GDN + 6 全注意力）+ 1 MTP。全 f16。",
+  "source": {
+    "author": "maintainer",
+    "date": "2026-09-16",
+    "issue": null,
+    "selfcheck_ref": null
+  }
+}

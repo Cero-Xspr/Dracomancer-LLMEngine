@@ -1,0 +1,4 @@
+{
+  "min_cos_threshold": 0.9999,
+  "source": "2026-09-16 实测 pos0..3×24 层最差 cos=1.00000（全 f16 无量化误差；beta/alpha 预转置布局修复后）"
+}

@@ -449,6 +449,45 @@ def _load_llama():
                 render=render)
 
 
+def _load_qwen35():
+    """Qwen3.5（qwen35：19 GDN + 6 全注意力/24 层，第 25 块 MTP 不进主图）→ qwen35_engine.py。
+
+    ★ qwen35 专属语义：
+      · 全注意力层是 **joint QG 投影**（每头 512 = q256|gate256）+ q/k 各自 RMSNorm +
+        **MRoPE 分段 [11,11,10,0]**——文本上分段退化为普通成对 rope（已用 dump 判定），
+        attn 输出再 ⊙sigmoid(gate) 才过 wo。
+      · GDN 层走 m6_gdn_attn；**ssm_beta/ssm_alpha 的 GGUF ne=[2048,16] ne0 最快 ⇒
+        预转置必须 reshape(16,2048).T**——直接 reshape(2048,16) 是错位布局
+        （cos 0.99 级静默偏差，首层逐段对账抓的）。
+      · 全 f16：kernF 路径（code 7）；无量化误差 ⇒ 逐层对账能到 cos≈1.00000。
+      · 无 output.weight ⇒ head=词嵌入绑定；无 bos 键（falcon_tok 容错）；pre=qwen35 正则。
+      · 第 25 块是 MTP（nextn），主图不执行。
+    """
+    global ENG, MAXT
+    import os
+    os.environ["MODEL"] = ARGS.model
+    os.environ.setdefault("MAXT", str(ARGS.ctx or 1024))
+    import qwen35_engine as E
+    import falcon_tok as FT
+    ENG = E
+    tk, _R = FT.build(ARGS.model, add_bos=False, pre="qwen35")
+    render = _template_renderer(ARGS.model)
+    if render is None:
+        raise SystemExit("qwen35 的 GGUF 里没有 chat_template")
+
+    def reset():
+        E.reset()
+
+    _eos = _gguf_ids(ARGS.model, "tokenizer.ggml.eos_token_id")[0]   # <|im_end|>
+    return dict(forward=E.forward, logits=E.logits_of_x, reset=reset,
+                encode=lambda t: tk.encode(t).ids,
+                decode=lambda ids: tk.decode(ids, skip_special_tokens=False),
+                eos=_eos, im_end=_eos, max_t=E.MAXT,
+                system_default=None, bos=None,
+                think_block=False, think_default=False,
+                render=render)
+
+
 def load_engine():
     """按 --engine 分派到适配器。每个适配器返回统一的算子接口 dict。"""
     global AP, MAXT
@@ -464,8 +503,10 @@ def load_engine():
         AP = _load_falcon()
     elif ARGS.engine == "llama":
         AP = _load_llama()
+    elif ARGS.engine == "qwen35":
+        AP = _load_qwen35()
     else:
-        raise SystemExit(f"未知引擎 {ARGS.engine}（当前支持：smol / zaya / ling / granite / falcon / llama）")
+        raise SystemExit(f"未知引擎 {ARGS.engine}（当前支持：smol / zaya / ling / granite / falcon / llama / qwen35）")
     MAXT = AP["max_t"]
     print(f"[SRV] 引擎就绪：{ARGS.model}  ctx<={MAXT}", flush=True)
 
