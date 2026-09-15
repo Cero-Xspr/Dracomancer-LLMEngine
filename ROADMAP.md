@@ -322,7 +322,21 @@
 - archspec spike 已验证 llama 密集 + MoE（cos 0.999962 / 0.9998），但 granite-hybrid、bailingmoe3(KDA) 还没进。
 - **做完标准**：把这两族的"形状看不出来的语义事实"补进 `SEMANTICS_*`，并让缺失字段**报错而不是默认**。
 
-### C4 💤 更多模型适配
+### C4 🔄 进行中（2026-09-15）：granite-hybrid 的 Darco 适配
+- **账已盘**（张量 40 层 = SSM 36 + GQA 注意力 4 [5/15/25/35] + MoE 64 选 6 + 共享专家全 40 层）：
+  · **可复用**：attn（m6_llama_attn_op，rope 128@10000）、MoE（m6_bailing_moe：granite 是
+    softmax 路由 + top6 + norm_w、无分组无偏置 ⇒ n_group=1/probs_b=null 即可）、共享专家
+  · **新写**：S4D 段（36 层核心）—— 原型已固化在 `granite_engine.py`（numpy），
+    语义全部来自 llama.cpp 逐行核对；对账通过后再下沉 C
+- **对账卡点（如实）**：与 llama.cpp 的 `mamba2_y_add_d-0` 对不上（cos≈0.06）。已穷举：
+  conv tap 方向 ×切分顺序（x|B|C 已按源码修正）× A 符号 × dt bias × 布局 —— 全部不是。
+  链尾已验证（cos 0.99968）⇒ 分歧在链头且**现有夹具锚点不够**（mamba-base 只 cb 两个名字）。
+  ⇒ 要么给 llama.cpp 夹具加 `ssm_in`/`ssm_conv` 的 cb 名（重编译），要么换对账策略
+  （如:从 `mamba_out-0` 反推 y_add_d 需要的 gate 值来定 z 段是否正确——仍需一个链头锚）。
+  **纪律：不把没对过账的架构登记进 `_DENGINE_ADAPTERS`** ⇒ granite 挂起至夹具补齐。
+- granite_engine.py 已就位（CFG 打印、S4D 原型、复用清单），随时可续。
+
+### C4（旧描述，保留）更多模型适配
 - granitehybrid、qwen35/qwen35moe…；每个都要过数值对账才登记进 `_DENGINE_ADAPTERS`。
 - **做完标准**：登记即"已对账"，档案里带证据。
 
