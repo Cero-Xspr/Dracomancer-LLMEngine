@@ -265,9 +265,11 @@ MEASURED = {
     ("Granite 4.0 h-tiny", "cpu"):     (9.4,  -1),
     ("Granite 4.0 h-tiny", "dengine"): (12.2, -1),
     # Llama 3.2 1B（2026-09-15，省电档；dengine 接 autotune 后 OMP=6，贪心口径）
-    ("Llama 3.2 1B Instruct", "dengine"): (33.0, -1),
-    # Qwen3.5 2B f16（2026-09-16，省电档；248k f16 head 是大头，~1GB/token）
-    ("Master", "dengine"): (16.0, -1),
+    # ★ 2026-09-16 修正：早前一批速度是虚高（AC 充电中 boost 频率，platform_profile 字段
+    #   不足以代表真实姿态；用户实测 qwen35 只有 5）。以下为真省电档（AC 满电、governor
+    #   powersave、EPP=power、~2GHz）重测值：
+    ("Llama 3.2 1B Instruct", "dengine"): (14.0, -1),
+    ("Master", "dengine"): (4.6, -1),
 }
 MEASURED_NPU = ("Llama-3.2-1B（合成权重、仅延迟）", 56.6, 281)
 
