@@ -383,7 +383,8 @@ def discover():
 # ★ 自研引擎（Darco）的适配器映射：按 GGUF 名匹配 —— 只有这份表里的模型能走 dengine。
 #   新增模型/架构必须先在 draco_engine_server.py 里写适配器并**过数值对账**，再登记到这里
 #   （见 models.d/*.json 的 engines.dracomancer 段）。
-_DENGINE_ADAPTERS = (("zaya", "zaya"), ("smollm2", "smol"), ("ling", "ling"))
+_DENGINE_ADAPTERS = (("zaya", "zaya"), ("smollm2", "smol"), ("ling", "ling"),
+                     ("granite 4.0 h", "granite"))
 
 
 def dengine_adapter(model):

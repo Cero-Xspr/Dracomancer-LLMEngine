@@ -294,13 +294,24 @@
         编译并成功 dump granite 40 层；
      ② **链尾验证通过**：`swiglu(z, dump_y_add_d) → rms_norm → ssm_out` vs `mamba_out-0`
         **cos=0.99968** ⇒ 链尾语义（swiglu 位置、norm、投影）确认；
-     ③ **链头仍有分歧**（in_proj/conv/scan 段，cos≈0.06）—— 已排除：A 符号、dt bias、切分顺序
-        （x|B|C 已按源码 238-244 行修正：**x 段在前**）、D 跳连对象（scan 输入按头）、两种布局。
-        未排除：**输入锚点语义**（`attn_norm-0` 是否真是层 0 SSM 分支的输入）与 conv 的 tap 顺序细节。
-        ⇒ **要继续必须给夹具补链头锚点**（`ssm_in`/`ssm_conv` 的 cb 名 —— mamba-base.cpp 目前
-        只 cb 了这两个名字，需要给 build_lora_mm/ssm_conv 处加 cb 或改用别的对账手段）。
-     ④ 已确认的新语义（写进 S4D 节）：**y = swiglu_split(z, y_add_d)**——z 段是门（silu(z)·y），
-        位置在 D 跳连之后、norm 之前；这是本轮从 dump 内部一致性里钉死的。
+     ③ **✅✅ 链头对账已完成（2026-09-15）—— 原「cos≈0.06 分歧」撤回**：
+        **分歧是我自己比较脚本里的索引错，不是引擎或模型的问题**。dump 的内存序是 ne0 最快 =
+        `[dim(64) 最快, head(48)]`，所以 `flat.reshape(48,64)` 才是 `[head, dim]`；
+        我当初写成 `flat.reshape(64,48).T`，等于把参考值自己转置了两次 ⇒ 余弦自然接近正交。
+        正确读法下的实测（`s4d_reconcile2.py`，逐位置递推，pos 0..3 × 全部 36 个 SSM 层）：
+        **链头 cos 中位 0.999990~0.999994、最小 0.999147**（残差是 Q4_K 把激活量化成 Q8_K 的
+        固有误差）；链尾 0.99951~0.99966。**⇒ S4D 全链（conv 历史帧顺序 / A·dt 衰减 /
+        状态更新次序 / y 展开顺序 / swiglu / grouped RMSNorm / ssm_out）与 llama.cpp 逐层一致。**
+        敏感度对照（`s4d_chainhead_probe.py`）证明链尾对 y 是敏感的（同范数随机 y 只给 0.0069、
+        全 1 给 −0.0827）⇒ "链尾对上"确实有信息量。
+        过程中真抓到一个 bug：`granite_engine.py` 的 `y = y_hk.T.reshape(-1)` 是错的，
+        必须 `y_hk.reshape(-1)`（h 主序）；对照实测 h 主序链尾 0.9998 vs 转置 −0.0436。
+        **⇒ 不需要改 llama.cpp 的图代码、不需要重编译库** —— 此前"必须给夹具补链头锚点"的结论
+        建立在那次假分歧上，一并撤回（夹具只重编译过一次：加 mamba 的两个 cb 名）。
+     ④ 已确认的新语义：**y = swiglu_split(z, y_add_d)**——z 段是门（silu(z)·y），
+        位置在 D 跳连之后、norm 之前。另**修正切分顺序**：in_proj 输出切成
+        `[z(3072) | xBC(3328) | dt(48)]`，xBC 内部再切成 **`[x(3072) | B(128) | C(128)]`**
+        （此前本文写成「B|C|x」，按 mamba-base.cpp 238-244 行的 view 偏移，**x 段在前**）。
      过程小坑：xBC 切片一度写成 2·G·ST(=256)（正确是 DI+2·G·ST=3328）、
      D 跳连对象试错了两版（乘层输入 z 不成立，乘 scan 输入 x 按头才形状自洽且语义合理）。
      `ssm_a` 形状 (1, 48) 是 **[1, dt_rank]**（A 作用在 dt 秩上，每 state 列共享），
@@ -324,17 +335,36 @@
 
 ### C4 🔄 进行中（2026-09-15）：granite-hybrid 的 Darco 适配
 - **账已盘**（张量 40 层 = SSM 36 + GQA 注意力 4 [5/15/25/35] + MoE 64 选 6 + 共享专家全 40 层）：
-  · **可复用**：attn（m6_llama_attn_op，rope 128@10000）、MoE（m6_bailing_moe：granite 是
-    softmax 路由 + top6 + norm_w、无分组无偏置 ⇒ n_group=1/probs_b=null 即可）、共享专家
-  · **新写**：S4D 段（36 层核心）—— 原型已固化在 `granite_engine.py`（numpy），
-    语义全部来自 llama.cpp 逐行核对；对账通过后再下沉 C
-- **对账卡点（如实）**：与 llama.cpp 的 `mamba2_y_add_d-0` 对不上（cos≈0.06）。已穷举：
-  conv tap 方向 ×切分顺序（x|B|C 已按源码修正）× A 符号 × dt bias × 布局 —— 全部不是。
-  链尾已验证（cos 0.99968）⇒ 分歧在链头且**现有夹具锚点不够**（mamba-base 只 cb 两个名字）。
-  ⇒ 要么给 llama.cpp 夹具加 `ssm_in`/`ssm_conv` 的 cb 名（重编译），要么换对账策略
-  （如:从 `mamba_out-0` 反推 y_add_d 需要的 gate 值来定 z 段是否正确——仍需一个链头锚）。
-  **纪律：不把没对过账的架构登记进 `_DENGINE_ADAPTERS`** ⇒ granite 挂起至夹具补齐。
-- granite_engine.py 已就位（CFG 打印、S4D 原型、复用清单），随时可续。
+  · **可复用**：attn（m6_llama_attn_op）、MoE（m6_bailing_moe：granite 是 softmax 路由 + top6 +
+    norm_w、无分组无偏置、**无 `expert_weights_scale`（⇒ 不缩放）** ⇒ n_group=1/probs_b=null 同构）
+  · **新写**：S4D 段（36 层核心）—— 原型已固化在 `granite_engine.py`，语义来自 llama.cpp 逐行核对，
+    **并已逐层对账通过**（见 C3 ③a），可以下沉 C
+- **新查清的三条 granite 专属语义**（都会影响数值，写在这里免得重踩）：
+  · **注意力层不套 RoPE（NoPE）**：GGUF `rope.scaling.finetuned=0` ⇒ llama.cpp 的 granite-hybrid
+    把 `rope_pattern` 全填 false ⇒ `has_rope(il)==false` ⇒ 图里 `inp_pos=nullptr`、
+    `build_attention_layer` 整段 `if (hparams.has_rope(il))` 被跳过。**不做 rope 才对**。
+  · **无任何 bias**：attn/ffn 一个 bias 张量都没有（`create_tensor_qkv` 传 flags=0）。
+  · 残差：分支输出 **先 ×res_scale(0.22) 再加**（attn/SSM 分支和 MoE 分支各一次），
+    层输入 `attn_norm` 是 **RMSNorm 的输出**（夹具里 dump 的 `attn_norm-{il}` 就是 SSM/attn 的输入）。
+- **对账卡点已解除**：原以为要改 llama.cpp 图代码 —— 实为我的索引假分歧（见 C3 ③a）。
+- **✅✅ 已完成并登记（2026-09-15）**：`m6_granite_s4d_op` / `m6_granite_attn_op` / `m6_granite_moe`
+  + `m6_granite_forward_token`（40 层图，含两处残差缩放与共享专家）已落地；
+  `granite_engine.py` 当驱动、`granite_tok.py` 当分词器；`_DENGINE_ADAPTERS` 已登记
+  （key 用 GGUF 原名 `'granite 4.0 h'`，不是 `'granite-h'` —— 匹配的是 `gguf_name` 而非文件名）；
+  `models.d/granite.json` 已写。
+  **两层证据**：① 算子级 S4D 逐层对账 cos 0.99999（pos 0..3 × 36 层）；
+  ② 端到端真实句子贪心 **16/16 token 与 llama.cpp 完全一致**；
+  ③ 经 `draco_engine_server.py --engine granite` 实测答出 "The capital of France is Paris."。
+- **遗留（性能组）**：dengine 4.6~6.8 tok/s vs 同机 llama.cpp 9.7 tok/s（约 1.5×，机器有负载、
+  数字噪声大）。分块实测：s4d 0.93ms×36 + attn 0.37×4 + moe 1.18×40 + lm_head 9.9 ≈ 92ms/token，
+  而端到端 216ms ⇒ **约 120ms 在"层间/小算子"（共享专家 3 次 gemv_any × 40 层）**。
+  试过把共享专家融成一个并行区 + 行区间入口：**A/B 无差异（6.55/6.29 vs 6.81/6.25）⇒ 按纪律撤回**，
+  说明瓶颈不在这三次调用本身（那条 `gemv_any` 整调用对小形状慢 15× 的微基准结论**没能在端到端复现**，
+  微基准本身不可靠 —— 又一次"参照物必须是被生产验证过的路径"）。
+- **顺带抓到的引擎级坑（已修，对所有架构成立）**：驱动**不设 OMP_NUM_THREADS** 时默认 20 逻辑核，
+  granite 从 7.8 → **1.06 tok/s（7.4× 退化）**；Ling/smol 一直靠 autotune 设这个。
+  `granite_engine.py` 现在先跑 `autotune.plan` 再 dlopen m6（**必须在首次 dlopen 之前**，
+  libgomp 初始化时就把该变量读走了）。新适配器一律先过 autotune。
 
 ### C4（旧描述，保留）更多模型适配
 - granitehybrid、qwen35/qwen35moe…；每个都要过数值对账才登记进 `_DENGINE_ADAPTERS`。

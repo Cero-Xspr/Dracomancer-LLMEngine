@@ -322,6 +322,47 @@ def _load_ling():
                 render=render)
 
 
+def _load_granite():
+    """granite-h-tiny（granitehybrid：S4D/Mamba-1 × 36 + GQA 注意力 × 4 + MoE 64选6 + 共享专家）
+    → granite_engine.py（C 侧 m6_granite_s4d_op / m6_granite_attn_op / m6_granite_moe）。
+
+    ★ 三条与其它架构都不同的语义（都从 llama.cpp 逐行核对 + 实测对账，别照抄别的适配器）：
+      · **注意力层是 NoPE**：GGUF `rope.scaling.finetuned=0` ⇒ llama.cpp 的 granite-hybrid 把
+        rope_pattern 全填 false ⇒ 图里根本不加 rope。加 rope 反而错。
+      · **kq_scale = 1/head_dim**（=attention.scale=0.0078125），不是 llama 系的 1/sqrt(head_dim)。
+      · MoE 是 **softmax 路由**（Bailing 那套是 sigmoid）+ **没有 expert_weights_scale**。
+    ★ 分词器不是 transformers 目录：直接用 GGUF 的 vocab/merges 搭（granite_tok.py），
+      已与 llama-tokenize 逐 id 对账（9/9 串一致，含 <|start_of_role|> 这类特殊 token）。
+    ★ 状态复位：S4D 的 conv 态 hist / ssm 态 hst、注意力 KV 缓存与 tlen，全是 Python 侧数组。
+    """
+    global ENG, MAXT
+    import os
+    os.environ["MODEL"] = ARGS.model
+    os.environ.setdefault("MAXT", str(ARGS.ctx or 1024))
+    import granite_engine as E
+    import granite_tok as GT
+    ENG = E
+    tk, _R = GT.build(ARGS.model)
+
+    render = _template_renderer(ARGS.model)
+    if render is None:
+        raise SystemExit("granite 的 GGUF 里没有 chat_template —— 无法渲染对话格式")
+
+    def reset():
+        E.reset()
+
+    _eos = _gguf_ids(ARGS.model, "tokenizer.ggml.eos_token_id")[0]
+    # granite-h-tiny **不是推理模型**：模板里没有 think/reasoning ⇒ 思考分区关闭
+    #   （think_block/think_default=False；`/think on` 对它没有意义）
+    return dict(forward=E.forward, logits=E.logits_of_x, reset=reset,
+                encode=lambda t: tk.encode(t, add_special_tokens=False).ids,
+                decode=lambda ids: tk.decode(ids, skip_special_tokens=False),
+                eos=_eos, im_end=_eos, max_t=E.MAXT,
+                system_default=None, bos=None,
+                think_block=False, think_default=False,
+                render=render)
+
+
 def load_engine():
     """按 --engine 分派到适配器。每个适配器返回统一的算子接口 dict。"""
     global AP, MAXT
@@ -331,8 +372,10 @@ def load_engine():
         AP = _load_zaya()
     elif ARGS.engine == "ling":
         AP = _load_ling()
+    elif ARGS.engine == "granite":
+        AP = _load_granite()
     else:
-        raise SystemExit(f"未知引擎 {ARGS.engine}（当前支持：smol / zaya / ling）")
+        raise SystemExit(f"未知引擎 {ARGS.engine}（当前支持：smol / zaya / ling / granite）")
     MAXT = AP["max_t"]
     print(f"[SRV] 引擎就绪：{ARGS.model}  ctx<={MAXT}", flush=True)
 
@@ -715,7 +758,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--port", type=int, required=True)
-    ap.add_argument("--engine", default="smol")
+    ap.add_argument("--engine", default="smol",
+                    help="smol / zaya / ling / granite（自研引擎各自的适配器）")
     ap.add_argument("--threads", type=int, default=4,
                     help="OMP 线程数（小模型 4 最快；默认全核反而慢 2.5×，实测）")
     ap.add_argument("--ctx", type=int, default=0,
