@@ -361,6 +361,15 @@
   `(n_tokens, bytes_per_row)`，直接 `[tid]` 取行即可（按字节偏移切是切「行」维度，会切出空数组）。
   同会话交替 A/B（都带负载记录）：**dengine 中位 12.16 vs llama.cpp 中位 10.3 tok/s**
   ⇒ 从"慢 1.5×"变成**至少打平（区间重叠）**。
+- **★ 修正（2026-09-15，用户指出后复测）："打平"只在 CPU 后端成立。** llama.cpp 的 **iGPU 后端**
+  （官方 vulkan 包或自建 build-vk，`-ngl 99`）稳定 **21.4~21.9 t/s**，是 CPU 后端的 2.3×，且几乎
+  不受 CPU 负载影响。所以三方对照是：**dengine(CPU) 中位 8.1 / llama.cpp CPU 中位 9.4 /
+  llama.cpp iGPU 中位 21.9**。⇒ 我上一轮把 llama.cpp 的基线测错了（没给 `-ngl`，拿的是纯 CPU 数）。
+  **dengine 目前是纯 CPU（AVX-512），没有 GPU 路径**（draco.py 的 `_SPEED_PRIOR` 注释里早就写着
+  "dengine 目前仍跑在 CPU 上（iGPU 未接线）"）⇒ **按绝对速度，这台机上跑 granite 最快的方式是
+  llama.cpp + iGPU**。已在 `models.d/granite.json` 把 granite 的 llama_cpp 默认后端改成 `igpu`。
+  dengine 要不要接 GPU 是另一个量级的工程（且早前的 iGPU 内核实验结论是"带宽受限、仅重载时胜出"，
+  与这里 llama.cpp 走 fp16 拿到 2.3× 的机制不同）——记为待议，不要顺手开工。
 - **修后的真实分段账**（AC / 平台档 low-power / load ~10；`m6_prof_t[8..23]` 是这段的专用槽）：
   wall 75.9ms = MoE 32.8（**43%**：gate+up 17.6 + down 11.2 + silu 0.9 + 加权 1.3 + 路由 1.4）
   + 分支 27.3（S4D 36 层：in_proj 14.0 / ssm_out 6.6 / scan 4.3 / conv 0.8 / norm 0.2，attn 4 层在内）
