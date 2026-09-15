@@ -45,6 +45,9 @@ static const char * const CB_NAMES[] = {
     "ffn_moe_weights_norm", "ffn_moe_weights_scaled", "ffn_moe_out", "ffn_norm", "ffn_inp",
     "ffn_moe_weights_softmax", "ffn_moe_weights_sum", "ffn_moe_topk", "ffn_moe_weighted",
     "ffn_moe_silu", "ffn_moe_down_scaled", "ffn_moe_gate_scaled", "ffn_shexp",
+    // ★ falcon-h1 的图名（每层 attn∥ssm 并行）：分支级对账锚点
+    "Qcur-post-rope", "Kcur-post-rope", "Vcur-post-rope", "attn_out", "ssm_in",
+    "layer_out", "ffn_out",
 };
 static const char * const BARE_NAMES[] = {
     "model.input_embed", "zaya_inp_scaled", "result_norm", "result_output",
@@ -134,7 +137,13 @@ int main(int argc, char ** argv) {
 
     std::vector<llama_token> toks;
     {
-        char * s = strdup(argv[2]);
+        // ★ 容错解析：曾把 "[17, 1243, ...]"（带方括号的 python 打印格式）直接传进来，
+        //   atoi("[17") 返回 0 ⇒ 首token悄悄变成 0 ⇒ 参考输出整体作废，对账全错还以为模型分歧。
+        //   先删掉所有非数字非逗号字符。
+        std::string clean;
+        for (const char * q = argv[2]; *q; ++q)
+            if ((*q >= '0' && *q <= '9') || *q == ',' || *q == '-') clean += *q;
+        char * s = strdup(clean.c_str());
         for (char * p = strtok(s, ","); p != nullptr; p = strtok(nullptr, ",")) {
             toks.push_back((llama_token) atoi(p));
         }

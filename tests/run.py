@@ -256,6 +256,29 @@ def t1_granite_greedy():
     return True, f"{len(exp)}/{len(exp)} token 与 llama.cpp 贪心一致"
 
 
+def t1_falcon_greedy():
+    """falcon 端到端：金标准 = llama.cpp ZGREEDY 的 12 个 token（"…Germany is" 续写）。
+    注：falcon 是补全式小模型，某些 prompt 会在 top-2 平手处分叉（见 golden 内 source 注），
+    金标准特意选了置信度高的续写。"""
+    gold = _load_golden("falcon_greedy")
+    if gold is None:
+        return False, "缺 tests/golden/falcon_greedy.json"
+    m = os.environ.get("FALCON_MODEL",
+                       "/media/xiao_/OverSys1/gguf/falcon-h1/Falcon-H1-0.5B-Instruct-Q4_K_M.gguf")
+    if not os.path.isfile(m):
+        return False, f"缺 falcon 模型（{m}）；T1/T2 需要本地模型"
+    s = _find_script("falcon_engine.py")
+    rc, out = _run([PY, s], timeout=1800,
+                   env={"TOKS": ",".join(map(str, gold["prompt"])),
+                        "NSTEPS": str(len(gold["tokens"])), "MODEL": m})
+    got = [int(x) for x in re.search(r"\[GEN\] 贪心 token: \[([0-9, ]+)\]", out).group(1).split(",")]
+    exp = gold["tokens"]
+    if got[:len(exp)] != exp:
+        bad = next((i for i, (a, b) in enumerate(zip(got, exp)) if a != b), None)
+        return False, f"第 {bad} 个 token 分叉：得到 {got[bad:bad+4]} 期望 {exp[bad:bad+4]}"
+    return True, f"{len(exp)}/{len(exp)} token 与 llama.cpp 贪心一致"
+
+
 # ═══════════════════════════ T2：大模型对账（十分钟级） ═══════════════════════════
 def t2_granite_s4d_layers():
     """S4D 逐层对账：pos 0..3 × 全部 36 个 SSM 层的链头 cos 必须 ≥ 0.9990。
@@ -275,6 +298,15 @@ def t2_granite_s4d_layers():
         return False, f"链头 cos 最小 {worst:.6f} < 阈值 {thr}（{len(rows)} 个位置）"
     return True, (f"{len(rows)} 个位置 × 36 层：链头 cos 最小 {worst:.6f} ≥ {thr}；"
                   f"中位 {max(float(r[1]) for r in rows):.6f}")
+
+
+def t2_falcon_layers():
+    """falcon 逐层对账：pos 0..3 × 36 层 vs 夹具 dump 的 l_out。阈值 0.996（实测最小 0.99682）。
+    低于 granite 的 0.999 是预期：llama.cpp 用 Q8_K 激活量化 + f16 KV，我们全 fp32。"""
+    g = _find_script("falcon_layer_gate.py")
+    rc, out = _run([PY, g], timeout=3600)
+    line = [x for x in out.splitlines() if x.startswith(("✅", "❌"))]
+    return rc == 0, (line[-1][2:].strip() if line else out[-200:])
 
 
 def t2_ling_fingerprint():
@@ -310,8 +342,9 @@ def main():
     cases = [("t0_think_split", 0, t0_think_split), ("t0_schema", 0, t0_schema),
              ("t0_measured_lookup", 0, t0_measured_lookup), ("t0_rank_prefer", 0, t0_rank_prefer),
              ("t1_smol_fingerprint", 1, t1_smol_fingerprint), ("t1_granite_tok", 1, t1_granite_tok),
-             ("t1_granite_greedy", 1, t1_granite_greedy),
+             ("t1_granite_greedy", 1, t1_granite_greedy), ("t1_falcon_greedy", 1, t1_falcon_greedy),
              ("t2_granite_s4d_layers", 2, t2_granite_s4d_layers),
+             ("t2_falcon_layers", 2, t2_falcon_layers),
              ("t2_ling_fingerprint", 2, t2_ling_fingerprint)]
     if A.list:
         for n, t, _ in cases:

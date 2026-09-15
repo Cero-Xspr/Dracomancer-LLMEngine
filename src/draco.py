@@ -391,12 +391,17 @@ def discover():
 #   （见 models.d/*.json 的 engines.dracomancer 段）。
 _DENGINE_ADAPTERS = (("zaya", "zaya"), ("smollm2", "smol"), ("ling", "ling"),
                      ("granite 4.0 h", "granite"))
+# ★ 有些模型 general.name 无意义（falcon-h1 的叫 "Original"），名字匹配不可用 ⇒ 按架构兜底。
+_DENGINE_ADAPTERS_ARCH = {"falcon-h1": "falcon"}
 
 
 def dengine_adapter(model):
     """该模型在 Darco 里的适配器名；没有则 None（= 不能走 dengine）。"""
     name = getattr(model, "gguf_name", model.name).lower()
-    return next((e for k, e in _DENGINE_ADAPTERS if k in name), None)
+    by_name = next((e for k, e in _DENGINE_ADAPTERS if k in name), None)
+    if by_name:
+        return by_name
+    return _DENGINE_ADAPTERS_ARCH.get(getattr(model, "arch", ""), None)
 
 
 def draco_view(model):

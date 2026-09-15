@@ -469,6 +469,23 @@
   这次的烟测我只看"命令跑起来了、`/hold` 提示打出来了"，**没有断言答案内容**，所以放过了它。
   ⇒ 规矩：碰流式/请求路径后，**必须断言真实答案**（指纹/健康问句），不能只看"没报错"。
 
+## 阶段 1 ✅ 首个家族（2026-09-15）：Falcon-H1 接入 Darco 并登记
+
+- **为什么快**：走 llama.cpp 的 mamba2 图，A={1,n_heads} 标量衰减 ⇒ **S4D 算子原样复用**；
+  dense FFN 复用 m6_dense_op；注意力在 llama_attn_core 加了个 use_neox 参数（4 类算子只新写了 0.5 个）。
+  印证了"架构覆盖的边际成本在降"的判断。
+- **对账**：逐层 pos0..3×36 层 cos 最小 0.99682（阈值 0.996，比 granite 宽是预期：Q8_K 激活+f16 KV）
+  ；无状态分支验证 attn 0.99996/ssm 0.99979；**rope 风格用数据判定**（NEOX 0.9999 vs 连续成对 0.89）
+  ；两个 prompt 端到端贪心 **12/12 token 与 llama.cpp 一致**。serve 端到端答对 Paris（66 t/s）。
+- **新语义**：NEOX rope + freq_base 1e11；**无 ssm_norm**（C 侧 norm=NULL 跳过）；
+  ffn_norm 张量名无 .weight 后缀；无任何 scale；tokenizer=falcon-h1 pre ⇒ llama3 正则+add_bos。
+- **★ 本次最大教训（对账假分歧的第二种形态）**：夹具 zaya_gdump 的 ids 参数带了方括号
+  （python 打印格式），`atoi("[17")=0` ⇒ **参考整个跑在错误的 prompt 上**，逐层对账"全错"，
+  折腾了好几轮才在"第一步 rms 就正交"处定位到是 prompt 不同。修法：解析加固 + 金标准生成时
+  **脚本当场断言 engine==ref** 才落盘。加上之前那次数组索引假分歧 ⇒ 对账对不上时的排查顺序：
+  ①比较代码的索引/形状 ②两边输入是否真的是同一序列 ③才轮到被测引擎。
+- falcon 的 general.name 是 "Original" ⇒ draco 新增 `_DENGINE_ADAPTERS_ARCH` 按**架构**匹配适配器。
+
 ## 阶段 0 ✅ 完成（2026-09-15）：分层测试套件地基
 
 - `run.py`（分层入口：T0 免模型 / T1 小模型 / T2 大模型对账；`--tier/-k/--list/--freeze`；

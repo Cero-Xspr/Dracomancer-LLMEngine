@@ -11,8 +11,10 @@
       "notes": "推荐 CPU 而不是 iGPU，理由是实测（draco.py selfcheck，同一台机）：CPU 两轮指纹一致、decode 90.9 / prefill 205.8 tok/s；iGPU(Vulkan) **两轮不一致**（贪心+固定 seed 下同一 prompt 给出不同答案）、decode ~95~107 / prefill ~157~183。即 iGPU 在 decode 上只快一点、prefill 反而更慢，却丢掉可复现性 ⇒ 不值得。同一模型 CPU 一致 / iGPU 不一致这一点，在与 draco 的预热请求（形状与真实请求对齐）排除'进程第一次解码'效应后仍然成立。健康问句 3/3 通过（Paris / 2 / 1-5）。"
     },
     "dracomancer": {
-      "status": "untested",
-      "notes": "自研引擎尚未实现 falcon-h1 架构（这是 Tier 2 候选：混合 SSM + 注意力）。"
+      "backend_hint": "dengine",
+      "status": "works",
+      "notes": "自研引擎（m6_falcon_forward_token：每层 注意力∥Mamba-2 并行相加 + dense FFN）2026-09-15 接入并登记。\n★★ 对账（三层证据）：\n  · 逐层：pos 0..3 × 全部 36 层 vs llama.cpp 夹具 dump 的 l_out，cos 最小 **0.99682**（阈值 0.996）——比 granite 的 0.999 略宽是预期：llama.cpp 对量化层用 Q8_K 激活 + f16 KV 缓存，我们全 fp32；\n  · 无状态分支验证（pos0）：attn 0.99996 / ssm 0.99979；rope 风格用 dump 的 Qcur-post-rope 判定（NEOX 0.9999 vs 连续成对 0.89，**NEOX 完胜**）；\n  · 端到端贪心：\"…Germany is\" 与 \"1, 2, 3, 4,\" 两个 prompt **12/12 token 与 llama.cpp 一致**。\n★ falcon 专属语义（照抄 granite 适配器会错）：**NEOX rope**（granite/llama 是连续成对）+ freq_base≈1e11；**没有 ssm_norm**（C 侧 norm=NULL 跳过分组归一化）；ffn_norm 张量名**无 .weight 后缀**；**没有任何 scale**（无 residual/embedding/logit）；tokenizer pre=falcon-h1 ⇒ llama3 正则 + add_bos=17。\n★ 坑：general.name 是无意义的 \"Original\" ⇒ draco 按**架构** falcon-h1 匹配适配器（_DENGINE_ADAPTERS_ARCH）；夹具 zaya_gdump 的 ids 参数**不能带方括号**（atoi(\"[17\")=0 ⇒ 参考跑在错误 prompt 上，对账全错还以为模型分歧——已加固解析）。\n★ 性能（省电档，load~2）：dengine decode ~48-62 tok/s（0.5B）；llama.cpp CPU 90（档案旧测）。同 falcon-h1.json 的 llama_cpp 段结论：该模型 iGPU 不可复现，推荐 CPU。",
+      "selfcheck_ref": "reconcile:falcon:layers-cos>=0.996:greedy-12/12-x2-prompts"
     }
   },
   "sampling": {
@@ -21,7 +23,7 @@
   "notes": "Falcon-H1-0.5B-Instruct（Q4_K_M，tiiuae/Falcon-H1-0.5B-Instruct-GGUF）：混合架构（Mamba-2 类 SSM + 注意力），llama.cpp 支持该架构。另注：本 GGUF 的 general.name 是无意义的 \"Original\"，draco list 里显示成 \"Original\"（已知 UX 问题，待注册表支持显示名覆盖）。证据：selfcheck JSON（arch=falcon-h1，2026-09-13）。",
   "source": {
     "author": "maintainer",
-    "date": "2026-09-13",
+    "date": "2026-09-15",
     "issue": null,
     "selfcheck_ref": "selfcheck:falcon-h1:cpu+iGPU"
   },

@@ -1,0 +1,33 @@
+{
+  "prompt_name": "The capital of France is Paris. The capital of Germany is",
+  "prompt": [
+    17,
+    1243,
+    7889,
+    813,
+    10513,
+    860,
+    16430,
+    537,
+    1007,
+    7889,
+    813,
+    10472,
+    860
+  ],
+  "tokens": [
+    23752,
+    537,
+    1007,
+    7889,
+    813,
+    15913,
+    860,
+    16064,
+    3120,
+    537,
+    1007,
+    7889
+  ],
+  "source": "ids 由 falcon_tok（与 llama-tokenize 逐 id 对账过）生成；tokens 为 llama.cpp build-dbg ZGREEDY=12（2026-09-15）。金标准由脚本当场验证 engine==ref 后写入。"
+}

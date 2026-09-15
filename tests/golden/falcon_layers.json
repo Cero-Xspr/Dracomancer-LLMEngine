@@ -1,0 +1,4 @@
+{
+  "min_cos_threshold": 0.996,
+  "source": "2026-09-15 实测（pos 0..3 × 36 层 vs 夹具 dump）：cos 最小 0.99682（pos0 层35），pos1/2 全部 ≥0.999，pos3 最小 0.99885。阈值 0.996 留余量。残差来源：llama.cpp 对量化层用 Q8_K 激活 + f16 KV 缓存，我们是 fp32 KV + fp32 激活。"
+}

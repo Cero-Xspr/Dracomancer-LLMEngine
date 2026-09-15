@@ -363,6 +363,48 @@ def _load_granite():
                 render=render)
 
 
+def _load_falcon():
+    """Falcon-H1（falcon-h1：每层 注意力∥Mamba-2 并行 + dense FFN，0.5B dense）→ falcon_engine.py。
+
+    ★ falcon 专属语义（与 granite 同走 mamba2 图，但注意这四条）：
+      · **NEOX rope** + freq_base≈1e11（llama.cpp 把 FALCON_H1 归在半区旋转那一段）
+      · **没有 ssm_norm**（loader 里 TENSOR_NOT_REQUIRED ⇒ C 侧跳过分组归一化）
+      · ffn_norm 的张量名**没有 .weight 后缀**
+      · **没有任何 scale**（无 residual/embedding/logit scale），KV/激活全 fp32
+      · tokenizer pre=falcon-h1 ⇒ llama3 同款正则 + **add_bos=17**（falcon_tok.py，
+        与 llama-tokenize 逐 id 对账 9/9 串一致）
+    ★ general.name 是无意义的 "Original" ⇒ draco 按架构 falcon-h1 匹配适配器。
+    """
+    global ENG, MAXT
+    import os
+    os.environ["MODEL"] = ARGS.model
+    os.environ.setdefault("MAXT", str(ARGS.ctx or 1024))
+    import falcon_engine as E
+    import falcon_tok as FT
+    ENG = E
+    tk, _R = FT.build(ARGS.model)
+
+    render = _template_renderer(ARGS.model)
+    if render is None:
+        raise SystemExit("falcon 的 GGUF 里没有 chat_template")
+
+    def reset():
+        E.reset()
+
+    _eos = _gguf_ids(ARGS.model, "tokenizer.ggml.eos_token_id")[0]
+    # 模板用 <|im_end|> 收尾：从词表里按文本找它的 id（找不到就退回 eos）
+    toks = list(_R.fields["tokenizer.ggml.tokens"].value)
+    im_end = toks.index("<|im_end|>") if "<|im_end|>" in toks else _eos
+    # 非推理模型：模板无 think/reasoning ⇒ 思考分区关闭
+    return dict(forward=E.forward, logits=E.logits_of_x, reset=reset,
+                encode=lambda t: tk.encode(t).ids,
+                decode=lambda ids: tk.decode(ids, skip_special_tokens=False),
+                eos=_eos, im_end=im_end, max_t=E.MAXT,
+                system_default=None, bos=None,
+                think_block=False, think_default=False,
+                render=render)
+
+
 def load_engine():
     """按 --engine 分派到适配器。每个适配器返回统一的算子接口 dict。"""
     global AP, MAXT
@@ -374,8 +416,10 @@ def load_engine():
         AP = _load_ling()
     elif ARGS.engine == "granite":
         AP = _load_granite()
+    elif ARGS.engine == "falcon":
+        AP = _load_falcon()
     else:
-        raise SystemExit(f"未知引擎 {ARGS.engine}（当前支持：smol / zaya / ling / granite）")
+        raise SystemExit(f"未知引擎 {ARGS.engine}（当前支持：smol / zaya / ling / granite / falcon）")
     MAXT = AP["max_t"]
     print(f"[SRV] 引擎就绪：{ARGS.model}  ctx<={MAXT}", flush=True)
 
