@@ -331,7 +331,7 @@ LOGITS = np.zeros(VOCAB, np.float32)
 HSC = np.zeros(H, np.float32)
 ONORM = fa("output_norm.weight")
 _EMB = T["token_embd.weight"]
-_EMB_ROWB = _EMB.data.nbytes // int(_EMB.shape[1])
+_EMB_ROWB = _EMB.data.shape[1]      # 每行的字节数（Q6_K: 1260）
 _HEAD, _HEAD_CODE = qb("token_embd.weight")     # granite 没有 output.weight ⇒ lm_head = 词嵌入
 KEEP.extend([X, TMP, MSO, LOGITS, HSC])
 
@@ -341,8 +341,12 @@ PROBE = {"layer_out": np.zeros((NL, H), np.float32)}
 
 
 def forward(tid, pos):
-    row = bytes(_EMB.data)[int(tid) * _EMB_ROWB:(int(tid) + 1) * _EMB_ROWB]
-    X[:] = np.asarray(gguf.quants.dequantize(np.frombuffer(row, np.uint8), _EMB.tensor_type),
+    # ★ 只取**一行**（零拷贝）：原来写成 `bytes(_EMB.data)[a:b]` —— bytes() 会把**整个 125MB
+    #   词嵌入复制一遍**再按字节偏移切片，实测每个 token 白花 50~90ms（占端到端的约 58%）。
+    #   gguf_fast 的 .data 是 mmap 上的只读 uint8 **二维**视图 (n_tokens, bytes_per_row)
+    #   ⇒ 直接 `[tid]` 拿一行；按字节偏移切是错的（那是切「行」维度，会切出空的）。
+    row = _EMB.data[int(tid)]
+    X[:] = np.asarray(gguf.quants.dequantize(row, _EMB.tensor_type),
                       np.float32) * EMB_SCALE
     M6E.m6_granite_forward_token(pf(X), H, EPS, pos, RES_SCALE, layers, NL, pf(TMP), pf(MSO),
                                  pf(PROBE["layer_out"]) if PROBE_ON else None)
