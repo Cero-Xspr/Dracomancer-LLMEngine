@@ -405,6 +405,50 @@ def _load_falcon():
                 render=render)
 
 
+def _load_llama():
+    """Llama 3.2 / llama 家族 → smol_engine.py（引擎固化管线就是 llama 形状，逐位复用）。
+
+    ★ 复用率最高的家族：llama/qwen2/qwen3/gemma/mistral 等同构管线将来都从这条走。
+    ★ 与 smol 的差别只有两处：分词器（GGUF 直构，pre=llama-bpe ⇒ llama3 正则）与
+      对话模板（GGUF 自带 llama3 格式；渲染文本以 {{bos_token}} 开头 ⇒ encode 不再前置，
+      免得双 BOS——falcon_tok.build(add_bos=False)）。
+    ★ 顺带修的引擎级坑：smol_engine 原来不设 OMP 环境变量（granite 同款退化，
+      llama32-1B 默认 18 → OMP=6~8 33 t/s）；现在 smol_engine 自己过 autotune。
+    """
+    global ENG, MAXT
+    import os
+    os.environ["MODEL"] = ARGS.model
+    os.environ.setdefault("MAXT", str(ARGS.ctx or 1024))
+    import smol_engine as E
+    import falcon_tok as FT
+    ENG = E
+    tk, _R = FT.build(ARGS.model, add_bos=False)
+    render = _template_renderer(ARGS.model)
+    if render is None:
+        raise SystemExit("llama 的 GGUF 里没有 chat_template")
+
+    def reset():
+        import ctypes as ct
+        for item in E.KEEP:
+            if isinstance(item, E.M6LlamaAttnP):
+                n = E.MAXT * item.n_kv * item.head_dim
+                ct.memset(item.kcache, 0, n * 4)
+                ct.memset(item.vcache, 0, n * 4)
+                item.tlen[0] = 0
+
+    _eos = _gguf_ids(ARGS.model, "tokenizer.ggml.eos_token_id")[0]
+    toks = list(_R.fields["tokenizer.ggml.tokens"].value)
+    im_end = toks.index("<|eot_id|>") if "<|eot_id|>" in toks else _eos
+    # 非推理模型：模板无 think/reasoning ⇒ 思考分区关闭
+    return dict(forward=E.forward, logits=E.logits_of_x, reset=reset,
+                encode=lambda t: tk.encode(t).ids,
+                decode=lambda ids: tk.decode(ids, skip_special_tokens=False),
+                eos=_eos, im_end=im_end, max_t=E.MAXT,
+                system_default=None, bos=None,
+                think_block=False, think_default=False,
+                render=render)
+
+
 def load_engine():
     """按 --engine 分派到适配器。每个适配器返回统一的算子接口 dict。"""
     global AP, MAXT
@@ -418,8 +462,10 @@ def load_engine():
         AP = _load_granite()
     elif ARGS.engine == "falcon":
         AP = _load_falcon()
+    elif ARGS.engine == "llama":
+        AP = _load_llama()
     else:
-        raise SystemExit(f"未知引擎 {ARGS.engine}（当前支持：smol / zaya / ling / granite / falcon）")
+        raise SystemExit(f"未知引擎 {ARGS.engine}（当前支持：smol / zaya / ling / granite / falcon / llama）")
     MAXT = AP["max_t"]
     print(f"[SRV] 引擎就绪：{ARGS.model}  ctx<={MAXT}", flush=True)
 

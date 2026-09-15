@@ -22,7 +22,10 @@ LLAMA3_PAT = (r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|"
               r"[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+")
 
 
-def build(model=MODEL):
+def build(model=MODEL, add_bos=True):
+    """add_bos=True：encode 前置 BOS（falcon/llama 的裸文本口径，与 llama-tokenize 默认一致）。
+    add_bos=False：原样 BPE——给「模板渲染文本已含 bos_token」的适配器用（llama 3.2 模板
+    以 {{- bos_token }} 开头，前置会变成双 BOS）。"""
     from tokenizers import Tokenizer, models, pre_tokenizers, decoders, Regex
     R = gguf_fast.FastGGUF(model)
     toks = list(R.fields["tokenizer.ggml.tokens"].value)
@@ -41,11 +44,13 @@ def build(model=MODEL):
     eos = int(R.fields["tokenizer.ggml.eos_token_id"].value)     # 11
 
     class _Enc:
-        """encode(text) = BOS + BPE（复刻 llama.cpp 的 add_bos=true）。"""
+        def __init__(self, ab):
+            self._ab = ab
+            self.bos = bos
+
         def encode(self, text, add_special_tokens=False):
             e = tk.encode(text, add_special_tokens=False)
-            from tokenizers import Encoding
-            ids = [bos] + e.ids
+            ids = ([bos] + e.ids) if self._ab else e.ids
             return type("R", (), {"ids": ids})()
 
         def decode(self, ids, skip_special_tokens=False):
@@ -56,7 +61,7 @@ def build(model=MODEL):
 
     print(f"[tok] vocab={len(toks)} merges={len(merges)} special={len(specials)} "
           f"bos={bos}({toks[bos]!r}) eos={eos}({toks[eos]!r})", flush=True)
-    return _Enc(), R
+    return _Enc(add_bos), R
 
 
 def llama_ids(s, model=MODEL, no_bos=False):
@@ -77,8 +82,8 @@ if __name__ == "__main__":
                  "<|im_start|>user\nhi<|im_end|>", "  leading spaces", "tab\there",
                  "emoji 🎉 and ünïcödé"]
         bad = 0
-        assert tk.encode("").ids == [17], "空串 = [BOS]（add_bos=true）"
-        print("✓ '' 空串 → [17]（BOS）")
+        assert tk.encode("").ids == [tk.bos], "空串 = [BOS]（add_bos=true）"
+        print(f"✓ '' 空串 → [{tk.bos}]（BOS）")
         for s in cases:
             mine = tk.encode(s).ids
             ref = llama_ids(s)

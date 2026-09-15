@@ -279,6 +279,31 @@ def t1_falcon_greedy():
     return True, f"{len(exp)}/{len(exp)} token 与 llama.cpp 贪心一致"
 
 
+def t1_llama_greedy():
+    """llama 家族（引擎固化管线）：金标准 = llama.cpp ZGREEDY 12 token。
+    管线本身由 smol 指纹长期覆盖，这条闸门守的是「llama 家族接入点」（分词器/模板/head 绑定）。"""
+    gold = _load_golden("llama_greedy")
+    if gold is None:
+        return False, "缺 tests/golden/llama_greedy.json"
+    m = os.environ.get("LLAMA_MODEL",
+                       "/media/xiao_/OverSys1/gguf/llama32/Llama-3.2-1B-Instruct-Q4_K_M.gguf")
+    if not os.path.isfile(m):
+        return False, f"缺 llama 模型（{m}）"
+    s = _find_script("llama_greedy.py")
+    rc, out = _run([PY, s], timeout=1800,
+                   env={"TOKS": ",".join(map(str, gold["prompt"])),
+                        "NSTEPS": str(len(gold["tokens"])), "MODEL": m})
+    mm = re.search(r"\[GEN\] 贪心 token: \[([0-9, ]+)\]", out)
+    if not mm:
+        return False, "拿不到贪心输出: " + out[-200:]
+    got = [int(x) for x in mm.group(1).split(",")]
+    exp = gold["tokens"]
+    if got[:len(exp)] != exp:
+        bad = next(i for i, (a, b) in enumerate(zip(got, exp)) if a != b)
+        return False, f"第 {bad} 个 token 分叉：得到 {got[bad:bad+4]} 期望 {exp[bad:bad+4]}"
+    return True, f"{len(exp)}/{len(exp)} token 与 llama.cpp 贪心一致"
+
+
 # ═══════════════════════════ T2：大模型对账（十分钟级） ═══════════════════════════
 def t2_granite_s4d_layers():
     """S4D 逐层对账：pos 0..3 × 全部 36 个 SSM 层的链头 cos 必须 ≥ 0.9990。
@@ -343,6 +368,7 @@ def main():
              ("t0_measured_lookup", 0, t0_measured_lookup), ("t0_rank_prefer", 0, t0_rank_prefer),
              ("t1_smol_fingerprint", 1, t1_smol_fingerprint), ("t1_granite_tok", 1, t1_granite_tok),
              ("t1_granite_greedy", 1, t1_granite_greedy), ("t1_falcon_greedy", 1, t1_falcon_greedy),
+             ("t1_llama_greedy", 1, t1_llama_greedy),
              ("t2_granite_s4d_layers", 2, t2_granite_s4d_layers),
              ("t2_falcon_layers", 2, t2_falcon_layers),
              ("t2_ling_fingerprint", 2, t2_ling_fingerprint)]

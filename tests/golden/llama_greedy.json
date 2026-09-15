@@ -1,0 +1,6 @@
+{
+  "prompt_name": "The capital of France is Paris. The capital of Germany is",
+  "prompt": [128000, 791, 6864, 315, 9822, 374, 12366, 13, 578, 6864, 315, 10057, 374],
+  "tokens": [20437, 13, 578, 6864, 315, 15704, 374, 22463, 13, 578, 6864, 315],
+  "source": "llama.cpp build-dbg ZGREEDY=12（2026-09-15，省电档）。llama 3.2 1B 走引擎固化管线（smol 同管线），12/12 一次通过。"
+}

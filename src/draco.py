@@ -264,6 +264,8 @@ MEASURED = {
     ("Granite 4.0 h-tiny", "igpu"):    (21.9, -1),
     ("Granite 4.0 h-tiny", "cpu"):     (9.4,  -1),
     ("Granite 4.0 h-tiny", "dengine"): (12.2, -1),
+    # Llama 3.2 1B（2026-09-15，省电档；dengine 接 autotune 后 OMP=6，贪心口径）
+    ("Llama 3.2 1B Instruct", "dengine"): (33.0, -1),
 }
 MEASURED_NPU = ("Llama-3.2-1B（合成权重、仅延迟）", 56.6, 281)
 
@@ -390,7 +392,7 @@ def discover():
 #   新增模型/架构必须先在 draco_engine_server.py 里写适配器并**过数值对账**，再登记到这里
 #   （见 models.d/*.json 的 engines.dracomancer 段）。
 _DENGINE_ADAPTERS = (("zaya", "zaya"), ("smollm2", "smol"), ("ling", "ling"),
-                     ("granite 4.0 h", "granite"))
+                     ("granite 4.0 h", "granite"), ("llama 3.2", "llama"))
 # ★ 有些模型 general.name 无意义（falcon-h1 的叫 "Original"），名字匹配不可用 ⇒ 按架构兜底。
 _DENGINE_ADAPTERS_ARCH = {"falcon-h1": "falcon"}
 

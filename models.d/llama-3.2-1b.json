@@ -1,0 +1,27 @@
+{
+  "schema_version": 2,
+  "match": {
+    "arch": "llama",
+    "name_contains": "llama 3.2 1b"
+  },
+  "display_name": "Llama 3.2 1B Instruct",
+  "engines": {
+    "llama_cpp": {
+      "backend_hint": "igpu",
+      "status": "works",
+      "notes": "官方构建原生支持。本机实测（2026-09-12）：cpu 78.5 tok/s / igpu 89.8 tok/s（iGPU 又快又省 563 mJ/tok）。无特殊参数。"
+    },
+    "dracomancer": {
+      "backend_hint": "dengine",
+      "status": "works",
+      "notes": "自研引擎（引擎固化管线即 llama 形状，与 SmolLM2 同管线逐位复用）2026-09-15 接入。\n★ 对账：端到端贪心 \"…Germany is\" 续写 **12/12 token 与 llama.cpp 一致**（金标准 tests/golden/llama_greedy.json）；管线本身经 SmolLM2 的逐位指纹闸门长期覆盖。\n★ 接线要点：分词器 pre=llama-bpe ⇒ llama3 正则（GGUF 直构，与 llama-tokenize 逐 id 对账一致）；**模板渲染文本已含 bos_token ⇒ encode 不前置**（免双 BOS）；eos=128009(<|eot_id|>)，im_end 同；tied embeddings（无 output.weight ⇒ head=词嵌入）；metadata 无 rope.scaling 键 ⇒ 纯 rope@500k。\n★ 性能（省电档）：dengine ~33 tok/s（OMP=6）vs llama.cpp cpu 78.5 —— 1B 上仍有差距，量级可接受；线程数必须过 autotune（smol_engine 已接，默认 20 线程只有 18 t/s）。"
+    }
+  },
+  "notes": "Llama 3.2 1B Instruct（16 层，32/8 头 × 64，H=2048，FF=8192，rope 64@500k，vocab 128256）。Q4_K_M。",
+  "source": {
+    "author": "maintainer",
+    "date": "2026-09-15",
+    "issue": null,
+    "selfcheck_ref": null
+  }
+}

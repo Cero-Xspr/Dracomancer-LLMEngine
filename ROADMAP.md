@@ -469,6 +469,21 @@
   这次的烟测我只看"命令跑起来了、`/hold` 提示打出来了"，**没有断言答案内容**，所以放过了它。
   ⇒ 规矩：碰流式/请求路径后，**必须断言真实答案**（指纹/健康问句），不能只看"没报错"。
 
+## 阶段 1 ✅ 家族 #6（2026-09-15）：Llama 3.2 1B（llama 架构）接入——复用率最高的一个
+
+- **零新代码**：引擎固化管线就是 llama 形状（smol 同管线）；只写了适配器（_load_llama）+
+  GGUF 直构分词器（复用 falcon_tok，pre=llama-bpe ⇒ llama3 正则）+ 档案。
+- **对账**：端到端贪心 **12/12 token 与 llama.cpp 一致**（一次通过）；管线数值由 smol 的
+  逐位指纹闸门长期覆盖。serve 实测答对 Paris、第二问无状态污染（33.5 t/s）。
+- **要点**：llama 3.2 模板渲染文本自带 bos ⇒ encode 不前置（免双 BOS，falcon_tok 加了
+  add_bos 参数）；tied embeddings（head=词嵌入）；metadata 无 rope.scaling ⇒ 纯 rope@500k。
+- **家族意义**：llama 架构 = llama/qwen2/qwen3/gemma/mistral 同构管线，这条接入点打通后
+  同族模型是 Tier 0（改档案不改代码）。
+- **顺带**：smol_engine 补上了 autotune（granite 同款 OMP 退化：llama32-1B 默认 20 线程
+  18 t/s → OMP=6 33 t/s，1.9×；线程数不改数值已再次验证）；smol 指纹逐位不变。
+- 本地还有 Qwen3.5-2B-f16（qwen35，GDN 注意力，m6_gdn_attn 现成）与 Qwen3.6-35B-A3B
+  两个量化版（qwen35moe）——qwen35 是下一个家族的现成候选（注意 2B 是 f16，~4GB）。
+
 ## 阶段 1 ✅ 首个家族（2026-09-15）：Falcon-H1 接入 Darco 并登记
 
 - **为什么快**：走 llama.cpp 的 mamba2 图，A={1,n_heads} 标量衰减 ⇒ **S4D 算子原样复用**；
