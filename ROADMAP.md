@@ -477,6 +477,16 @@
   这次的烟测我只看"命令跑起来了、`/hold` 提示打出来了"，**没有断言答案内容**，所以放过了它。
   ⇒ 规矩：碰流式/请求路径后，**必须断言真实答案**（指纹/健康问句），不能只看"没报错"。
 
+## 阶段 2b ✅（2026-09-16）：多会话状态槽
+
+- **机制**：`_SLOTS[key] = {ids, snap}`，key = system+首问哈希（同会话首问跨轮不变；撞键安全——
+  前缀不匹配就回退全量）。快照/恢复 = 整块 memcpy STATES（granite ~70MB 毫秒级），
+  LRU 2 槽。有 STATES 的引擎（smol/llama/granite/falcon/qwen35）自动启用；zaya/ling 回退单会话。
+- **实测（granite serve，A/B 两会话交替）**：A1 cached=0 → B1 cached=30 → B2 cached=47 →
+  **A2 切回 cached=40**，答案全对（Euro）——交替会话不再互相打掉缓存。
+- smol_engine 补了 STATES 清单（kc/vc；tl 由适配器 reset 兜底）。
+- 待做：并发压测脚本化进套件（现在是手工 e2e）；zaya/ling 的 STATES 化。
+
 ## 阶段 2 ✅ 第一批（2026-09-16）：上下文增量复用 + 整代串行锁
 
 - **机制**：引擎状态精确对应 `_CTX_CACHE["ids"]`（prompt+已生成 token，生成时同步延长）。

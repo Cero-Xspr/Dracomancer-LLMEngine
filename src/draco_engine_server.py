@@ -129,6 +129,7 @@ def _load_smol():
                 encode=lambda t: TOK.encode(t, add_special_tokens=True).ids,
                 decode=lambda ids: TOK.decode(ids), eos=EOS_ID, im_end=IM_END, max_t=MAXT,
                 system_default=DEFAULT_SYSTEM, bos=None, think_block=False, think_default=False,
+                state_arrays=(lambda: E.STATES) if hasattr(E, "STATES") else None,
                 render=lambda msgs, think: render_chatml_generic(msgs, think, None, DEFAULT_SYSTEM, False))
 
 
@@ -361,6 +362,7 @@ def _load_granite():
                 eos=_eos, im_end=_eos, max_t=E.MAXT,
                 system_default=None, bos=None,
                 think_block=False, think_default=False,
+                state_arrays=(lambda: E.STATES) if hasattr(E, "STATES") else None,
                 render=render)
 
 
@@ -403,6 +405,7 @@ def _load_falcon():
                 eos=_eos, im_end=im_end, max_t=E.MAXT,
                 system_default=None, bos=None,
                 think_block=False, think_default=False,
+                state_arrays=(lambda: E.STATES) if hasattr(E, "STATES") else None,
                 render=render)
 
 
@@ -447,6 +450,7 @@ def _load_llama():
                 eos=_eos, im_end=im_end, max_t=E.MAXT,
                 system_default=None, bos=None,
                 think_block=False, think_default=False,
+                state_arrays=(lambda: E.STATES) if hasattr(E, "STATES") else None,
                 render=render)
 
 
@@ -486,6 +490,7 @@ def _load_qwen35():
                 eos=_eos, im_end=_eos, max_t=E.MAXT,
                 system_default=None, bos=None,
                 think_block=False, think_default=False,
+                state_arrays=(lambda: E.STATES) if hasattr(E, "STATES") else None,
                 render=render)
 
 
@@ -517,6 +522,21 @@ def load_engine():
 # 这个已转发序列**。新请求与缓存有公共前缀 L（且新序列更长）⇒ 状态对前 L 个 token 依然精确
 # ⇒ 只 prefill 增量 ids[L:]，不 reset。任何不匹配 ⇒ 全量 reset（永远正确，只是慢）。
 _CTX_CACHE = {"ids": None, "valid": False}
+# ★ 多会话槽：key → {"ids": 序列, "snap": [状态数组快照]}。快照/恢复就是整块 memcpy
+#   （granite ~70MB / qwen35 ~45MB，毫秒级），让两个会话交替时也能吃到前缀复用。
+_SLOTS = {}
+_SLOT_ORDER = []          # LRU：最旧在前
+_MAX_SLOTS = 2
+
+
+def _session_key(messages):
+    """会话键：system 内容 + 第一条 user 消息（同一会话的首问跨轮不变）。
+    不同会话撞键也安全：前缀不匹配就回退全量 prefill，只是没有加速。"""
+    sysc = messages[0].get("content") if messages and messages[0].get("role") == "system" else ""
+    for m in messages:
+        if m.get("role") == "user":
+            return hash((str(sysc), str(m.get("content"))))
+    return hash(str(messages))
 # ★ 锁必须罩住**整代**（prefill+采样循环的所有 forward）：ThreadingHTTPServer 下两个并发
 #   流若交错 forward 会互写状态。代价：客户端中途卡住会占住引擎（与 llama-server 的排队同性质）。
 _ENG_LOCK = threading.Lock()
@@ -601,7 +621,8 @@ def generate(messages, max_tokens, temp, seed, repeat_penalty, enable_thinking=N
         raise ValueError(f"提示词太长：{len(ids)} token > 本引擎上下文 {MAXT}。"
                          f"（draco 侧可用 -c 调大，桥接会用同一个值）")
     n_gen = min(max_tokens if max_tokens and max_tokens > 0 else 256, budget)
-    return _gen(ids, n_gen, temp, seed, repeat_penalty, think_now, hold)
+    return _gen(ids, n_gen, temp, seed, repeat_penalty, think_now, hold,
+                skey=_session_key(messages))
 
 
 def _decodable_prefix(text):
@@ -621,14 +642,14 @@ def _decodable_prefix(text):
     return text[:len(text) - n] if n else text
 
 
-def _gen(ids, n_gen, temp, seed, repeat_penalty, think_now, hold=None):
+def _gen(ids, n_gen, temp, seed, repeat_penalty, think_now, hold=None, skey=None):
     """持锁整代串行：锁横跨内部生成器的整个生命周期（yield 挂起时不释放——并发第二个
     请求只会排队；客户端断连时 GeneratorExit 走 with 退出，锁照样释放）。"""
     with _ENG_LOCK:
-        yield from _gen_locked(ids, n_gen, temp, seed, repeat_penalty, think_now, hold)
+        yield from _gen_locked(ids, n_gen, temp, seed, repeat_penalty, think_now, hold, skey)
 
 
-def _gen_locked(ids, n_gen, temp, seed, repeat_penalty, think_now, hold=None):
+def _gen_locked(ids, n_gen, temp, seed, repeat_penalty, think_now, hold=None, skey=None):
     """生成器：yield (kind, 文本增量, 计时dict)。调用方必须已持 _ENG_LOCK。"""
     rng = random.Random(seed if seed and seed > 0 else None)
 
@@ -637,7 +658,21 @@ def _gen_locked(ids, n_gen, temp, seed, repeat_penalty, think_now, hold=None):
     #   特例 L == len(ids)（与缓存完全同头的短/等长 prompt）：状态已越过该前缀
     #   （多生了缓存里的后续 token），没有 rewind ⇒ 老实全量重跑。
     reuse = 0
-    if _CTX_CACHE["valid"] and _CTX_CACHE["ids"]:
+    arrays = AP.get("state_arrays")
+    slot = _SLOTS.get(skey) if (skey is not None and arrays) else None
+    if slot is not None:
+        # ★ 会话槽命中：恢复快照（状态精确回到该会话上次结束点），再按前缀续转
+        L = _common_prefix_len(ids, slot["ids"])
+        if L >= len(ids):
+            L = 0
+        if L > 0:
+            for live, snap in zip(arrays(), slot["snap"]):
+                live[...] = snap
+            _CTX_CACHE["ids"] = list(slot["ids"])
+            _CTX_CACHE["valid"] = True
+            reuse = L
+    elif _CTX_CACHE["valid"] and _CTX_CACHE["ids"]:
+        # 无槽引擎（zaya/ling 等）：保持单会话前缀复用
         reuse = _common_prefix_len(ids, _CTX_CACHE["ids"])
         if reuse >= len(ids):
             reuse = 0
@@ -706,6 +741,16 @@ def _gen_locked(ids, n_gen, temp, seed, repeat_penalty, think_now, hold=None):
         "predicted_n": len(out), "predicted_per_second": round(len(out) / dec_s, 1) if dec_s else 0,
         "ttft_ms": ttft_ms,
     }
+    # ★ 生成结束：把状态快照进会话槽（LRU 2 槽；无 state_arrays 的引擎跳过）
+    if skey is not None and AP.get("state_arrays"):
+        _SLOTS[skey] = {"ids": list(_CTX_CACHE["ids"]),
+                        "snap": [a.copy() for a in AP["state_arrays"]()]}
+        if skey in _SLOT_ORDER:
+            _SLOT_ORDER.remove(skey)
+        _SLOT_ORDER.append(skey)
+        while len(_SLOT_ORDER) > _MAX_SLOTS:
+            old = _SLOT_ORDER.pop(0)
+            _SLOTS.pop(old, None)
     yield "content", "", timings
 
 
