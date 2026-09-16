@@ -543,7 +543,19 @@ _ADAPTERS_ARCH + models.d ③T1/T2 用例 ④层 31~39 的 0.989~0.997 归档为
 - 顺带收获：手写 GGUF 头 Range 解析器（/tmp/parse_k2.py，含完整类型表）——以后评估任何
   新模型都可以**只拉 128MB 就看清结构**，不用先下全量。
 
-## 阶段 2b ✅（2026-09-16）：多会话状态槽
+## 阶段 4 🔄 AVX2/标量回退（2026-09-16 开工）：Q8_0 已验证，K 系布局待查
+
+- **已完成**：`m5/m5_kern_scalar.c`（标量回退内核：m5_gemv/m5_gemv_range/m5_scalar_supported，
+  布局对照本仓 gguf-py quants.py 抄写）已编译；验证脚本 /tmp/scalar_verify.py
+  （35B 模型全部 (类型,形状) 组合，标量 vs AVX-512 内核 vs numpy 三方对账）。
+- **Q8_0 全形状 cos 1.000 ✓**；**K 系（Q4_K/Q5_K/Q6_K）标量版与 gguf-py 不一致**
+  （个别形状还输出全零/nan）——布局从 quants.py 抄的，错误细节待查。
+  **下一步=块级 elementwise 对账**：对标量 dequant 一行 vs gguf-py dequantize 同一行，
+  逐元素 diff（别用 gemv 猜——gemv 把布局错和点积错混在一起）。
+- F16/F32 平凡 ✓ 未单独跑。IQ 系（IQ3_S 等）标量版未实现（fail loudly），qwen35moe
+  在纯标量机器上暂不可跑——接受（发行说明写清），或后续补 IQ3_S。
+- 分派机制（Python 侧 kernsel：无 AVX-512 ⇒ 全槽指向标量 .so）未做——等 K 系修通一起。
+- 验证脚本里 n_in/n_out 方向踩坑：GGUF ne=(n_in, n_out)，ne0=n_in 最快——写死进注释。
 
 - **机制**：`_SLOTS[key] = {ids, snap}`，key = system+首问哈希（同会话首问跨轮不变；撞键安全——
   前缀不匹配就回退全量）。快照/恢复 = 整块 memcpy STATES（granite ~70MB 毫秒级），
