@@ -274,7 +274,8 @@ SCORES = np.zeros(NH * MAXT, np.float32)
 LOGITS = np.zeros(VOCAB, np.float32)
 HSC = np.zeros(H, np.float32)
 ONORM = fa("output_norm.weight")
-_HEAD, _HEAD_CODE = qb("token_embd.weight")      # 无 output.weight ⇒ head=词嵌入（F16）
+_hn = "output.weight" if "output.weight" in T else "token_embd.weight"
+_HEAD, _HEAD_CODE = qb(_hn)   # ★ qwen35 2B 无 output（tied）；qwen35moe 有独立 output.weight
 KEEP += [X, X2N, X2O, FFO, KRN, VRN, SCORES, LOGITS, HSC]
 
 

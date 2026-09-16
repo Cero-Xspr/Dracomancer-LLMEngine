@@ -491,10 +491,13 @@ F32 张量 code 9；无 recurrent_layers 键时按 full_attention_interval 推�
 FFN 只剩 shexp；手工对账时手动相加把引擎缺陷掩盖了）。修复后 **pos0 层 0~30 cos 全 1.000**，
 层 31~39 余 0.989~0.997（从最后一个全注意力层 31 起）。内核矩阵已排除内核嫌疑
 （blk.0/15/35 全部张量逐一对账 0 失败，含 Q8_0/Q5_K/Q4_K/IQ4_XS）。
-下一步：层 31 分支隔离（attn_norm-31 → m6_full_attn → attn_residual-31）——
-嫌疑在 full-attn 层的某个细节（注意 m6_full_attn 里 K gemv 硬编码 n_out=512=NKV×HD ✓、
-o gemv n_out=2048=H ✓ 对 35B 恰好成立；QG 联合投影 NQG=8192 ✓ 已参数化）。
-然后贪心金标准 → 登记 → T1/T2 用例。
+**✅ 又修一 bug（2026-09-16）**：**head 绑定**——qwen35moe 有独立 output.weight，
+驱动却硬编码用词嵌入 ⇒ 隐层对（cos 0.997）而 logits 全错（ref 首 token 排到 12 万名外）。
+修复后：**真实句子贪心 12/12 与 llama.cpp 一致**（"…Germany is"）；计数 prompt 在
+第 3 token 分叉——判定为量化噪声（IQ3_S 专家 + Q8_K 激活 vs 我们 fp32，pos3 逐层
+min 0.9935 且层 0~2 pos3 = 1.000 ⇒ 状态递推无 bug）。
+**剩余收尾（下轮）**：①贪心金标准落盘（France/Germany prompt 已验证 12/12）②登记
+_ADAPTERS_ARCH + models.d ③T1/T2 用例 ④层 31~39 的 0.989~0.997 归档为 Q8_K 激活差异预期。
 
 ## 阶段 2b ✅（2026-09-16）：多会话状态槽
 
