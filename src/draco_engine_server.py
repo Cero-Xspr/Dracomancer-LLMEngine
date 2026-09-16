@@ -524,10 +524,10 @@ def load_engine():
         AP = _load_falcon()
     elif ARGS.engine == "llama":
         AP = _load_llama()
-    elif ARGS.engine == "qwen35":
+    elif ARGS.engine in ("qwen35", "qwen35moe"):
         AP = _load_qwen35()
     else:
-        raise SystemExit(f"未知引擎 {ARGS.engine}（当前支持：smol / zaya / ling / granite / falcon / llama / qwen35）")
+        raise SystemExit(f"未知引擎 {ARGS.engine}（当前支持：smol / zaya / ling / granite / falcon / llama / qwen35(+moe)）")
     MAXT = AP["max_t"]
     print(f"[SRV] 引擎就绪：{ARGS.model}  ctx<={MAXT}", flush=True)
 

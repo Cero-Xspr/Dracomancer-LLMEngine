@@ -398,7 +398,7 @@ def discover():
 _DENGINE_ADAPTERS = (("zaya", "zaya"), ("smollm2", "smol"), ("ling", "ling"),
                      ("granite 4.0 h", "granite"), ("llama 3.2", "llama"))
 # ★ 有些模型 general.name 无意义（falcon-h1 的叫 "Original"），名字匹配不可用 ⇒ 按架构兜底。
-_DENGINE_ADAPTERS_ARCH = {"falcon-h1": "falcon", "qwen35": "qwen35"}
+_DENGINE_ADAPTERS_ARCH = {"falcon-h1": "falcon", "qwen35": "qwen35", "qwen35moe": "qwen35"}
 
 
 def dengine_adapter(model):

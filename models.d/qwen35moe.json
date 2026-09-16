@@ -1,0 +1,26 @@
+{
+  "schema_version": 2,
+  "match": {
+    "arch": "qwen35moe"
+  },
+  "display_name": "Qwen3.6 35B A3B（qwen35moe）",
+  "engines": {
+    "llama_cpp": {
+      "status": "works",
+      "notes": "官方构建原生支持（qwen35moe.cpp：GDN + 全注意力 + MoE 133×8 + 门控共享专家 + MTP）。"
+    },
+    "dracomancer": {
+      "backend_hint": "dengine",
+      "status": "works",
+      "notes": "自研引擎（qwen35 驱动 arch 自适应：m6_gdn_attn × 30 + m6_full_attn × 10 + m6_granite_moe 133×8 + 门控共享专家）2026-09-16 接入。\n★ 对账：pos0 层 0~30 cos 全 1.000、31~39 0.989~0.997（IQ3_S 专家 + llama.cpp Q8_K 激活 vs 我们 fp32 的预期差异，阈值 0.99）；真实句子贪心 **12/12 与 llama.cpp 一致**（计数 prompt 第 3 token 分叉=同源量化噪声，已归档）。\n★ 本轮修的 3 个 bug（都进方法学）：shexp 门 silu→sigmoid（精确反相关指纹）；_ffn 漏加 moe_out（手工对账掩盖引擎缺陷——分段探针必须走引擎完整路径）；head 绑定（有独立 output.weight 却硬编码词嵌入 ⇒ 隐层全对 logits 全错，tied/非 tied 混用首查项）。\n★ 与 2B 的结构差异：40 层（30 GDN + 10 全注意力）、GDN d_inner 4096/NVH 32、无 recurrent_layers 键（按 interval 推导）、有 output.weight、专家 IQ3_S/Q6_K 混合。REAP-48 = 48% 剪枝版，9.4GB。",
+      "selfcheck_ref": "reconcile:qwen35moe:layers-cos>=0.99:greedy-12/12"
+    }
+  },
+  "notes": "Qwen3.6 35B A3B REAP-48-v2（本机 9.4GB 量化版；另有 UD-IQ4_NL_XL 19.5GB 未测）。40 层 = 30 GDN + 10 全注意力，MoE 133 选 8 + 门控共享专家，GQA 16/2×256，MRoPE 分段同 qwen35。",
+  "source": {
+    "author": "maintainer",
+    "date": "2026-09-16",
+    "issue": null,
+    "selfcheck_ref": null
+  }
+}

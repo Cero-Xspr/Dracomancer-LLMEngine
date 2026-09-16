@@ -1,0 +1,33 @@
+{
+  "prompt_name": "The capital of France is Paris. The capital of Germany is",
+  "prompt": [
+    248044,
+    760,
+    6511,
+    314,
+    9338,
+    369,
+    11751,
+    13,
+    561,
+    6511,
+    314,
+    9564,
+    369
+  ],
+  "tokens": [
+    11751,
+    13,
+    561,
+    6511,
+    314,
+    9564,
+    369,
+    11751,
+    13,
+    561,
+    6511,
+    314
+  ],
+  "source": "llama.cpp build-dbg ZGREEDY=12（2026-09-16）。真实句子贪心 12/12 已当场验证；计数 prompt 在第 3 token 分叉（IQ3_S 专家 + Q8_K 激活的量化噪声），不入金标准。"
+}

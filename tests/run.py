@@ -418,6 +418,31 @@ print(f"INC_EQ={np.array_equal(LA, LB)} DMAX={np.abs(LA-LB).max():.2e}")
     return True, "增量续转 ≡ 全量重跑（logits 逐位相同，max|Δ|=0）"
 
 
+def t1_qwen35moe_greedy():
+    """qwen35moe（35B A3B REAP）：金标准 = llama.cpp ZGREEDY 12 token。
+    计数类 prompt 有量化噪声分叉（IQ3_S+Q8_K vs fp32），金标准用真实句子。"""
+    gold = _load_golden("qwen35moe_greedy")
+    if gold is None:
+        return False, "缺 tests/golden/qwen35moe_greedy.json"
+    m = os.environ.get("QWEN35MOE_MODEL",
+                       "/media/xiao_/OverSys1/gguf/Qwen3.6-35B-A3B-REAP-48-v2.gguf")
+    if not os.path.isfile(m):
+        return False, f"缺 qwen35moe 模型（{m}）"
+    s = _find_script("qwen35_engine.py")
+    rc, out = _run([PY, s], timeout=3600,
+                   env={"TOKS": ",".join(map(str, gold["prompt"])),
+                        "NSTEPS": str(len(gold["tokens"])), "MODEL": m})
+    mm = re.search(r"\[GEN\] 贪心 token: \[([0-9, ]+)\]", out)
+    if not mm:
+        return False, "拿不到贪心输出: " + out[-200:]
+    got = [int(x) for x in mm.group(1).split(",")]
+    exp = gold["tokens"]
+    if got[:len(exp)] != exp:
+        bad = next(i for i, (a, b) in enumerate(zip(got, exp)) if a != b)
+        return False, f"第 {bad} 个 token 分叉：得到 {got[bad:bad+4]} 期望 {exp[bad:bad+4]}"
+    return True, f"{len(exp)}/{len(exp)} token 与 llama.cpp 贪心一致"
+
+
 def t2_granite_s4d_layers():
     """S4D 逐层对账：pos 0..3 × 全部 36 个 SSM 层的链头 cos 必须 ≥ 0.9990。
     阈值取自实测（本轮记录的最小值 0.999147），不另立标准。"""
@@ -483,6 +508,7 @@ def main():
              ("t1_granite_greedy", 1, t1_granite_greedy), ("t1_falcon_greedy", 1, t1_falcon_greedy),
              ("t1_llama_greedy", 1, t1_llama_greedy), ("t1_qwen35_greedy", 1, t1_qwen35_greedy),
              ("t1_incremental_state", 1, t1_incremental_state),
+             ("t1_qwen35moe_greedy", 1, t1_qwen35moe_greedy),
              ("t2_granite_s4d_layers", 2, t2_granite_s4d_layers),
              ("t2_qwen35_layers", 2, t2_qwen35_layers),
              ("t2_falcon_layers", 2, t2_falcon_layers),
