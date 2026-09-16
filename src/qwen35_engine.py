@@ -290,6 +290,10 @@ def _ffn(L, xn, out):
     # 共享专家：up/gate gemv → silu(gate)·up → down → ×sigmoid(标量门)
     M6E.m6_granite_shexp(pf(xn), M["shp"], M["shc"], pf(M["sg"]), pf(M["sh"]), pf(M["shg"]),
                          pf(out), SHEXP_FFN, H)
+    # ★ FFN = moe_out + 门控共享专家。m6_granite_moe 写的是 M["mo"]，shexp 覆盖了 out
+    #   —— 这一步漏掉时 FFN 只剩 shexp（norm 0.21 vs 0.71），逐层 cos 0.9 但分段"全对"
+    #   （手工对账时手动做了相加，正好把引擎缺的这步掩盖了）。
+    out[:] = M["mo"] + out
 
 
 def forward(tid, pos):
