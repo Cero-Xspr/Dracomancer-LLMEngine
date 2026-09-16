@@ -499,6 +499,26 @@ min 0.9935 且层 0~2 pos3 = 1.000 ⇒ 状态递推无 bug）。
 **剩余收尾（下轮）**：①贪心金标准落盘（France/Germany prompt 已验证 12/12）②登记
 _ADAPTERS_ARCH + models.d ③T1/T2 用例 ④层 31~39 的 0.989~0.997 归档为 Q8_K 激活差异预期。
 
+## 阶段 1 续 📋 K2-Horizon-MoVA-36B-A4B（用户点名）——侦察完成，Tier-2 排队（2026-09-16）
+
+- **来源**：IFM/K2-Horizon-MoVA-36B-A4B（HF），官方 GGUF 仅 BF16 74.9GB；社区量化齐
+  （ngquocvinh IQ1_M 8.7GB ~ Q8 39.8GB）。本机磁盘剩 18G ⇒ IQ1_M/Q2_K_S 可下。
+- **结构（128MB 头部 Range 下载 + 手写解析，未下全量）**：arch=`k2-horizon`，48 层，
+  H=2560，dense FFN 6144，GQA 32/8×128，rope 128@1e7，上下文 512k，词表 250624（gpt2 BPE、
+  pre=k2-horizon、`<|ifm|begin_of_text|>` 族特殊 token）。
+  · **纯全注意力（无 SSM）+ 两个路由系统**：FFN MoE 100 选 8（专家 FF 768，**前 3 层 dense**、
+    共享专家 1 个 FF 768、**expert_weights_norm=1 且 expert_weights_scale=2.5**、
+    **expert_gating_func=2**——语义需查新 llama.cpp 枚举）
+  · **MoVA（创新点）= V 投影也是 MoE**：value_expert_count=64、value_expert_used_count=4
+    ⇒ 引擎没有的"值混合"算子，本次适配的唯一真新算子
+- **前置条件**：本地 b10819 **不认识 k2-horizon** ⇒ 必须先升级 llama.cpp 源码树并重建
+  build-dbg（对账 oracle 才存在），再下量化。**未下载全量**（等 oracle 就绪，避免白占 9~17GB）。
+- **工作量预估（诚实）**：Tier-2 新算子（MoVA）+ gating/scale 新语义 ⇒ 以 qwen35moe 为基准
+  （一个会话轮内 3 个 bug 全由层探针流水线定位），MoVA 预计 2~3 个会话轮——这正是
+  「兼容过程效率」的真实度量场景：驱动/夹具/金标准/闸门全套现成，新算子是唯一变量。
+- 顺带收获：手写 GGUF 头 Range 解析器（/tmp/parse_k2.py，含完整类型表）——以后评估任何
+  新模型都可以**只拉 128MB 就看清结构**，不用先下全量。
+
 ## 阶段 2b ✅（2026-09-16）：多会话状态槽
 
 - **机制**：`_SLOTS[key] = {ids, snap}`，key = system+首问哈希（同会话首问跨轮不变；撞键安全——
