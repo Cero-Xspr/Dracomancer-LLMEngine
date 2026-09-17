@@ -126,7 +126,6 @@ def _load_smol():
                 ct.memset(item.vcache, 0, n * 4)
                 item.tlen[0] = 0
     return dict(forward=E.forward, logits=E.logits_of_x, reset=reset,
-                snap_state=snap_state, restore_state=restore_state,
                 encode=lambda t: TOK.encode(t, add_special_tokens=True).ids,
                 decode=lambda ids: TOK.decode(ids), eos=EOS_ID, im_end=IM_END, max_t=MAXT,
                 system_default=DEFAULT_SYSTEM, bos=None, think_block=False, think_default=False,
@@ -307,6 +306,7 @@ def _load_ling():
     """
     global ENG, MAXT
     import os
+    import ctypes as ct
     os.environ["MODEL"] = ARGS.model
     os.environ.setdefault("MAXT", "1024")
     import ling_engine as E
@@ -335,6 +335,35 @@ def _load_ling():
                 ct.memset(ct.cast(item.S, ct.c_void_p), 0,
                           LP.NH * LP.KDA_HEAD * LP.KDA_HEAD * 4)
 
+    def snap_state():
+        parts = []
+        for item in E.KEEP:
+            if isinstance(item, E.M6MlaP):
+                ks = LP.KV_LORA + LP.ROT
+                parts.append(ct.string_at(ct.cast(item.kcache, ct.c_void_p), item.max_t * ks * 4))
+                parts.append(ct.string_at(ct.cast(item.vcache, ct.c_void_p), item.max_t * LP.KV_LORA * 4))
+                parts.append(int(item.tlen[0]).to_bytes(4, "little"))
+            elif isinstance(item, E.M6KdaP):
+                parts.append(ct.string_at(ct.cast(item.conv_state, ct.c_void_p),
+                                          3 * LP.D_INNER * (LP.CONV_K - 1) * 4))
+                parts.append(ct.string_at(ct.cast(item.S, ct.c_void_p),
+                                          LP.NH * LP.KDA_HEAD * LP.KDA_HEAD * 4))
+        return parts
+
+    def restore_state(parts):
+        i2 = 0
+        for item in E.KEEP:
+            if isinstance(item, E.M6MlaP):
+                ks = LP.KV_LORA + LP.ROT
+                ct.memmove(ct.cast(item.kcache, ct.c_void_p), parts[i2], item.max_t * ks * 4); i2 += 1
+                ct.memmove(ct.cast(item.vcache, ct.c_void_p), parts[i2], item.max_t * LP.KV_LORA * 4); i2 += 1
+                item.tlen[0] = int.from_bytes(parts[i2], "little"); i2 += 1
+            elif isinstance(item, E.M6KdaP):
+                ct.memmove(ct.cast(item.conv_state, ct.c_void_p), parts[i2],
+                           3 * LP.D_INNER * (LP.CONV_K - 1) * 4); i2 += 1
+                ct.memmove(ct.cast(item.S, ct.c_void_p), parts[i2],
+                           LP.NH * LP.KDA_HEAD * LP.KDA_HEAD * 4); i2 += 1
+
     _eos = _gguf_ids(ARGS.model, "tokenizer.ggml.eos_token_id")[0]
     MAXT = E.MAXT
     # ★★ think_block=True（2026-09-15 修正）：Bailing 模板的生成前缀同样是
@@ -346,6 +375,7 @@ def _load_ling():
     # think_default：模板里 enable_thinking 未给时 thinking_option='on' ⇒ 默认开，与模型一致
     #    （要直接给答案用 `/think off`，那会渲染成空 think 块）。
     return dict(forward=E.forward, logits=E.logits_of_x, reset=reset,
+                snap_state=snap_state, restore_state=restore_state,
                 encode=lambda t: tk.encode(t, add_special_tokens=False).ids,
                 decode=lambda ids: tk.decode(ids), eos=_eos,
                 im_end=_eos, max_t=MAXT,
