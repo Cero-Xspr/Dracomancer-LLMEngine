@@ -423,12 +423,18 @@ def _load_falcon():
     def reset():
         E.reset()
 
+    # ★ id→解码文本映射（sample 文本等价重复惩罚用）；decode_batch 一次算完
+    _vocab = len(_R.fields["tokenizer.ggml.tokens"].value)
+    pen_texts = np.array(tk.raw.decode_batch([[i] for i in range(_vocab)], skip_special_tokens=False),
+                         dtype=object)
+
     _eos = _gguf_ids(ARGS.model, "tokenizer.ggml.eos_token_id")[0]
     # 模板用 <|im_end|> 收尾：从词表里按文本找它的 id（找不到就退回 eos）
     toks = list(_R.fields["tokenizer.ggml.tokens"].value)
     im_end = toks.index("<|im_end|>") if "<|im_end|>" in toks else _eos
     # 非推理模型：模板无 think/reasoning ⇒ 思考分区关闭
     return dict(forward=E.forward, logits=E.logits_of_x, reset=reset,
+                pen_texts=pen_texts,
                 encode=lambda t: tk.encode(t).ids,
                 decode=lambda ids: tk.decode(ids, skip_special_tokens=False),
                 eos=_eos, im_end=im_end, max_t=E.MAXT,
@@ -630,12 +636,22 @@ def render_chatml_generic(messages, enable_thinking, system_default, default_sys
     return "".join(parts)
 
 
-def sample(logits, temp, seed_rng, repeat_penalty, recent):
-    """温度采样 + 简单重复惩罚。temp=0 ⇒ 贪心。"""
+def sample(logits, temp, seed_rng, repeat_penalty, recent, pen_texts=None):
+    """温度采样 + 简单重复惩罚。temp=0 ⇒ 贪心。
+
+    ★ pen_texts（id→解码文本）：按文本等价惩罚——字节级 BPE 词表里惩罚「你好」的
+      token id 后，模型会用字节序列重新表达同一文本（不同 id 逃过惩罚）⇒ 字节碎片+�。
+      文本等价惩罚把所有 token 化路径一起抑制。"""
     z = logits.astype(np.float64).copy()
     if repeat_penalty and repeat_penalty > 1.0 and recent:
-        for t in list(recent)[-64:]:
-            z[t] /= repeat_penalty if z[t] > 0 else z[t] * repeat_penalty
+        if pen_texts is not None:
+            texts = {pen_texts[t] for t in list(recent)[-64:]}
+            for t in range(len(z)):
+                if z[t] > 0 and pen_texts[t] in texts:
+                    z[t] /= repeat_penalty
+        else:
+            for t in list(recent)[-64:]:
+                z[t] /= repeat_penalty if z[t] > 0 else z[t] * repeat_penalty
     if temp and temp > 0:
         p = np.exp((z - z.max()) / temp)
         p /= p.sum()
@@ -743,7 +759,11 @@ def _gen_locked(ids, n_gen, temp, seed, repeat_penalty, think_now, hold=None, sk
     for i in range(n_gen):
         _q = time.perf_counter()
         lg = AP["logits"]()
-        nid = sample(lg, temp, rng, repeat_penalty, gen_ids)
+        # ★ 惩罚窗 = prompt+生成的最后 64 token（llama.cpp 同式，含 prompt 抑制复读）；
+        #   只罚已生成时，字节级词表模型会换 token 化复读 prompt（falcon temp=0 乱码实证）
+        recent = (ids + gen_ids)[-64:]
+        nid = sample(lg, temp, rng, repeat_penalty, recent,
+                     pen_texts=AP.get("pen_texts"))
         if _prof:
             _q2 = time.perf_counter(); _p["logits"] += _q2 - _q
         if nid == AP["eos"] or nid == AP["im_end"]:

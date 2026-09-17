@@ -52,6 +52,7 @@ def build(model=MODEL, add_bos=True, pre="llama3"):
         def __init__(self, ab):
             self._ab = ab
             self.bos = bos
+            self.raw = tk          # 底层 Tokenizer（decode_batch 等）
 
         def encode(self, text, add_special_tokens=False):
             e = tk.encode(text, add_special_tokens=False)
