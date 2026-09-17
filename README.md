@@ -19,9 +19,23 @@ Dracomancer 是一个自研的 **GGUF 量化推理引擎**（端侧优先：内�
 | `src/gguf_fast.py` | **只读 GGUF 解析器**（gguf-py 的兼容子集）：元数据解析快 40~50×，见下 |
 | `src/gguf_probe.py` | **能力探针**：加载之前静态判定（类型被移除 / 架构未实现 / 可能可以） |
 | `src/hwprobe.py` | 功率传感器按 name+label 定位（不按 hwmon 编号——编号会变） |
+| [DESIGN.md](DESIGN.md) | 引擎分层架构、验证方法论、性能档位（脱敏版） |
 | `tests/` | 自带对账/单测：`gguf_fast_check.py`（逐字节对账 gguf-py）、`test_think_split.py`（思考分区不变式）、`backend_ab.py`（后端单轮对拍） |
 | `release/validate_submission.py` | 提交校验器（schema/白名单 + 可选 GGUF 匹配核对） |
 | `.github/` | 「模型适配」issue 表单 + 自动校验 bot（只做 schema 级过滤，不替代人工复核） |
+
+### 引擎家族与测试
+
+当前已接入 **8 个模型家族**（llama / zaya / bailingmoe3 / granitehybrid / falcon-h1 /
+qwen35 / qwen35moe + bitnet 登记），每个都过「逐层对账 + 算子级单热验证 + 端到端贪心
+逐 token 一致」三层证据才登记——判据与实测值在 `tests/golden/*.json`。
+
+`tests/run.py` 是分层测试入口（T0 免模型秒级可进 CI / T1 小模型 / T2 大模型对账）；
+共享代码路径的改动必须过「逐位指纹」闸门。架构与验证方法学的完整描述见 [DESIGN.md](DESIGN.md)。
+
+服务端支持 OpenAI 兼容接口、多轮上下文增量复用（第二轮 TTFT 毫秒级）、
+多会话状态槽（交替会话不互相冲掉缓存）；无 AVX-512 的机器自动落到标量回退内核
+（慢 ~16× 但结果正确）。
 
 ### 三个诊断命令
 
