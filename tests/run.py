@@ -443,6 +443,33 @@ def t1_qwen35moe_greedy():
     return True, f"{len(exp)}/{len(exp)} token 与 llama.cpp 贪心一致"
 
 
+def t2_qwen35moe_layers():
+    """qwen35moe 逐层对账：pos 0..3 × 40 层，阈值 0.985（IQ3_S+Q8_K 激活量化差异，
+    实测最差 0.98822）。dump 缺失时用夹具现场生成。"""
+    for p in range(4):
+        d = f"/tmp/qmrec{p}"
+        if not glob.glob(d + "/l_out-0.*.bin"):
+            fix = _find_file("zaya_gdump")
+            if fix is None:
+                return False, "缺夹具 zaya_gdump 且无缓存 dump"
+            S = "/media/xiao_/OverSys1/npu-direct/llama.cpp-b10819/build-dbg/bin"
+            os.makedirs(d, exist_ok=True)
+            r = subprocess.run([fix, "/media/xiao_/OverSys1/gguf/Qwen3.6-35B-A3B-REAP-48-v2.gguf",
+                                "760,6511,314,9338,369", d],
+                               env={**os.environ, "LD_LIBRARY_PATH": S, "ZDUMP_POS": str(p)},
+                               capture_output=True, text=True, timeout=1800)
+            if r.returncode != 0:
+                return False, f"夹具失败 pos{p}: {r.stderr[-150:]}"
+    m = os.environ.get("QWEN35MOE_MODEL",
+                       "/media/xiao_/OverSys1/gguf/Qwen3.6-35B-A3B-REAP-48-v2.gguf")
+    if not os.path.isfile(m):
+        return False, f"缺 qwen35moe 模型（{m}）"
+    g = _find_file("qwen35moe_layer_gate.py") or _find_script("qwen35moe_layer_gate.py")
+    rc, out = _run([PY, g], timeout=3600, env={"MODEL": m, "QWEN35MOE_MODEL": m})
+    line = [x for x in out.splitlines() if x.startswith(("✅", "❌"))]
+    return rc == 0, (line[-1][2:].strip() if line else out[-200:])
+
+
 def t2_granite_s4d_layers():
     """S4D 逐层对账：pos 0..3 × 全部 36 个 SSM 层的链头 cos 必须 ≥ 0.9990。
     阈值取自实测（本轮记录的最小值 0.999147），不另立标准。"""
@@ -511,6 +538,7 @@ def main():
              ("t1_qwen35moe_greedy", 1, t1_qwen35moe_greedy),
              ("t2_granite_s4d_layers", 2, t2_granite_s4d_layers),
              ("t2_qwen35_layers", 2, t2_qwen35_layers),
+             ("t2_qwen35moe_layers", 2, t2_qwen35moe_layers),
              ("t2_falcon_layers", 2, t2_falcon_layers),
              ("t2_ling_fingerprint", 2, t2_ling_fingerprint)]
     if A.list:

@@ -12,5 +12,5 @@ def scalar():
 def paths():
     if scalar():
         return ("m5_kern_scalar.so",) * 5
-    return ("/m5/m5_kern6.so", "/m5/m5_kern9.so", "/m5/m5_kern8.so",
-            "/m5/m5_kern7.so", "/m5/m5_kernF.so")
+    return ("m5_kern6.so", "m5_kern9.so", "m5_kern8.so",
+            "m5_kern7.so", "m5_kernF.so")
