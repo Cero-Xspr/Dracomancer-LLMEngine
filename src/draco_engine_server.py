@@ -518,7 +518,7 @@ def _load_qwen35():
                 decode=lambda ids: tk.decode(ids, skip_special_tokens=False),
                 eos=_eos, im_end=_eos, max_t=E.MAXT,
                 system_default=None, bos=None,
-                think_block=False, think_default=False,
+                think_block=True, think_default=False,   # ★ REAP 剪枝版即兴开 think（中→英漂移+自我纠正），开分区显示为思考区
                 state_arrays=(lambda: E.STATES) if hasattr(E, "STATES") else None,
                 render=render)
 
