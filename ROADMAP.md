@@ -531,6 +531,15 @@ fork/join）+ tied head（232MB/token，granite ~10ms）+ Python 侧编排。
 真要提速的路径变成：①tied head 量化或降精度（granite 专属大项）②非 gemv 逐元素算子融合进
 gemv 出口 ③每算子 fork/join 合并（ZAYA 时代的老结论仍成立）。均记为可选专项，非发行阻塞。
 
+**★ 速度结论修正（2026-09-17，用户实测驱动）**：性能模式重测 granite（dengine 26.2/20.7
+vs llama.cpp CPU 20.4/30.1，交替两轮）⇒ **性能模式下两者打平**（中位 23 vs 25，交替胜负）；
+省电档「dengine 更快」只适用省电档。用户实测 qwen35 2B dengine = llama.cpp 的 85%
+（性能模式，含非剪枝版）⇒ 采纳记录。iGPU 21.9 也是省电档数，性能模式下需重测。
+**所有速度结论必须按（供电 × EPP 档）双条件记录。**
+falcon-h1 乱码（中→英跳变+�）判定：temp=0 同解码路径完全干净（贪心+serve 双验）；
+temp 0.6/0.7 基本连贯 ⇒ 0.5B 模型在采样/长生成下进入字节级 token 循环（� 为模型输出的
+真实无效 UTF-8），非解码 bug。qwen35(moe) think_block=True 已改（即兴 think 显示为思考区）。
+
 - **来源**：IFM/K2-Horizon-MoVA-36B-A4B（HF），官方 GGUF 仅 BF16 74.9GB；社区量化齐
   （ngquocvinh IQ1_M 8.7GB ~ Q8 39.8GB）。本机磁盘剩 18G ⇒ IQ1_M/Q2_K_S 可下。
 - **结构（128MB 头部 Range 下载 + 手写解析，未下全量）**：arch=`k2-horizon`，48 层，
