@@ -21,6 +21,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
 sys.path.insert(0, "/media/xiao_/OverSys1/npu-direct/llama.cpp-b10819/gguf-py")
 import gguf  # noqa: E402
+import m5sel
 import gguf_fast  # noqa: E402
 
 MODEL = os.environ.get("MODEL", "/media/xiao_/OverSys1/gguf/Qwen3.5-2B-f16.gguf")
@@ -91,8 +92,7 @@ CODE = {'Q8_0': 0, 'IQ4_NL': 1, 'IQ3_S': 2, 'Q5_K': 3, 'Q6_K': 4, 'Q4_K': 5, 'IQ
 M6E = ct.CDLL(os.environ.get("M6_SO", os.path.join(BASE, "m6_engine.so")))
 M6E.m6_init_dl.argtypes = [ct.c_char_p] * 5
 M6E.m6_init_dl.restype = ct.c_int
-_rc = M6E.m6_init_dl(*[(os.path.join(BASE, "m5") + "/" + n).encode() for n in
-                       ("m5_kern6.so", "m5_kern9.so", "m5_kern8.so", "m5_kern7.so", "m5_kernF.so")])
+_rc = M6E.m6_init_dl(*[(os.path.join(BASE, "m5") + "/" + n).encode() for n in m5sel.paths()])
 assert _rc == 0, f"m6_init_dl rc={_rc}"
 for _n, _a, _r in (("m6_gdn_attn",
                     [ct.POINTER(ct.c_float), ct.c_void_p, ct.POINTER(ct.c_float),

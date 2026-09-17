@@ -17,6 +17,7 @@ import ctypes as ct, numpy as np, sys, time, os as _os
 MODEL = _os.environ.get("MODEL", "/media/xiao_/OverSys1/gguf/smol/SmolLM2-360M-Instruct-Q4_K_M.gguf")
 
 # ===================== ② 元数据 → 超参 (llama 家族) =====================
+import m5sel
 import gguf_fast as _gf
 import gguf
 # ★ 元数据解析换 gguf_fast（gguf.GGUFReader 在 llama32-1B 上 6.4s / ZAYA 上 13.6s，
@@ -65,7 +66,7 @@ M6E = ct.CDLL(_os.environ.get("M6_SO", BASEDIR + "m6_engine.so"))
 M6E.m6_init_dl.argtypes = [ct.c_char_p] * 5; M6E.m6_init_dl.restype = ct.c_int
 M6E.m6_init_extra_dl.argtypes = [ct.c_char_p]; M6E.m6_init_extra_dl.restype = ct.c_int
 _rc = M6E.m6_init_dl(*( (BASEDIR + "m5/" + n).encode() for n in
-                      ("m5_kern6.so", "m5_kern9.so", "m5_kern8.so", "m5_kern7.so", "m5_kernF.so")))
+                      m5sel.paths()))
 assert _rc == 0, f"m6_init_dl rc={_rc}"
 _rc2 = M6E.m6_init_extra_dl((BASEDIR + "m5/m5_kern11.so").encode())
 assert _rc2 == 0, f"Q5_0 内核加载失败 rc={_rc2} (m5_kern11.so 存在?)"

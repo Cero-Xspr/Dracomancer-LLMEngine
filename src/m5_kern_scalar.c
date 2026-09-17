@@ -10,7 +10,11 @@ static inline float f16tof32(uint16_t h) {
     const uint32_t sign = (uint32_t)(h & 0x8000) << 16;
     const uint32_t exp  = (h >> 10) & 0x1F, man = h & 0x3FF;
     uint32_t o;
-    if (exp == 0)  o = (man == 0) ? sign : sign | (0x03800000u + (man << 13));
+    if (exp == 0) {
+        if (man == 0) { o = sign; }
+        else { float v = (float)man * 5.9604644775390625e-8f;   // = man×2^-24，唯一正确写法
+               uint32_t vi; memcpy(&vi, &v, 4); o = sign | vi; }
+    }
     else if (exp == 31) o = sign | 0x7F800000u | (man << 13);
     else o = sign | ((exp + 112u) << 23) | (man << 13);
     float f; memcpy(&f, &o, 4); return f;
@@ -125,8 +129,9 @@ static float dot_row(int code, const uint8_t* row, const float* x, int n_in) {
                     float acc = 0.f;
                     for (int k = 0; k < 16; k++) {
                         const int kk = halfg * 16 + k;
-                        const int nib = (qlB[g2 * 64 + half * 32 + k] >> (sel * 4)) & 0xF;
-                        const int b2 = (qhB[g3 * 32 + k] >> shl) & 0x3;
+                        // ★ 字节索引用 kk（行内 0..31）——k 只是 16 组内的位置
+                        const int nib = (qlB[g2 * 64 + half * 32 + kk] >> (sel * 4)) & 0xF;
+                        const int b2 = (qhB[g3 * 32 + kk] >> shl) & 0x3;
                         acc += (float)((nib | (b2 << 4)) - 32) * x[b * 256 + r * 32 + kk];
                     }
                     dot += dsc * acc;
