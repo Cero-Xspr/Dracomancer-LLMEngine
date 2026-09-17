@@ -126,6 +126,7 @@ def _load_smol():
                 ct.memset(item.vcache, 0, n * 4)
                 item.tlen[0] = 0
     return dict(forward=E.forward, logits=E.logits_of_x, reset=reset,
+                snap_state=snap_state, restore_state=restore_state,
                 encode=lambda t: TOK.encode(t, add_special_tokens=True).ids,
                 decode=lambda ids: TOK.decode(ids), eos=EOS_ID, im_end=IM_END, max_t=MAXT,
                 system_default=DEFAULT_SYSTEM, bos=None, think_block=False, think_default=False,
@@ -174,6 +175,33 @@ def _load_zaya():
             if pcp.tlen:
                 ct.cast(pcp.tlen, ct.POINTER(ct.c_int))[0] = 0
         Z.RH[:] = 0.0                      # EDA 递推状态
+
+    # 字节级快照/恢复（会话槽）：字段与尺寸严格镜像 reset()
+    def snap_state():
+        parts = []
+        for pcp in Z.cca_ps:
+            for f, n in (("conv_state", 2 * 1280), ("kbuf", 1024 * 256),
+                         ("vbuf", 1024 * 256), ("vdel", 128)):
+                b = getattr(pcp, f)
+                parts.append(ct.string_at(ct.cast(b, ct.c_void_p), n * 4) if b else b"")
+            parts.append((ct.cast(pcp.tlen, ct.POINTER(ct.c_int))[0]).to_bytes(4, "little")
+                         if pcp.tlen else b"")
+        parts.append(Z.RH.tobytes())
+        return parts
+
+    def restore_state(parts):
+        i = 0
+        for pcp in Z.cca_ps:
+            for f, n in (("conv_state", 2 * 1280), ("kbuf", 1024 * 256),
+                         ("vbuf", 1024 * 256), ("vdel", 128)):
+                b = getattr(pcp, f)
+                if b:
+                    ct.memmove(ct.cast(b, ct.c_void_p), parts[i], n * 4)
+                i += 1
+            if pcp.tlen:
+                ct.cast(pcp.tlen, ct.POINTER(ct.c_int))[0] = int.from_bytes(parts[i], "little")
+                i += 1
+        Z.RH[:] = np.frombuffer(parts[i], np.float32)
 
     # ---- head（共享词嵌入）：与 zaya_gguf GEN 块同源 ----
     onw = np.frombuffer(bytes(Z.T["output_norm.weight"].data), np.float32).copy()
@@ -264,6 +292,7 @@ def _load_zaya():
                 encode=enc, decode=decode, eos=eos, im_end=im_end, max_t=MAXT,
                 system_default=None, bos=2, vsz=vsz,
                 think_block=True, think_default=True,   # ZAYA 模板默认开思考，用空 think 块关
+                snap_state=snap_state, restore_state=restore_state,
                 render=render)
 
 
@@ -756,13 +785,19 @@ def _gen_locked(ids, n_gen, temp, seed, repeat_penalty, think_now, hold=None, sk
         "predicted_n": len(out), "predicted_per_second": round(len(out) / dec_s, 1) if dec_s else 0,
         "ttft_ms": ttft_ms,
     }
-    # ★ 生成结束：把状态快照进会话槽（LRU 2 槽；无 state_arrays 的引擎跳过）
-    if skey is not None and AP.get("state_arrays"):
-        _SLOTS[skey] = {"ids": list(_CTX_CACHE["ids"]),
-                        "snap": [a.copy() for a in AP["state_arrays"]()]}
+    # ★ 生成结束：把状态快照进会话槽（LRU 2 槽；numpy 数组槽 / 字节快照槽两种引擎）
+    if skey is not None:
+        if AP.get("state_arrays"):
+            _SLOTS[skey] = {"ids": list(_CTX_CACHE["ids"]),
+                            "snap": [a.copy() for a in AP["state_arrays"]()]}
+        elif AP.get("snap_state"):
+            _SLOTS[skey] = {"ids": list(_CTX_CACHE["ids"]), "snap": AP["snap_state"]()}
+        else:
+            _SLOTS.pop(skey, None)
         if skey in _SLOT_ORDER:
             _SLOT_ORDER.remove(skey)
-        _SLOT_ORDER.append(skey)
+        if skey in _SLOTS:
+            _SLOT_ORDER.append(skey)
         while len(_SLOT_ORDER) > _MAX_SLOTS:
             old = _SLOT_ORDER.pop(0)
             _SLOTS.pop(old, None)
