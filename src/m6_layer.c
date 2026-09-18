@@ -340,8 +340,25 @@ void m6_gdn_attn(const float* h1, const GdnW* w, float* ssm, float* tail,
         }
     }
     ms = 0.f;   /* ★ 必须重置: ms 前面用于 xn 的 rms */
-    #pragma omp parallel for schedule(static) reduction(+:ms)
-    for (int i = 0; i < 2048; i++) { x2_out[i] = h1[i] + attn[i]; ms += x2_out[i] * x2_out[i]; }
+    {   // ★ 确定性求和：reduction(+:ms) 的累加顺序随调度漂移（实测同状态两次
+        //   forced-logits 差 ~1.4e-5 的唯一来源），改成 static 分块 + 每线程部分和
+        //   固定槽 + 区外按序相加 ⇒ 并行度不变、每次运行逐位一致。
+        const int NT = omp_get_max_threads();
+        float part[128];
+        for (int i = 0; i < NT && i < 128; i++) part[i] = 0.f;
+        #pragma omp parallel
+        {
+            const int tid = omp_get_thread_num();
+            float p = 0.f;
+            #pragma omp for schedule(static) nowait
+            for (int i = 0; i < 2048; i++) {
+                x2_out[i] = h1[i] + attn[i];
+                p += x2_out[i] * x2_out[i];
+            }
+            if (tid < 128) part[tid] = p;
+        }
+        for (int i = 0; i < NT && i < 128; i++) ms += part[i];
+    }
     inv = 1.f / sqrtf(ms / 2048.f + EPS);
     for (int i = 0; i < 2048; i++) x2n[i] = x2_out[i] * inv * w->post_norm[i];
 }

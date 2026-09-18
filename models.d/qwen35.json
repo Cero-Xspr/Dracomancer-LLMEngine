@@ -17,7 +17,7 @@
       "selfcheck_ref": "reconcile:qwen35:layers-cos1.00000:greedy-12/12"
     }
   },
-  "notes": "Qwen3.5 2B（general.name=Master 无意义，按架构匹配）。25 块 = 24 主图层（19 GDN + 6 全注意力）+ 1 MTP。全 f16。",
+  "notes": "Qwen3.5 2B（general.name=Master 无意义，按架构匹配）。25 块 = 24 主图层（19 GDN + 6 全注意力）+ 1 MTP。全 f16。\n\n★★ 2026-09-19 夜班：f16 → Q8_0 量化版（llama-quantize 生成 `/media/xiao_/OverSys1/gguf/Qwen3.5-2B-Q8_0.gguf`，2.08GB vs f16 3.9GB）。\n该模型是 f16 时每 token 读 4GB ⇒ 本就贴着带宽屋顶跑；Q8_0 后实测（AC×性能/8线程/dengine）14.6→22.2 t/s（1.52×），\n**48 个贪心 token 与 f16 逐个一致**（Q8_0 近无损）。两份文件并存，按文件选择即可。",
   "source": {
     "author": "maintainer",
     "date": "2026-09-16",

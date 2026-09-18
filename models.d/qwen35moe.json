@@ -16,7 +16,7 @@
       "selfcheck_ref": "reconcile:qwen35moe:layers-cos>=0.99:greedy-12/12"
     }
   },
-  "notes": "Qwen3.6 35B A3B REAP-48-v2（本机 9.4GB 量化版；另有 UD-IQ4_NL_XL 19.5GB 未测）。40 层 = 30 GDN + 10 全注意力，MoE 133 选 8 + 门控共享专家，GQA 16/2×256，MRoPE 分段同 qwen35。",
+  "notes": "Qwen3.6 35B A3B REAP-48-v2（本机 9.4GB 量化版；另有 UD-IQ4_NL_XL 19.5GB 未测）。40 层 = 30 GDN + 10 全注意力，MoE 133 选 8 + 门控共享专家，GQA 16/2×256，MRoPE 分段同 qwen35。\n\n★★★ 2026-09-19 夜班提速 1.7×（贪心 5.4→9.6 t/s，AC×性能/8线程/dengine；同机 llama.cpp 11.1 t/s ⇒ 追到 86%）：\n① MoE 专家段行分块（m6_layer.c moe_experts，MOE_CHUNK=64 默认）：每行点积不变 ⇒ 逐位不变，端到端配对 1.05-1.10×；\n② GDN/全注意力/head 词表投影的大 gemv 行分段并行（g_gdn_seg）：此前 qkv(6144×2048) 等每层 ~20MB 只有 1 核在读，\n   分段后同进程配对 1.40-1.47×（GDN 36ms→~25ms，head 12.5→~3ms 量级）；每行仍由同一内核按原序计算 ⇒ 逐位不变。\n③ kern12 整数快路径（DRACO_IQ3_FAST=1 opt-in）：bench 1.12-1.45×，但整数累加经 40 层残差放大后逐层 cos 0.9829<0.985\n   （mode12/13 都红），贪心 12/12 虽过，按闸门纪律不上默认。\n★ 引擎固有现象（与本次改动无关，chunk=0 也复现）：同状态两次 forced-logits max|Δ|~1.4e-5（疑某并行归约顺序不定），\n  不影响贪心/cos 闸门，但**该家族不能加逐位指纹闸门**。\n★ 投机解码尽调（2026-09-19）：ngram 接受率实测——复读/改写类每步 4.2-5.3 个（K=8）、聊天类≈0；\n  供给侧 GDN 层按位置严格串行 ⇒ 跨位置权重摊薄结构性不可行（40 层仅 10 层全注意力可批，验证加速上限 ~1.07×）。\n  **结论：本架构上投机解码结构性不赚**；解锁条件 = 纯稠密模型 + 同词表草稿 + skinny-GEMM 内核，三者本 zoo 均缺。",
   "source": {
     "author": "maintainer",
     "date": "2026-09-16",
