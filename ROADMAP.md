@@ -784,3 +784,18 @@ head_dim 256（全注意力层）、GQA 8/2，**rope 分段 [11,11,10,0]**，SSM
   ②批处理内核（[T×in]×[in×out] skinny-GEMM，IQ3_S/Q6_K 热格式优先）③full-attn 层的批 KV 追加。
   做完标准：pp256 ≥ llama.cpp CPU 的 80%（~70 t/s），贪心续接与逐 token 路径一致（阈值闸门）。
 - **副产品**：skinny-GEMM 一旦存在，投机解码的验证批处理墙也被拆掉（见上节）—— 一石二鸟。
+
+#### prefill 悬崖的攻坚设计（2026-09-19 凌晨分析，供立项）
+- **设计真相**：prefill 的钱都花在**重复读权重**上（每 token 一遍全套 gemv）。llama.cpp 的路子：
+  ①每层投影（qkv/gate/in_proj）对**全部 T 个位置一次 matmul**（权重只读一遍）；
+  ②状态类算子（ssm_scan/gdn）在内核里**逐 token 走状态但只碰激活**（128×128 小状态在缓存里，不碰权重）；
+  ③MoE/FFN 在 T 个位置上批处理（专家按 union 去重后每专家一次 GEMM）。
+- **我们对应的三件套**：①skinny-GEMM 内核（[T×in]×[in×out]，热格式 Q6_K/IQ3_S/Q8_0 优先）
+  ②GDN 的「批投影 + 逐 token 状态扫描」两段式（扫描只碰 q/k/v/β/g 激活与 S 状态）
+  ③MoE 按位置批处理（需要 GDN 输出全位置可得 ⇒ 引出 chunked/associative scan，delta rule
+  S_t = g_t(I−β_t k_tk_tᵀ)S_{t-1} + β_t k_tv_tᵀ 满足结合律；llama.cpp 89.7 t/s 说明全管线可行，直接读它的
+  qwen35moe.cpp + ggml ssm/scan 实现做 oracle）。
+- **里程碑**：M1 两段式 GDN（MoE 仍逐 token）预期 13.7→~25 t/s；M2 MoE 位置批处理 → 冲 70-90；
+  验收 = pp256 ≥ llama.cpp CPU 80% 且贪心续接与逐 token 路径一致。副产品：投机解码验证墙同步拆除。
+- **教训（流程）**：用 pkill -f 收自己的测试服务会把外层 bash 包装器一起匹配杀掉（本次整个命令块被截断、
+  追加与提交都没执行）——测试服务一律用 nohup 时记下 PID 再按 PID kill。
