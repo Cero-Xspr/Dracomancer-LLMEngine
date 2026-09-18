@@ -418,6 +418,14 @@ print(f"INC_EQ={np.array_equal(LA, LB)} DMAX={np.abs(LA-LB).max():.2e}")
     return True, "增量续转 ≡ 全量重跑（logits 逐位相同，max|Δ|=0）"
 
 
+def t1_load_smoke():
+    """8 家族装载冒烟：每家 load_engine + prefill + 4 贪心 token。
+    防回归场景：适配器批量编辑误伤（smol/ling snap_state NameError 事故）那类"打不开"。"""
+    s = _find_script("load_smoke.py")
+    rc, out = _run([PY, s], timeout=900, env={"ONLY": ""})
+    return rc == 0, out
+
+
 def t1_qwen35moe_greedy():
     """qwen35moe（35B A3B REAP）：金标准 = llama.cpp ZGREEDY 12 token。
     计数类 prompt 有量化噪声分叉（IQ3_S+Q8_K vs fp32），金标准用真实句子。"""
@@ -536,6 +544,7 @@ def main():
              ("t1_llama_greedy", 1, t1_llama_greedy), ("t1_qwen35_greedy", 1, t1_qwen35_greedy),
              ("t1_incremental_state", 1, t1_incremental_state),
              ("t1_qwen35moe_greedy", 1, t1_qwen35moe_greedy),
+             ("t1_load_smoke", 1, t1_load_smoke),
              ("t2_granite_s4d_layers", 2, t2_granite_s4d_layers),
              ("t2_qwen35_layers", 2, t2_qwen35_layers),
              ("t2_qwen35moe_layers", 2, t2_qwen35moe_layers),

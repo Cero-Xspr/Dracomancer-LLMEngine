@@ -773,3 +773,14 @@ head_dim 256（全注意力层）、GQA 8/2，**rope 分段 [11,11,10,0]**，SSM
   直译大概率仍算力受限；真工作是把热格式改写成**查表/向量友好**的 GPU 内核（LUT+VBMI2 方向），
   不是简单移植 —— 这修正了此前"带宽受限、写内核就能赢"的旧假设（B4 节）。
 - NPU：FLM 官方路线对支持的模型仍是能效王（0.29 J/token）；自研 NPU 路线前置阻塞未变。
+
+### 🔥 B-新（2026-09-19 凌晨实测）：**prefill 悬崖** —— 下一个大项目的头号候选
+- **数字**（qwen35moe，pp256，AC×性能）：dengine **13.7 t/s**（256 tok = 18.7s）vs llama.cpp CPU **89.7**（6.5×）vs
+  Vulkan iGPU **259.7**（19×）。聊天历史 500 token ⇒ 我们 TTFT ~36s（decode 追平之后，这才是体验上的真差距）。
+- **根因**：我们的 prefill = 逐 token decode 循环（每 token 全套 gemv）；llama.cpp 有**位置批处理 matmul** +
+  GDN/Mamba 类的**分块并行扫描**（delta rule 的状态递推满足结合律：S_t = g_t·S_{t-1} + k_t⊗δ_t 可按块合并）。
+- **prefill 算子分布**（192 tok，包裹计时）：MoE 43% / GDN 32% / head 10% / 全注意力 8% / shexp 4%。
+- **项目范围**：①GDN 分块扫描（结合律合并，参照 granite ssm_scan 的 llama.cpp 逐行核对法，oracle 现成）
+  ②批处理内核（[T×in]×[in×out] skinny-GEMM，IQ3_S/Q6_K 热格式优先）③full-attn 层的批 KV 追加。
+  做完标准：pp256 ≥ llama.cpp CPU 的 80%（~70 t/s），贪心续接与逐 token 路径一致（阈值闸门）。
+- **副产品**：skinny-GEMM 一旦存在，投机解码的验证批处理墙也被拆掉（见上节）—— 一石二鸟。
