@@ -94,6 +94,17 @@ M6E.m6_init_dl.argtypes = [ct.c_char_p] * 5
 M6E.m6_init_dl.restype = ct.c_int
 _rc = M6E.m6_init_dl(*[(os.path.join(BASE, "m5") + "/" + n).encode() for n in m5sel.paths()])
 assert _rc == 0, f"m6_init_dl rc={_rc}"
+# IQ3_S 整数快速路径（kern12，AVX-512 i32gather）：bench_moe 交错实测比 kern6 浮点路径
+# 快 ~1.12-1.45×（该核算力受限）。★ 默认关：整数累加与浮点路径微差 max|Δ|≈2e-4/矩阵，
+# 经 40 层残差放大后逐层 cos 掉到 0.9829 < 0.985 阈值（2026-09-19 闸门实测红），
+# 贪心 12/12 虽仍过，按「闸门红=不上默认」纪律只作 opt-in 速度实验档。
+# DRACO_IQ3_FAST=1 开启。标量回退模式下不可用（kern12 是 AVX-512 专用）。
+if not m5sel.scalar() and os.environ.get("DRACO_IQ3_FAST", "0") == "1":
+    M6E.m6_init_iq3_dl.argtypes = [ct.c_char_p]
+    M6E.m6_init_iq3_dl.restype = ct.c_int
+    _rc2 = M6E.m6_init_iq3_dl(os.path.join(BASE, "m5", "m5_kern12.so").encode())
+    if _rc2 != 0:
+        print(f"[qwen35] IQ3_S 快路径加载失败 rc={_rc2}（退回 kern6 浮点路径）", flush=True)
 for _n, _a, _r in (("m6_gdn_attn",
                     [ct.POINTER(ct.c_float), ct.c_void_p, ct.POINTER(ct.c_float),
                      ct.POINTER(ct.c_float), ct.POINTER(ct.c_float), ct.POINTER(ct.c_float),

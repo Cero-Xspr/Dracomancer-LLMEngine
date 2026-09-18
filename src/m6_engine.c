@@ -373,7 +373,20 @@ void m6_kda_op(const float* xn, void* pv, int pos, float* out) {
 int m6_head_op(const float* x, const float* final_norm, int h, float eps,
                const uint8_t* head_w, int code, int vocab, float* logits, float* scratch) {
     m6_rms_norm(x, final_norm, h, eps, scratch);
-    gemv_any(code, scratch, head_w, vocab, h, logits);
+    // 词表矩阵 250MB 级（qwen35moe vocab=248320），单线程 gemv 只有一核在读。
+    // 行分段（绝对行号语义）→ 每行点积不变 ⇒ 逐位不变。HEAD_SEG=0 回单线程。
+    if (g_gdn_seg) {
+        const int NS = omp_get_max_threads();
+        #pragma omp parallel
+        {
+            #pragma omp for schedule(dynamic)
+            for (int s = 0; s < NS; s++)
+                gemv_range_any(code, scratch, head_w, vocab, h, logits,
+                               s * vocab / NS, (s + 1) * vocab / NS);
+        }
+    } else {
+        gemv_any(code, scratch, head_w, vocab, h, logits);
+    }
     return 0;
 }
 
