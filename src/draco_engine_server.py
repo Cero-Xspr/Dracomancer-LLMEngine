@@ -565,6 +565,35 @@ def _load_qwen35():
     return ap
 
 
+def _load_k2():
+    """K2-Horizon（k2-horizon 架构，MoVA）适配器。
+
+    架构要点见 k2_engine.py。oracle = 官方 transformers 实现（k2_numpy 对拍 max|Δ|=1.4e-7）。
+    ★ 已知性能特征：模型 22.4GB > 可用内存 ⇒ 每 token 激活 2.68GB 权重从磁盘流式读
+    （实测 ~6.7 GB/s ≈ S730 顺序读上限），decode 0.4-0.6 s/token。K2_PREFETCH=1 时按上次
+    路由做专家预读（SS-MoE 思路）。"""
+    import k2_engine as E
+    import falcon_tok as FT
+    tk, _R = FT.build(ARGS.model, add_bos=False, pre="llama3")   # pre=k2-horizon 的正则与 llama3 相同
+    render = _template_renderer(ARGS.model, think_default=False)
+    if render is None:
+        raise SystemExit("K2 的 GGUF 里没有 chat_template")
+
+    def reset():
+        E.reset()
+
+    _eos = _gguf_ids(ARGS.model, "tokenizer.ggml.eos_token_id")[0]   # 1 = <|ifm|endoftext|>
+    ap = dict(forward=E.forward, logits=E.logits_of_x, reset=reset,
+              encode=lambda t: tk.encode(t).ids,
+              decode=lambda ids: tk.decode(ids, skip_special_tokens=False),
+              eos=_eos, im_end=_eos, max_t=E.MAXT,
+              system_default=None, bos=0,
+              think_block=False, think_default=False,
+              state_arrays=(lambda: E.STATES) if hasattr(E, "STATES") else None,
+              render=render)
+    return ap
+
+
 def _require_avx512():
     """发布前硬需求的第一步：m5/m6 内核是 -march=native + AVX-512 手写，没有 AVX-512
     的机器 dlopen 后首条 SIMD 指令就是 SIGILL（段错误样子的崩溃）。这里在装载前给出
@@ -597,8 +626,10 @@ def load_engine():
         AP = _load_llama()
     elif ARGS.engine in ("qwen35", "qwen35moe"):
         AP = _load_qwen35()
+    elif ARGS.engine == "k2":
+        AP = _load_k2()
     else:
-        raise SystemExit(f"未知引擎 {ARGS.engine}（当前支持：smol / zaya / ling / granite / falcon / llama / qwen35(+moe)）")
+        raise SystemExit(f"未知引擎 {ARGS.engine}（当前支持：smol / zaya / ling / granite / falcon / llama / qwen35(+moe) / k2）")
     MAXT = AP["max_t"]
     print(f"[SRV] 引擎就绪：{ARGS.model}  ctx<={MAXT}", flush=True)
 
