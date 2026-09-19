@@ -109,6 +109,40 @@ def wview(name):
 
 STATES = []
 
+# ── 专家预取（SS-MoE 思路：按上次路由预读本 token 的专家权重，内核异步 I/O 与计算重叠）──
+_PREFETCH = os.environ.get("K2_PREFETCH", "1") == "1"
+try:
+    _FD = R._fd.fileno() if hasattr(R, "_fd") and hasattr(R._fd, "fileno") else None
+except Exception:
+    _FD = None
+_LAST_SEL = {}   # li -> [sel_v, sel_moe]
+
+
+def _advise(name, off, length):
+    if _FD is None:
+        return
+    t = T.get(name)
+    if t is None:
+        return
+    try:
+        os.posix_fadvise(_FD, t.data_offset + off, length, os.POSIX_FADV_WILLNEED)
+    except OSError:
+        pass
+
+
+def prefetch_experts(li, sel_v, sel_moe):
+    """按上次 token 的路由预取本 token 可能用到的专家（86% GoodPrefetch 见 SS-MoE）。"""
+    if not _PREFETCH:
+        return
+    L = LAYERS[li]
+    if L.sparse:
+        for e in sel_v:
+            _advise(f"blk.{li}.attn_v_exps.weight", int(e) * L.ve_per, L.ve_per)
+    for e in sel_moe:
+        _advise(f"blk.{li}.ffn_gate_exps.weight", int(e) * L.ex_per, L.ex_per)
+        _advise(f"blk.{li}.ffn_up_exps.weight", int(e) * L.ux_per, L.ux_per)
+        _advise(f"blk.{li}.ffn_down_exps.weight", int(e) * L.dx_per, L.dx_per)
+
 
 class Layer:
     def __init__(self, li):
@@ -222,6 +256,7 @@ def attn_ffn_common(x, L, pos):
         vlogits = gemv1(L.vgc, L.vgb, MEXP, H, h)
         scores = softmax(vlogits) + L.vgate_b
         sel = np.argsort(-scores, kind="stable")[:MUSED]
+        _LAST_SEL.setdefault(L.li, [None, None])[0] = sel
         wts = softmax(vlogits)[sel]
         wts = wts / wts.sum()
         v = np.zeros(VOUT, np.float32)
@@ -254,6 +289,7 @@ def moe_ffn(h2, L):
     logits = L.gate_inp @ h2
     scores = softmax(logits)
     sel = np.argsort(-(scores + L.probs_b), kind="stable")[:NUSED]
+    _LAST_SEL.setdefault(L.li, [None, None])[1] = sel
     rw = scores[sel]
     rw = rw / rw.sum()
     out = np.zeros(H, np.float32)
@@ -283,6 +319,9 @@ def forward(tid, pos, layer_hook=None):
     t = T["token_embd.weight"]
     x = np.asarray(Q.dequantize(t.data[tid], t.tensor_type), np.float32)
     for li, L in enumerate(LAYERS):
+        _ls = _LAST_SEL.get(li)
+        if _ls is not None:
+            prefetch_experts(li, _ls[0] if _ls[0] is not None else [], _ls[1] if _ls[1] is not None else [])
         attn = attn_ffn_common(x, L, pos)
         x = x + attn
         h2 = grouped_rms1(x, L.norm_f)

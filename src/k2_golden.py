@@ -103,7 +103,8 @@ class WMap:
                       .replace("mlp.gate_proj", "ffn_gate")     # ★ 稠密 FFN（必须先于 mlp.gate 规则）
                       .replace("mlp.up_proj", "ffn_up")
                       .replace("mlp.down_proj", "ffn_down")
-                      .replace("mlp.gate", "ffn_gate_inp"))     # MoE 路由器
+                      .replace("mlp.gate.bias", "exp_probs_b.bias")  # ★★ MoE 路由 bias（moe_gate_bias=true 时官方语义要加，缺它=静默路由错误）
+                      .replace("mlp.gate", "ffn_gate_inp"))     # MoE 路由器 weight
             if sub.startswith("mlp.experts."):
                 return None   # 堆叠张量，走专用接口
             if sub.startswith("mlp."):
@@ -126,7 +127,7 @@ class WMap:
             kind = parts[6].replace("_proj", "")
             base = {"gate": "ffn_gate_exps", "up": "ffn_up_exps", "down": "ffn_down_exps"}[kind] + ".weight"
             full = self.lazy[f"blk.{li}.{base}"]
-            return full[ei]   # dequantize 输出 [exp, out, in]，按专家轴切
+            return full[ei]   # dequantize 输出 [NEXP, out, in]（gguf-py 反转），按专家轴切
         if ".v_experts." in name:
             li = int(name.split(".")[2])
             ei = int(name.split("v_experts.")[1].split(".")[0])
