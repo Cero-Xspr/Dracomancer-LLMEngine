@@ -419,11 +419,11 @@ print(f"INC_EQ={np.array_equal(LA, LB)} DMAX={np.abs(LA-LB).max():.2e}")
 
 
 def _prefill_chunk_gate(eng, model, ntok):
-    os.environ["ENG"] = eng
-    os.environ["MODEL"] = model
-    os.environ["NTOK"] = str(ntok)
+    # ★ env 必须走 _run(env=)（子进程级）：直接改 os.environ 会泄漏给后续用例
+    #   （falcon/ling 按 MODEL 找模型 → 加载了 qwen35moe → 元数据键全错，2026-09-19 实测翻车）
     s = _find_script("prefill_chunk_gate.py")
-    rc, out = _run([PY, s], timeout=1800)
+    rc, out = _run([PY, s], timeout=1800,
+                   env={"ENG": eng, "MODEL": model, "NTOK": str(ntok)})
     return rc == 0, out
 
 
