@@ -202,7 +202,7 @@ static inline void gemm_rows_t(const float* X, const uint8_t* row, int t0, int t
     for (int u = 0; u < NB16; u++) {
         __m512 v;
         dq16(code, row, u * 16, &v);
-        for (int t = 0; t < GTOK; t++)
+        for (int t = 0; t < GTOK && t < tc; t++)
             racc[t] = _mm512_fmadd_ps(v, _mm512_loadu_ps(X + (size_t)(t0 + t) * n_in + u * 16), racc[t]);
     }
     for (int t = 0; t < tc; t++) Y[(size_t)(t0 + t) * n_out + r] = hsum512(racc[t]);

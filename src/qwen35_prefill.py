@@ -75,7 +75,7 @@ class ChunkPrefiller:
         self.FG.m5_gemm_auto.restype = ct.c_int
         self.FG.m5_gemm_auto.argtypes = [ct.c_int] + [ct.c_void_p]*2 + [ct.c_int]*3 + [ct.c_void_p]
         self._fused_fp = ct.cast(self.FG.m5_gemm_auto, ct.c_void_p)
-        self._fused_fn = {0: self.FG.m5_gemm_q80, 2: self.FG.m5_gemm_iq3s,
+        self._fused_fn = {} if os.environ.get("DRACO_FUSED_GEMM", "1") == "0" else {0: self.FG.m5_gemm_q80, 2: self.FG.m5_gemm_iq3s,
                           3: self.FG.m5_gemm_q5k, 4: self.FG.m5_gemm_q6k,
                           5: self.FG.m5_gemm_q4k, 6: self.FG.m5_gemm_iq4xs}
         for _fn in self._fused_fn.values():
