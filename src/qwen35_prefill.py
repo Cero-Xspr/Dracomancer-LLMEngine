@@ -69,16 +69,17 @@ class ChunkPrefiller:
         self.SC = ct.CDLL(os.path.join(base, "m6_gdn_scan.so"))
         self.MT = ct.CDLL(os.path.join(base, "m6_moe_tok.so"))
         self.MT.m6_moe_tok.restype = None
-        self.MT.m6_moe_tok.argtypes = [ct.c_void_p] * 7 + [ct.c_int] * 6 + [ct.c_void_p] * 3
+        self.MT.m6_moe_tok.argtypes = [ct.c_void_p] * 8 + [ct.c_int] * 6 + [ct.c_void_p] * 3
         self._dq_fp = ct.cast(self.G.m5_dequant_row, ct.c_void_p)  # 注入反量化入口（v3 无嵌套 OMP）
+        self.FG = ct.CDLL(os.path.join(base, "m5", "m5_gemm_fused.so"))   # IQ3_S 融合 GEMM
+        self._fused_fp = ct.cast(self.FG.m5_gemm_iq3s, ct.c_void_p)
         self.SC.m6_gdn_scan.restype = None
         self.SC.m6_gdn_scan.argtypes = [ct.c_void_p]*8 + [ct.c_int]*3 + [ct.c_void_p]*2
         self.NTH = (os.cpu_count() or 8)
-        # ★ M2 专家并集批处理默认关：数值闸门全过（cos=1.0/贪心一致）但 m5_gemm 是
-        #   「材料化反查表」式 GEMM，反量化成本没有摊薄到足够低，实测反比 M1 逐 token 慢
-        #   （13.3 vs 16.3 t/s @T=192）。真解 = 块内融合反量化×多 token 的 GEMM 内核
-        #   （kern6 的 rows_iq3_s 结构 + 每 16 值寄存器复用 × token 分块），见 ROADMAP。
-        self.moe_batch = os.environ.get("DRACO_MOE_BATCH", "0") == "1"
+        # ★ M2 融合版已转正（2026-09-19）：m6_moe_tok 对全 IQ3_S 专家走 m5_gemm_fused
+        #   （寄存器级反量化 × 8-token 分块，v16/dg 复用），端到端热态交替 2.15-2.20×（vs 逐 token），
+        #   末位 cos=1.000000 + 贪心续接一致。DRACO_MOE_BATCH=0 回 M1 逐 token FFN。
+        self.moe_batch = os.environ.get("DRACO_MOE_BATCH", "1") == "1"
         self.wbuf = np.zeros(self.NTH * 8208, np.float32)
         self.f32p = ct.POINTER(ct.c_float)
         self.u8p = ct.POINTER(ct.c_uint8)
@@ -178,7 +179,7 @@ class ChunkPrefiller:
         wtop_c = np.ascontiguousarray(wtop, np.float32)
         work = np.empty(T * NUSED * (H + 3 * FF + H), np.float32)
         iwork = np.empty(T * NUSED * 2 + NEXP + 1, np.int32)
-        self.MT.m6_moe_tok(self._dq_fp, self.wbuf.ctypes.data,
+        self.MT.m6_moe_tok(self._dq_fp, self._fused_fp, self.wbuf.ctypes.data,
                            pf(X2n), pf(order_c), pf(wtop_c), M["ep"], M["ec"],
                            T, NUSED, FF, H, H, NEXP, pf(out), pf(work), pf(iwork))
         # 共享专家（整批）

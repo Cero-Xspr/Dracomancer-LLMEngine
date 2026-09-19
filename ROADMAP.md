@@ -825,3 +825,15 @@ head_dim 256（全注意力层）、GQA 8/2，**rope 分段 [11,11,10,0]**，SSM
 - **调试教训**：①OMP 嵌套调用 GEMM + 共享 wbuf/输出 scatter = 数据竞争（cos 每轮漂移）与
   病态变慢（43s）；②浮点归约不开 -ffast-math 不会自动向量化——批内核的点积必须手写 zmm；
   ③REAP 文件是混合量化（深层层专家 IQ4_XS/Q4_K，其余 IQ3_S）——GEMM 必须全格式支持。
+
+#### prefill M2 ✅ 转正（2026-09-19 下午）：融合反量化 GEMM 内核
+- **m5_gemm_fused.c**：IQ3_S 寄存器级反量化 × 8-token 分块（v16 算一次、8 个 racc 复用）。
+  **两个关键实测**：①单层累加（dg 折进 v16）+ 不加 unroll pragma = 0.52ms/矩阵；加
+  `#pragma GCC unroll 8`（谓词展开）反而 5ms——谓词展开把寄存器压爆，**手写内核别加它**；
+  ②材料化 GEMM（0.71ms）其实也只反量化一次，输在「标量 dequant + store/reload」而非付两次。
+- **m6_moe_tok v3**：全 IQ3_S 专家走融合 GEMM（行主序、无转置），其余格式 DQ+dotf 回退。
+- **端到端**（T=192 热态交替 ×2）：MOE_BATCH=0 → 14.1-15.4 t/s；=1 → **21.1-22.7 t/s**（2.15-2.20×
+  vs 逐 token；T=128 时 2.33-2.55×）。数值：cos=0.999998 + 贪心续接 12 token 逐 token 一致 ✓。
+  **已转默认**（DRACO_MOE_BATCH=0 回退）。
+- **pp256 估算**：T=192 chunk 21-23 t/s ⇒ 256 token 约 25-30s→12s 区间，仍低于 llama.cpp CPU
+  89.7——下一刀是把融合 GEMM 推广到 Q6_K/Q5_K 投影（当前投影走材料化 m5_gemm，占 chunk ~24%）。
