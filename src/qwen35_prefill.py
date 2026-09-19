@@ -67,9 +67,18 @@ class ChunkPrefiller:
         self.G.m5_gemm.argtypes = [ct.c_int, ct.c_void_p, ct.c_void_p,
                                    ct.c_int, ct.c_int, ct.c_int, ct.c_void_p, ct.c_void_p]
         self.SC = ct.CDLL(os.path.join(base, "m6_gdn_scan.so"))
+        self.MT = ct.CDLL(os.path.join(base, "m6_moe_tok.so"))
+        self.MT.m6_moe_tok.restype = None
+        self.MT.m6_moe_tok.argtypes = [ct.c_void_p] * 7 + [ct.c_int] * 6 + [ct.c_void_p] * 3
+        self._dq_fp = ct.cast(self.G.m5_dequant_row, ct.c_void_p)  # 注入反量化入口（v3 无嵌套 OMP）
         self.SC.m6_gdn_scan.restype = None
         self.SC.m6_gdn_scan.argtypes = [ct.c_void_p]*8 + [ct.c_int]*3 + [ct.c_void_p]*2
         self.NTH = (os.cpu_count() or 8)
+        # ★ M2 专家并集批处理默认关：数值闸门全过（cos=1.0/贪心一致）但 m5_gemm 是
+        #   「材料化反查表」式 GEMM，反量化成本没有摊薄到足够低，实测反比 M1 逐 token 慢
+        #   （13.3 vs 16.3 t/s @T=192）。真解 = 块内融合反量化×多 token 的 GEMM 内核
+        #   （kern6 的 rows_iq3_s 结构 + 每 16 值寄存器复用 × token 分块），见 ROADMAP。
+        self.moe_batch = os.environ.get("DRACO_MOE_BATCH", "0") == "1"
         self.wbuf = np.zeros(self.NTH * 8208, np.float32)
         self.f32p = ct.POINTER(ct.c_float)
         self.u8p = ct.POINTER(ct.c_uint8)
@@ -144,6 +153,45 @@ class ChunkPrefiller:
         o_attn = self._gemm(w.o_code, np.ascontiguousarray(attn), w.o_buf, H, nh*hd)
         return o_attn, w.post_norm
 
+    def _ffn_chunk(self, L, X2n):
+        """M2：MoE FFN 按位置批处理 —— 路由一次算完全部位置，专家按并集分组，
+        每个被选中的专家**反量化一次**服务它的全部 token（m5_gemm），共享专家整批。
+        语义与 m6_granite_moe/m6_granite_shexp 同式（softmax 路由 + stable topk +
+        norm_w + clamp；门控共享专家 = sigmoid(sg·x) 标量门）。"""
+        QE = self.QE
+        M = L["moe"]
+        T, H = X2n.shape
+        FF = QE.EXP_FFN
+        NEXP, NUSED = QE.N_EXP, QE.N_USED
+        gi = self._f32view(M["gi"], NEXP * H).reshape(NEXP, H)
+        # 路由
+        lg = X2n @ gi.T
+        lg -= lg.max(1, keepdims=True)
+        P = np.exp(lg)
+        P /= P.sum(1, keepdims=True)
+        order = np.argsort(-P, axis=1, kind="stable")[:, :NUSED]
+        wtop = np.take_along_axis(P, order, 1)
+        wtop /= np.maximum(wtop.sum(1, keepdims=True), 6.103515625e-5)
+        out = np.zeros((T, H), np.float32)
+        # 专家并集分组：整体下沉到 C（gather → 每专家批 GEMM → silu → 加权 scatter）
+        order_c = np.ascontiguousarray(order, np.int32)
+        wtop_c = np.ascontiguousarray(wtop, np.float32)
+        work = np.empty(T * NUSED * (H + 3 * FF + H), np.float32)
+        iwork = np.empty(T * NUSED * 2 + NEXP + 1, np.int32)
+        self.MT.m6_moe_tok(self._dq_fp, self.wbuf.ctypes.data,
+                           pf(X2n), pf(order_c), pf(wtop_c), M["ep"], M["ec"],
+                           T, NUSED, FF, H, H, NEXP, pf(out), pf(work), pf(iwork))
+        # 共享专家（整批）
+        shp = np.ctypeslib.as_array(M["shp"], shape=(4,))
+        shc = np.ctypeslib.as_array(M["shc"], shape=(4,))
+        sg_w = self._f32view(int(shp[3]), H)
+        gsc = 1.0 / (1.0 + np.exp(-(X2n @ sg_w)))
+        shg = self._gemm(int(shc[0]), X2n, int(shp[0]), QE.SHEXP_FFN, H)
+        shu = self._gemm(int(shc[1]), X2n, int(shp[1]), QE.SHEXP_FFN, H)
+        act = np.ascontiguousarray(shg / (1.0 + np.exp(-shg)) * shu)
+        shd = self._gemm(int(shc[2]), act, int(shp[2]), H, QE.SHEXP_FFN)
+        return out + shd * gsc[:, None]
+
     def prefill_chunk(self, ids, pos0):
         """等价于对 ids 逐 token forward(ids[i], pos0+i) 后的引擎状态；返回末位 logits。"""
         QE = self.QE
@@ -162,6 +210,10 @@ class ChunkPrefiller:
             post_arr = self._f32view(post, QE.H)
             X2 = X + attn
             X2n = rms_mean(X2, post_arr)
+            if "moe" in L and self.moe_batch:
+                # M2：专家并集批处理
+                X = X2 + self._ffn_chunk(L, X2n)
+                continue
             # MoE/dense FFN：M1 逐 token（复用引擎算子与缓冲）
             for i in range(T):
                 QE._ffn(L, X2n[i], FFO)

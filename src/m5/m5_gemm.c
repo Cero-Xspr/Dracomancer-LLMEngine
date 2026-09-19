@@ -10,6 +10,7 @@
 #include <math.h>
 #include <immintrin.h>
 #include <omp.h>
+#include "iq3s_grid.h"
 
 static inline float h2f1(uint16_t h) {
     uint32_t sign = (uint32_t)(h & 0x8000) << 16;
@@ -48,6 +49,100 @@ int m5_dequant_row(int code, const uint8_t* row, int n_in, float* out) {
     if (code == 7) {                                   // F16
         const uint16_t* s = (const uint16_t*)row;
         for (int i = 0; i < n_in; i++) out[i] = h2f1(s[i]);
+        return 0;
+    }
+    if (code == 1) {                                   // IQ4_NL: 18B/32 = d(fp16) + 16 nibble 字节
+        static const int8_t KVAL[16] = {-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113};
+        const int nb = n_in / 32;
+        for (int b = 0; b < nb; b++) {
+            const uint8_t* blk = row + (size_t)b * 18;
+            const float d = h2f1(*(const uint16_t*)blk);
+            for (int j = 0; j < 16; j++) {
+                const uint8_t q = blk[2 + j];
+                out[b*32 + j]    = d * (float)KVAL[q & 0x0F];
+                out[b*32 + 16+j] = d * (float)KVAL[q >> 4];
+            }
+        }
+        return 0;
+    }
+    if (code == 2) {                                   // IQ3_S: 110B/256，与 m5_kern6 rows_iq3_s 同布局
+        const int nb = n_in / 256;
+        for (int b = 0; b < nb; b++) {
+            const uint8_t* blk = row + (size_t)b * 110;
+            const float d = h2f1(*(const uint16_t*)blk);
+            const uint8_t* qs = blk + 2;
+            const uint8_t* qh = blk + 66;
+            const uint8_t* signs = blk + 74;
+            const uint8_t* scales = blk + 106;
+            float* ob = out + b * 256;
+            for (int g = 0; g < 8; g++) {
+                const uint8_t nib = (g & 1) ? (scales[g >> 1] >> 4) : (scales[g >> 1] & 0x0F);
+                const float dg = d * (1.0f + 2.0f * (float)nib);
+                for (int qi = 0; qi < 8; qi += 4) {
+                    const int i0 = g * 8 + qi;
+                    uint32_t qs4; memcpy(&qs4, qs + i0, 4);
+                    const uint8_t qhb = qh[i0 >> 3];
+                    const int sh = i0 & 7;
+                    const uint16_t sbits = (uint16_t)signs[i0 >> 1] | ((uint16_t)signs[(i0 >> 1) + 1] << 8);
+                    for (int j = 0; j < 16; j++) {
+                        const int idx = ((qs4 >> (8 * (j >> 2))) & 0xFF) | (((qhb >> (sh + (j >> 2))) & 1) << 8);
+                        const float sgn = ((sbits >> j) & 1) ? -1.f : 1.f;
+                        ob[i0 * 4 + j] = dg * (float)(int8_t)IQ3S_GRID[idx * 4 + (j & 3)] * sgn;
+                    }
+                }
+            }
+        }
+        return 0;
+    }
+    if (code == 5) {                                   // Q4_K: 144B/256 = d dmin scales[12] qs[128]
+        const int nb = n_in / 256;
+        for (int b = 0; b < nb; b++) {
+            const uint8_t* blk = row + (size_t)b * 144;
+            const float d = h2f1(*(const uint16_t*)blk);
+            const float dmin = h2f1(*(const uint16_t*)(blk + 2));
+            uint8_t sc[8], m[8];
+            { const uint8_t* s = blk + 4;
+              for (int i = 0; i < 4; i++) { sc[i] = s[i] & 0x3F; m[i] = s[4+i] & 0x3F; }
+              for (int i = 0; i < 4; i++) { sc[4+i] = (s[8+i] & 0x0F) | ((s[i] >> 2) & 0x30);
+                                            m[4+i] = ((s[8+i] >> 4) & 0x0F) | ((s[4+i] >> 2) & 0x30); } }
+            const uint8_t* qs = blk + 16;
+            float* ob = out + b * 256;
+            // ★ 64 值共享同一 32 字节流：低 nibble = 偶数组 g，高 nibble = 奇数组 g+1（kern7 同映射）
+            for (int g = 0; g < 8; g += 2) {
+                const uint8_t* qb = qs + (g >> 1) * 32;
+                const float scf0 = d * (float)sc[g],     min0 = dmin * (float)m[g];
+                const float scf1 = d * (float)sc[g + 1], min1 = dmin * (float)m[g + 1];
+                for (int j = 0; j < 16; j++) {
+                    ob[g*32 + j]          = scf0 * (float)(qb[j] & 0x0F)      - min0;
+                    ob[g*32 + 16 + j]     = scf0 * (float)(qb[16 + j] & 0x0F) - min0;
+                    ob[(g+1)*32 + j]      = scf1 * (float)(qb[j] >> 4)        - min1;
+                    ob[(g+1)*32 + 16 + j] = scf1 * (float)(qb[16 + j] >> 4)   - min1;
+                }
+            }
+        }
+        return 0;
+    }
+    if (code == 6) {                                   // IQ4_XS: 136B/256 = d scales_h scales_l(4) qs(128)
+        static const int8_t KV2[16] = {-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113};
+        const int nb = n_in / 256;
+        for (int b = 0; b < nb; b++) {
+            const uint8_t* blk = row + (size_t)b * 136;
+            const float d = h2f1(*(const uint16_t*)blk);
+            const uint16_t sh = *(const uint16_t*)(blk + 2);
+            const uint8_t* sl = blk + 4;
+            const uint8_t* qs = blk + 8;
+            float* ob = out + b * 256;
+            for (int g = 0; g < 8; g++) {
+                const uint8_t lo = (g & 1) ? (sl[g >> 1] >> 4) : (sl[g >> 1] & 0x0F);
+                const int sc = (int)((((unsigned)sh >> (2 * g)) & 3) << 4 | lo) - 32;
+                const float dg = d * (float)sc;
+                for (int j = 0; j < 16; j++) {
+                    const uint8_t q = qs[g * 16 + j];
+                    ob[g*32 + j]    = dg * (float)KV2[q & 0x0F];
+                    ob[g*32 + 16+j] = dg * (float)KV2[q >> 4];
+                }
+            }
+        }
         return 0;
     }
     if (code == 4) {                                   // Q6_K: 210B/256 = ql[128] qh[64] scales[16] d
@@ -116,7 +211,11 @@ int m5_gemm(int code, const float* X, const uint8_t* W, int T, int n_out, int n_
             const int rowbytes = (code == 0) ? (n_in / 32) * 34
                               : (code == 7) ? n_in * 2
                               : (code == 4) ? (n_in / 256) * 210
-                              : (code == 3) ? (n_in / 256) * 176 : -1;
+                              : (code == 3) ? (n_in / 256) * 176
+                              : (code == 2) ? (n_in / 256) * 110
+                              : (code == 1) ? (n_in / 32) * 18
+                              : (code == 5) ? (n_in / 256) * 144
+                              : (code == 6) ? (n_in / 256) * 136 : -1;
             if (m5_dequant_row(code, W + (size_t)r * rowbytes, n_in, wb) != 0) continue;
             for (int t = 0; t < T; t++)
                 Y[(size_t)t * n_out + r] = dot_row(wb, X + (size_t)t * n_in, n_in);
