@@ -22,7 +22,7 @@ static inline float h2f1(uint16_t h) {
 }
 static inline float hsum512(__m512 v) { return _mm512_reduce_add_ps(v); }
 
-#define GTOK 8
+#define GTOK 16   // 16-token 分块（G8→G16 实测 +8%，逐位一致）
 
 // 单个 token 分块 [t0, t0+tc) 的整行 GEMM（内部函数，racc 结构与 rows_iq3_s 同构）
 static inline void gemm_iq3s_rows(const float* X, const uint8_t* row, int t0, int tc, int n_out, int n_in, float* Y, int r) {
