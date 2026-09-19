@@ -71,8 +71,16 @@ class ChunkPrefiller:
         self.MT.m6_moe_tok.restype = None
         self.MT.m6_moe_tok.argtypes = [ct.c_void_p] * 8 + [ct.c_int] * 6 + [ct.c_void_p] * 3
         self._dq_fp = ct.cast(self.G.m5_dequant_row, ct.c_void_p)  # 注入反量化入口（v3 无嵌套 OMP）
-        self.FG = ct.CDLL(os.path.join(base, "m5", "m5_gemm_fused.so"))   # IQ3_S 融合 GEMM
-        self._fused_fp = ct.cast(self.FG.m5_gemm_iq3s, ct.c_void_p)
+        self.FG = ct.CDLL(os.path.join(base, "m5", "m5_gemm_fused.so"))   # 融合 GEMM（全格式）
+        self.FG.m5_gemm_auto.restype = ct.c_int
+        self.FG.m5_gemm_auto.argtypes = [ct.c_int] + [ct.c_void_p]*2 + [ct.c_int]*3 + [ct.c_void_p]
+        self._fused_fp = ct.cast(self.FG.m5_gemm_auto, ct.c_void_p)
+        self._fused_fn = {0: self.FG.m5_gemm_q80, 2: self.FG.m5_gemm_iq3s,
+                          3: self.FG.m5_gemm_q5k, 4: self.FG.m5_gemm_q6k,
+                          5: self.FG.m5_gemm_q4k, 6: self.FG.m5_gemm_iq4xs}
+        for _fn in self._fused_fn.values():
+            _fn.restype = None
+            _fn.argtypes = [ct.POINTER(ct.c_float), ct.POINTER(ct.c_uint8), ct.c_int, ct.c_int, ct.c_int, ct.POINTER(ct.c_float)]
         self.SC.m6_gdn_scan.restype = None
         self.SC.m6_gdn_scan.argtypes = [ct.c_void_p]*8 + [ct.c_int]*3 + [ct.c_void_p]*2
         self.NTH = (os.cpu_count() or 8)
@@ -90,8 +98,13 @@ class ChunkPrefiller:
     def _gemm(self, code, X, wbuf_ptr, n_out, n_in):
         T = X.shape[0]
         Y = np.empty((T, n_out), np.float32)
-        self.G.m5_gemm(code, X.ctypes.data, wbuf_ptr, T, n_out, n_in,
-                       Y.ctypes.data, self.wbuf.ctypes.data)
+        fn = self._fused_fn.get(code)
+        if fn is not None:
+            fn(X.ctypes.data_as(ct.POINTER(ct.c_float)),
+               ct.cast(wbuf_ptr, ct.POINTER(ct.c_uint8)), T, n_out, n_in, pf(Y))
+        else:
+            self.G.m5_gemm(code, X.ctypes.data, wbuf_ptr, T, n_out, n_in,
+                           Y.ctypes.data, self.wbuf.ctypes.data)
         return Y
 
     def _gdn(self, w, L, X, pos0):

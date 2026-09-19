@@ -13,7 +13,7 @@
 #include <omp.h>
 
 typedef int (*dequant_fn)(int, const uint8_t*, int, float*);
-typedef void (*fused_iq3s_fn)(const float*, const uint8_t*, int, int, int, float*);
+typedef int (*gemm_auto_fn)(int, const float*, const uint8_t*, int, int, int, float*);
 
 // ★ 手写 zmm 点积：浮点归约不开 -ffast-math 不会被自动向量化（v2 教训：标量点积慢 4×+）
 #include <immintrin.h>
@@ -41,7 +41,7 @@ static inline int rowbytes_of(int code, int n) {
     }
 }
 
-void m6_moe_tok(dequant_fn DQ, fused_iq3s_fn FIQ, float* gwbuf,
+void m6_moe_tok(dequant_fn DQ, gemm_auto_fn GA, float* gwbuf,
                 const float* X, const int* order, const float* wtop,
                 const uint64_t* ep, const int* ec,
                 int T, int n_used, int inter, int n_in, int n_out, int n_exp,
@@ -107,15 +107,17 @@ void m6_moe_tok(dequant_fn DQ, fused_iq3s_fn FIQ, float* gwbuf,
             float* seg_uu = uu + (size_t)off[e] * inter;
             float* seg_ac = act + (size_t)off[e] * inter;
             float* seg_yd = yd + (size_t)off[e] * n_out;
-            if (cg == 2 && cu == 2 && cd == 2 && FIQ) {
+            const int sup = (cg >= 0 && cg <= 6 && cg != 1 && cu >= 0 && cu <= 6 && cu != 1 &&
+                             cd >= 0 && cd <= 6 && cd != 1);
+            if (sup && GA) {
                 // 融合路径：行主序 [c][inter]，无转置（v16 寄存器复用 × token 分块）
-                FIQ(seg_g, wg, c, inter, n_in, seg_gu);
-                FIQ(seg_g, wu, c, inter, n_in, seg_uu);
+                GA(cg, seg_g, wg, c, inter, n_in, seg_gu);
+                GA(cu, seg_g, wu, c, inter, n_in, seg_uu);
                 for (int i = 0; i < c * inter; i++) {
                     const float gv = seg_gu[i];
                     seg_gu[i] = (gv / (1.f + expf(-gv))) * seg_uu[i];
                 }
-                FIQ(seg_gu, wd, c, n_out, inter, seg_yd);
+                GA(cd, seg_gu, wd, c, n_out, inter, seg_yd);
                 continue;
             }
             const int rbg = rowbytes_of(cg, n_in), rbu = rowbytes_of(cu, n_in);

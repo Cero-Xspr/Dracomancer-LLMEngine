@@ -837,3 +837,13 @@ head_dim 256（全注意力层）、GQA 8/2，**rope 分段 [11,11,10,0]**，SSM
   **已转默认**（DRACO_MOE_BATCH=0 回退）。
 - **pp256 估算**：T=192 chunk 21-23 t/s ⇒ 256 token 约 25-30s→12s 区间，仍低于 llama.cpp CPU
   89.7——下一刀是把融合 GEMM 推广到 Q6_K/Q5_K 投影（当前投影走材料化 m5_gemm，占 chunk ~24%）。
+
+#### 融合 GEMM 全格式 ✅（2026-09-19 下午续）
+- **m5_gemm_fused.c** 新增 Q8_0/Q6_K/Q5_K/Q4_K/IQ4_XS 融合变体 + `m5_gemm_auto` 统一分发
+  （dq16 每 16 值组寄存器反量化）。逐位对账 m5_gemm：**全部 Δ=0**。隔离加速：Q6_K 2.7×、
+  Q5_K 2.2-2.3×、IQ4_XS 1.35-1.5×、Q8_0 ~1×、Q4_K ~1×。
+- **接线**：qwen35_prefill._gemm 自动路由融合（F16/IQ4_NL 留材料化）；m6_moe_tok 换 auto 入口
+  （深层层 IQ4_XS/Q4_K 专家也批处理化）。
+- **端到端**（T=192 热态交替）：全融合 **20.9-24.7 t/s（2.31×）**；调试坑：①Q8_0 反量化误用
+  cvtepu8（int8 要 cvtepi8）；②dq16 的位域必须用**块内位置 p=base&255**（Q6_K ql/qh/sc、
+  Q5_K 组号都是块内语义，全局 base 会错位到后面块）；③Q4_K sc/m 6-bit 解包下标按 kern7 逐式抄。

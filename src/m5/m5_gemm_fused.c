@@ -86,3 +86,156 @@ void m5_gemm_iq3s(const float* X, const uint8_t* W, int c, int n_out, int n_in, 
         }
     }
 }
+
+// ===== Q8_0 / Q6_K / Q5_K 融合变体（与 m5_gemm_fused 的 IQ3_S 同模式）=====
+// 每 16 值组寄存器反量化一次 → GTOK 个 token fma。
+
+static inline int rowbytes_of(int code, int n) {
+    switch (code) {
+        case 0: return (n / 32) * 34;
+        case 7: return n * 2;
+        case 4: return (n / 256) * 210;
+        case 3: return (n / 256) * 176;
+        case 2: return (n / 256) * 110;
+        case 1: return (n / 32) * 18;
+        case 5: return (n / 256) * 144;
+        case 6: return (n / 256) * 136;
+        default: return 0;
+    }
+}
+
+// 每 16 值组反量化（base 16 对齐；位布局与 m5_gemm.c/m5_kern6/7/8/9 一致）
+static inline void get_sc_m(const uint8_t* s, int j, uint8_t* d8, uint8_t* m8) {
+    if (j < 4) { *d8 = s[j] & 63; *m8 = s[j + 4] & 63; }
+    else {
+        *d8 = (s[j + 4] & 0xF) | ((s[j - 4] >> 6) << 4);
+        *m8 = (s[j + 4] >> 4) | ((s[j] >> 6) << 4);
+    }
+}
+
+static inline void dq16(int code, const uint8_t* row, int base, __m512* v) {
+    if (code == 0) {                                     // Q8_0
+        const uint8_t* blk = row + (size_t)(base >> 5) * 34;
+        const float d = h2f1(*(const uint16_t*)blk);
+        const __m128i b8 = _mm_loadu_si128((const __m128i*)(blk + 2 + (base & 31)));
+        *v = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(b8)), _mm512_set1_ps(d));
+    } else if (code == 4) {                              // Q6_K
+        const int p = base & 255;                        // ★ 组内位置：所有位域都按块内 p
+        const uint8_t* blk = row + (size_t)(base >> 8) * 210;
+        const uint8_t* ql = blk;
+        const uint8_t* qh = blk + 128;
+        const int8_t* sc = (const int8_t*)(blk + 192);
+        const float d = h2f1(*(const uint16_t*)(blk + 208));
+        const int seg = (p >> 6) & 1;
+        const int qoff = ((p >> 5) & 3) * 2;
+        const __m128i b8 = _mm_loadu_si128((const __m128i*)(ql + ((p >> 7) * 64) + (p & 63)));
+        const __m128i nib = seg ? _mm_and_si128(_mm_srli_epi16(b8, 4), _mm_set1_epi8(0x0F))
+                                : _mm_and_si128(b8, _mm_set1_epi8(0x0F));
+        const __m128i qhb = _mm_loadu_si128((const __m128i*)(qh + ((p >> 7) * 32) + (p & 31)));
+        const __m128i two = _mm_and_si128(_mm_srli_epi16(qhb, qoff), _mm_set1_epi8(0x03));
+        const __m128i q6 = _mm_or_si128(nib, _mm_slli_epi16(two, 4));
+        const __m512i q32 = _mm512_sub_epi32(_mm512_cvtepu8_epi32(q6), _mm512_set1_epi32(32));
+        *v = _mm512_mul_ps(_mm512_cvtepi32_ps(q32),
+                           _mm512_set1_ps(d * (float)sc[p >> 4]));
+    } else if (code == 5) {                              // Q4_K（144B/256：nibble 无 qh，6-bit sc/m 同 kern7）
+        const int p = base & 255;
+        const uint8_t* blk = row + (size_t)(base >> 8) * 144;
+        const float d = h2f1(*(const uint16_t*)blk);
+        const float dmin = h2f1(*(const uint16_t*)(blk + 2));
+        const int g32 = p >> 5;
+        uint8_t scj, mj;                       // ★ 只解当前组的两个标量（原 8 组全解在 16 组粒度下是 8× 冗余）
+        { const uint8_t* s = blk + 4;
+          if (g32 < 4) { scj = s[g32] & 0x3F; mj = s[4+g32] & 0x3F; }
+          else { scj = (s[4+g32] & 0x0F) | ((s[g32-4] >> 2) & 0x30);
+                 mj = ((s[4+g32] >> 4) & 0x0F) | ((s[g32] >> 2) & 0x30); } }
+        const int hpar = g32 & 1;
+        const __m128i b8 = _mm_loadu_si128((const __m128i*)(blk + 16 + (g32 >> 1) * 32 + (p & 31)));
+        const __m128i nib = hpar ? _mm_and_si128(_mm_srli_epi16(b8, 4), _mm_set1_epi8(0x0F))
+                                 : _mm_and_si128(b8, _mm_set1_epi8(0x0F));
+        const __m512 lo = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(nib)),
+                                        _mm512_set1_ps(d * (float)scj));
+        *v = _mm512_sub_ps(lo, _mm512_set1_ps(dmin * (float)mj));
+    } else if (code == 6) {                              // IQ4_XS（136B/256：d scales_h scales_l(4) qs(128)）
+        static const int8_t KV2[16] = {-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113};
+        const int p = base & 255;
+        const uint8_t* blk = row + (size_t)(base >> 8) * 136;
+        const float d = h2f1(*(const uint16_t*)blk);
+        const uint16_t sh = *(const uint16_t*)(blk + 2);
+        const uint8_t* sl = blk + 4;
+        const int g32 = p >> 5;
+        const uint8_t lo4 = (g32 & 1) ? (sl[g32 >> 1] >> 4) : (sl[g32 >> 1] & 0x0F);
+        const int sc = (int)((((unsigned)sh >> (2 * g32)) & 3) << 4 | lo4) - 32;
+        const int half = (p >> 4) & 1;
+        const __m128i b8 = _mm_loadu_si128((const __m128i*)(blk + 8 + g32 * 16));
+        const __m128i nib = half ? _mm_and_si128(_mm_srli_epi16(b8, 4), _mm_set1_epi8(0x0F))
+                                 : _mm_and_si128(b8, _mm_set1_epi8(0x0F));
+        const __m128i kv = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)KV2), nib);
+        *v = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(kv)), _mm512_set1_ps(d * (float)sc));
+    } else if (code == 3) {                              // Q5_K
+        const int p = base & 255;                        // ★ 组内位置
+        const uint8_t* blk = row + (size_t)(base >> 8) * 176;
+        const uint8_t* qs = blk + 48;
+        const uint8_t* qh = blk + 16;
+        uint8_t scj, mj;
+        get_sc_m(blk + 4, p >> 5, &scj, &mj);
+        const float d = h2f1(*(const uint16_t*)blk);
+        const float dmin = h2f1(*(const uint16_t*)(blk + 2));
+        const int hpar = (p >> 5) & 1;
+        const __m128i b8 = _mm_loadu_si128((const __m128i*)(qs + ((p >> 6) * 32) + (p & 31)));
+        const __m128i nib = hpar ? _mm_and_si128(_mm_srli_epi16(b8, 4), _mm_set1_epi8(0x0F))
+                                 : _mm_and_si128(b8, _mm_set1_epi8(0x0F));
+        const __m128i qhb = _mm_loadu_si128((const __m128i*)(qh + (p & 31)));
+        const __m128i hi1 = _mm_and_si128(_mm_srli_epi16(qhb, (p >> 6) * 2 + hpar), _mm_set1_epi8(0x01));
+        const __m512i q5 = _mm512_add_epi32(_mm512_cvtepu8_epi32(nib),
+                                            _mm512_slli_epi32(_mm512_cvtepu8_epi32(hi1), 4));
+        const __m512 lo = _mm512_mul_ps(_mm512_cvtepi32_ps(q5),
+                                        _mm512_set1_ps(d * (float)scj));
+        *v = _mm512_sub_ps(lo, _mm512_set1_ps(dmin * (float)mj));
+    }
+}
+
+static inline void gemm_rows_t(const float* X, const uint8_t* row, int t0, int tc,
+                               int n_out, int n_in, float* Y, int r, int code) {
+    __m512 racc[GTOK];
+    for (int t = 0; t < tc; t++) racc[t] = _mm512_setzero_ps();
+    const int NB16 = n_in / 16;
+    for (int u = 0; u < NB16; u++) {
+        __m512 v;
+        dq16(code, row, u * 16, &v);
+        for (int t = 0; t < GTOK; t++)
+            racc[t] = _mm512_fmadd_ps(v, _mm512_loadu_ps(X + (size_t)(t0 + t) * n_in + u * 16), racc[t]);
+    }
+    for (int t = 0; t < tc; t++) Y[(size_t)(t0 + t) * n_out + r] = hsum512(racc[t]);
+}
+
+#define FUSED3(FN, CODE)                                                    \
+void FN(const float* X, const uint8_t* W, int c, int n_out, int n_in, float* Y) { \
+    const int rb = rowbytes_of(CODE, n_in);                                  \
+    _Pragma("omp parallel for schedule(dynamic, 4)")                          \
+    for (int r = 0; r < n_out; r++) {                                        \
+        const uint8_t* row = W + (size_t)r * rb;                             \
+        for (int t0 = 0; t0 < c; t0 += GTOK) {                               \
+            const int tc = (t0 + GTOK <= c) ? GTOK : (c - t0);               \
+            gemm_rows_t(X, row, t0, tc, n_out, n_in, Y, r, CODE);            \
+        }                                                                    \
+    }                                                                        \
+}
+
+FUSED3(m5_gemm_q80, 0)
+FUSED3(m5_gemm_q6k, 4)
+FUSED3(m5_gemm_q5k, 3)
+FUSED3(m5_gemm_q4k, 5)
+FUSED3(m5_gemm_iq4xs, 6)
+
+// 统一分发入口：支持的码直接融合，返回 0；不支持的码返回 -1（调用方回退）
+int m5_gemm_auto(int code, const float* X, const uint8_t* W, int c, int n_out, int n_in, float* Y) {
+    switch (code) {
+        case 0: m5_gemm_q80(X, W, c, n_out, n_in, Y); return 0;
+        case 2: m5_gemm_iq3s(X, W, c, n_out, n_in, Y); return 0;
+        case 3: m5_gemm_q5k(X, W, c, n_out, n_in, Y); return 0;
+        case 4: m5_gemm_q6k(X, W, c, n_out, n_in, Y); return 0;
+        case 5: m5_gemm_q4k(X, W, c, n_out, n_in, Y); return 0;
+        case 6: m5_gemm_iq4xs(X, W, c, n_out, n_in, Y); return 0;
+        default: return -1;
+    }
+}
