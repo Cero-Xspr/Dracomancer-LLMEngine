@@ -110,7 +110,10 @@ def wview(name):
 STATES = []
 
 # ── 专家预取（SS-MoE 思路：按上次路由预读本 token 的专家权重，内核异步 I/O 与计算重叠）──
-_PREFETCH = os.environ.get("K2_PREFETCH", "1") == "1"
+# ★ 默认关：A/B 实测（140-170ms/tok 区间）无收益——内核默认 readahead 已在做类似的事，
+#   而我们的专家访问是随机块（每 token 路由不同），fadvise WILLNEED 的成功率不高。
+#   真正的 I/O 杠杆是「模型能驻留内存」（更小量化）或「显式专家 LRU 缓存」（SS-MoE 的 ExpertCache）。
+_PREFETCH = os.environ.get("K2_PREFETCH", "0") == "1"
 try:
     _FD = R._fd.fileno() if hasattr(R, "_fd") and hasattr(R._fd, "fileno") else None
 except Exception:

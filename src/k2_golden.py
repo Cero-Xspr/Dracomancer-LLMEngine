@@ -59,6 +59,20 @@ class LazyW:
         self.cache = {}
         self.cur_blk = None
 
+    def expert(self, name, e, n_exp):
+        """★ 只反量化第 e 个专家（整张量 dequant 是 100× 浪费——oracle 慢 400s/token 的根因）。"""
+        key = (name, e)
+        if key in self.cache:
+            return self.cache[key]
+        t = self.T[name]
+        per = t.data.nbytes // n_exp
+        raw = np.frombuffer(t.data, np.uint8)[e * per:(e + 1) * per]
+        v = np.asarray(Q.dequantize(raw, t.tensor_type), np.float32)
+        shp = tuple(int(x) for x in t.shape)[:-1][::-1]   # 去掉专家轴再反转 = [out, in]
+        v = v.reshape(shp)
+        self.cache[key] = v
+        return v
+
     def __getitem__(self, name):
         if name in self.cache:
             return self.cache[name]
@@ -68,7 +82,7 @@ class LazyW:
             parts = name.split(".")
             blk = int(parts[1]) if parts[0] == "blk" else None
             if blk != self.cur_blk:
-                for k in [k for k in self.cache if k.startswith("blk.")]:
+                for k in [k for k in self.cache if isinstance(k, str) and k.startswith("blk.")]:
                     del self.cache[k]
                 self.cur_blk = blk
         self.cache[name] = v
@@ -79,6 +93,10 @@ class LazyW:
 
 
 lazy = LazyW(T_)
+
+
+NEXP_C = NEXP
+MEXP_C = MEXP
 
 
 class WMap:
@@ -126,13 +144,11 @@ class WMap:
             li, ei = int(parts[2]), int(parts[5])   # layers.N.mlp.experts.E.kind_proj
             kind = parts[6].replace("_proj", "")
             base = {"gate": "ffn_gate_exps", "up": "ffn_up_exps", "down": "ffn_down_exps"}[kind] + ".weight"
-            full = self.lazy[f"blk.{li}.{base}"]
-            return full[ei]   # dequantize 输出 [NEXP, out, in]（gguf-py 反转），按专家轴切
+            return self.lazy.expert(f"blk.{li}.{base}", ei, NEXP_C)
         if ".v_experts." in name:
             li = int(name.split(".")[2])
             ei = int(name.split("v_experts.")[1].split(".")[0])
-            full = self.lazy[f"blk.{li}.attn_v_exps.weight"]
-            return full[ei]
+            return self.lazy.expert(f"blk.{li}.attn_v_exps.weight", ei, MEXP_C)
         gg = self.hf2gguf(name)
         return self.lazy[gg]
 
