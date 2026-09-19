@@ -799,3 +799,15 @@ head_dim 256（全注意力层）、GQA 8/2，**rope 分段 [11,11,10,0]**，SSM
   验收 = pp256 ≥ llama.cpp CPU 80% 且贪心续接与逐 token 路径一致。副产品：投机解码验证墙同步拆除。
 - **教训（流程）**：用 pkill -f 收自己的测试服务会把外层 bash 包装器一起匹配杀掉（本次整个命令块被截断、
   追加与提交都没执行）——测试服务一律用 nohup 时记下 PID 再按 PID kill。
+
+#### prefill M1 ✅ 已完成（2026-09-19 上午）：两段式 GDN + 批投影 + 批注意力
+- **落地**：`m5/m5_gemm.c`（Q8_0/Q5_K/Q6_K/F16 批投影，反量化对账 gguf-py 逐位一致）、
+  `m6_gdn_scan.c`（激活态扫描，对账 numpy 参考 S/ON/tail 逐位级）、`qwen35_prefill.py`（编排）、
+  `prefill_chunk_gate.py`（闸门）。服务端 ≥64 token 增量自动走 chunk（`DRACO_CHUNK_PREFILL=0` 关）。
+- **等价性**：qwen35 与 qwen35moe 均 **末位 cos=1.000000 + 贪心续接 12 token 逐 token 一致**（T2 闸门入套件）。
+- **速度**（AC×性能/8线程）：qwen35moe T=192 热态交替 **1.44×**（11.3→16.3 t/s）；服务端 154 tok 实测 15.0 t/s。
+- **调试教训**（三个连环坑）：①我自己 rms_mean 对 2D 输入错加一维（`ms/shape[1]` 变逐元素）——
+  引擎 xn 反推比对抓出；②全注意力 q/k rms 是**均值式**（n2/HD+eps），GDN 头内 rms 是**和式**
+  （fmax(sqrt(nq))）——Kr 恰差 √256=16× 抓出；③引擎调试哨兵 buf[39000]=1 + buf[30000](qkv 全量)/
+  buf[38240](xn) 是现成的真值出口，比外部 oracle（gguf-py 对该文件的字节偏移与引擎未必一致）更可信。
+- **剩余**：chunk 内 MoE 仍逐 token（~60% 时间）⇒ M2 专家并集批处理是下一刀（预期再 2-3×）。

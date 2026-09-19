@@ -418,6 +418,31 @@ print(f"INC_EQ={np.array_equal(LA, LB)} DMAX={np.abs(LA-LB).max():.2e}")
     return True, "增量续转 ≡ 全量重跑（logits 逐位相同，max|Δ|=0）"
 
 
+def _prefill_chunk_gate(eng, model, ntok):
+    os.environ["ENG"] = eng
+    os.environ["MODEL"] = model
+    os.environ["NTOK"] = str(ntok)
+    s = _find_script("prefill_chunk_gate.py")
+    rc, out = _run([PY, s], timeout=1800)
+    return rc == 0, out
+
+
+def t2_prefill_chunk_qwen35():
+    """chunked prefill 等价性（qwen35 2B）：cos≥0.999 + 贪心续接 12 token 一致。"""
+    m = "/media/xiao_/OverSys1/gguf/Qwen3.5-2B-f16.gguf"
+    if not os.path.exists(m):
+        return False, f"缺 {m}"
+    return _prefill_chunk_gate("qwen35", m, 96)
+
+
+def t2_prefill_chunk_qwen35moe():
+    """chunked prefill 等价性（qwen35moe）：cos≥0.999 + 贪心续接 12 token 一致。"""
+    m = "/media/xiao_/OverSys1/gguf/Qwen3.6-35B-A3B-REAP-48-v2.gguf"
+    if not os.path.exists(m):
+        return False, f"缺 {m}"
+    return _prefill_chunk_gate("qwen35moe", m, 96)
+
+
 def t1_load_smoke():
     """8 家族装载冒烟：每家 load_engine + prefill + 4 贪心 token。
     防回归场景：适配器批量编辑误伤（smol/ling snap_state NameError 事故）那类"打不开"。"""
@@ -545,6 +570,8 @@ def main():
              ("t1_incremental_state", 1, t1_incremental_state),
              ("t1_qwen35moe_greedy", 1, t1_qwen35moe_greedy),
              ("t1_load_smoke", 1, t1_load_smoke),
+             ("t2_prefill_chunk_qwen35", 2, t2_prefill_chunk_qwen35),
+             ("t2_prefill_chunk_qwen35moe", 2, t2_prefill_chunk_qwen35moe),
              ("t2_granite_s4d_layers", 2, t2_granite_s4d_layers),
              ("t2_qwen35_layers", 2, t2_qwen35_layers),
              ("t2_qwen35moe_layers", 2, t2_qwen35moe_layers),

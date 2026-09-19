@@ -549,14 +549,20 @@ def _load_qwen35():
         E.reset()
 
     _eos = _gguf_ids(ARGS.model, "tokenizer.ggml.eos_token_id")[0]   # <|im_end|>
-    return dict(forward=E.forward, logits=E.logits_of_x, reset=reset,
-                encode=lambda t: tk.encode(t).ids,
-                decode=lambda ids: tk.decode(ids, skip_special_tokens=False),
-                eos=_eos, im_end=_eos, max_t=E.MAXT,
-                system_default=None, bos=None,
-                think_block=True, think_default=False,   # ★ REAP 剪枝版即兴开 think（中→英漂移+自我纠正），开分区显示为思考区
-                state_arrays=(lambda: E.STATES) if hasattr(E, "STATES") else None,
-                render=render)
+    ap = dict(forward=E.forward, logits=E.logits_of_x, reset=reset,
+              encode=lambda t: tk.encode(t).ids,
+              decode=lambda ids: tk.decode(ids, skip_special_tokens=False),
+              eos=_eos, im_end=_eos, max_t=E.MAXT,
+              system_default=None, bos=None,
+              think_block=True, think_default=False,   # ★ REAP 剪枝版即兴开 think（中→英漂移+自我纠正），开分区显示为思考区
+              state_arrays=(lambda: E.STATES) if hasattr(E, "STATES") else None,
+              render=render)
+    # ★ chunked prefill（M1：批投影+激活态扫描）：TTFT 提速（实测 qwen35moe 热态 1.44×、
+    #   等价性 cos=1.000000 + 贪心续接逐 token 一致）。DRACO_CHUNK_PREFILL=0 关闭。
+    if os.environ.get("DRACO_CHUNK_PREFILL", "1") == "1":
+        from qwen35_prefill import ChunkPrefiller
+        ap["forward_chunk"] = ChunkPrefiller(E).prefill_chunk
+    return ap
 
 
 def _require_avx512():
@@ -769,8 +775,15 @@ def _gen_locked(ids, n_gen, temp, seed, repeat_penalty, think_now, hold=None, sk
     if reuse == 0:
         reset_state()
     t0 = time.time()
-    for pos in range(reuse, len(ids)):
-        AP["forward"](int(ids[pos]), pos)
+    _fc = AP.get("forward_chunk")
+    _inc = len(ids) - reuse
+    if _fc is not None and _inc >= 64:
+        # ★ chunked prefill：批投影+激活态扫描（qwen35 家族）。状态落在引擎原缓冲，
+        #   末位 logits 在 LOGITS 里；等价性闸门（cos/贪心续接）见 qwen35_prefill.py。
+        _fc(ids[reuse:], reuse)
+    else:
+        for pos in range(reuse, len(ids)):
+            AP["forward"](int(ids[pos]), pos)
     prefill_s = time.time() - t0
     _CTX_CACHE["ids"] = list(ids)
     _CTX_CACHE["valid"] = True
