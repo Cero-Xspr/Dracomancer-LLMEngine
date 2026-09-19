@@ -152,8 +152,9 @@ def sparse_moe(x, w, prefix, cfg):
     return out
 
 
-def model_forward(ids, w, cfg):
-    """完整 forward。ids [T] int；w：HF state_dict 同键名 fp32 numpy dict。返回 logits [T, vocab]。"""
+def model_forward(ids, w, cfg, layer_hook=None):
+    """完整 forward。ids [T] int；w：HF state_dict 同键名 fp32 numpy dict。返回 logits [T, vocab]。
+    layer_hook(li, x): 每层完成后的回调（调试/对账用）。"""
     T = len(ids)
     x = w["model.embed_tokens.weight"][ids]
     hd = cfg["head_dim"]
@@ -180,5 +181,9 @@ def model_forward(ids, w, cfg):
             x = x + sparse_moe(h2, w, pre + "mlp.", cfg)
         else:
             x = x + mlp_forward(h2, w, pre + "mlp.")
+        if layer_hook is not None:
+            layer_hook(il, x.copy())
+    if layer_hook is not None:
+        layer_hook(-1, x.copy())
     x = grouped_rms(x, w["model.norm.weight"], ngroups, cfg["rms_norm_eps"])
     return x @ w["lm_head.weight"].T
