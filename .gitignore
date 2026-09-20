@@ -1,2 +1,3 @@
 __pycache__/
 *.pyc
+tests/k2ref/tokenizer.json

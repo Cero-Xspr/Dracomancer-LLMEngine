@@ -32,6 +32,26 @@ static inline void get_sc_m(const uint8_t* s, int j, uint8_t* d8, uint8_t* m8) {
 }
 
 // 反量化一行到 out[n_in]（值与 gguf-py dequantize 逐位一致；点积顺序与 gemv 内核不同 ⇒ 容差闸门）
+// ── IQ2_S (code 13) 支撑：网格×符号 预展开表（与 m5_kern13.c 同构，从 iq2s_grid_gen.h 生成）──
+#include "iq2s_grid_gen.h"
+static int8_t *K13_GRIDSGN = NULL;
+static void k13_build(void) {
+    K13_GRIDSGN = (int8_t*)malloc((size_t)1024 * 256 * 8);
+    for (int e = 0; e < 1024; e++) {
+        uint16_t g16 = IQ2S_GRID[e];
+        int8_t g8[8];
+        for (int j = 0; j < 8; j++) {
+            const int code = (g16 >> (2 * j)) & 3;
+            g8[j] = (code == 0) ? 8 : (code == 1) ? 25 : 43;   // 2-bit 码 = 原字节编码
+        }
+        for (int sb = 0; sb < 256; sb++) {
+            int8_t* dst = K13_GRIDSGN + ((size_t)e * 256 + sb) * 8;
+            for (int j = 0; j < 8; j++)
+                dst[j] = (sb >> j) & 1 ? (int8_t)-g8[j] : g8[j];
+        }
+    }
+}
+
 int m5_dequant_row(int code, const uint8_t* row, int n_in, float* out) {
     if (code == 0) {                                   // Q8_0
         const int nb = n_in / 32;
@@ -49,6 +69,31 @@ int m5_dequant_row(int code, const uint8_t* row, int n_in, float* out) {
     if (code == 7) {                                   // F16
         const uint16_t* s = (const uint16_t*)row;
         for (int i = 0; i < n_in; i++) out[i] = h2f1(s[i]);
+        return 0;
+    }
+    if (code == 13) {                                  // IQ2_S: 82B/256 = d+qs[32]+signs[32]+qh[8]+scales[8]
+        if (K13_GRIDSGN == NULL) k13_build();
+        const int nb = n_in / 256;
+        for (int b = 0; b < nb; b++) {
+            const uint8_t* blk = row + (size_t)b * 82;
+            const float d = h2f1(*(const uint16_t*)blk) * 0.25f;
+            const uint8_t* qs = blk + 2;
+            const uint8_t* sg = blk + 34;
+            const uint8_t* qh = blk + 66;
+            const uint8_t* scb = blk + 74;
+            float sc[16];
+            for (int i = 0; i < 8; i++) {              // 交错 nibble
+                sc[2*i]     = d * (0.5f + (float)(scb[i] & 0x0F));
+                sc[2*i + 1] = d * (0.5f + (float)(scb[i] >> 4));
+            }
+            for (int s = 0; s < 32; s++) {
+                const int idx10 = qs[s] | (((qh[s >> 2] >> ((s & 3) * 2)) & 3) << 8);
+                const int8_t* g = K13_GRIDSGN + ((size_t)idx10 * 256 + sg[s]) * 8;
+                float* o = out + b * 256 + s * 8;
+                const __m256 vf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*)g)));
+                _mm256_storeu_ps(o, _mm256_mul_ps(vf, _mm256_set1_ps(sc[s >> 1])));
+            }
+        }
         return 0;
     }
     if (code == 1) {                                   // IQ4_NL: 18B/32 = d(fp16) + 16 nibble 字节
@@ -203,6 +248,7 @@ static inline float dot_row(const float* w, const float* x, int n) {
 // 行维并行（每个线程独占整行：dequant + T 个点积），行间无依赖。
 int m5_gemm(int code, const float* X, const uint8_t* W, int T, int n_out, int n_in,
             float* Y, float* wbuf) {
+    if (code == 13 && K13_GRIDSGN == NULL) k13_build();   // ★ 必须在并行区外建表（首次调用竞态）
     #pragma omp parallel
     {
         float* wb = wbuf + (size_t)omp_get_thread_num() * ((n_in + 15) & ~15);
@@ -215,7 +261,8 @@ int m5_gemm(int code, const float* X, const uint8_t* W, int T, int n_out, int n_
                               : (code == 2) ? (n_in / 256) * 110
                               : (code == 1) ? (n_in / 32) * 18
                               : (code == 5) ? (n_in / 256) * 144
-                              : (code == 6) ? (n_in / 256) * 136 : -1;
+                              : (code == 6) ? (n_in / 256) * 136
+                              : (code == 13) ? (n_in / 256) * 82 : -1;
             if (m5_dequant_row(code, W + (size_t)r * rowbytes, n_in, wb) != 0) continue;
             for (int t = 0; t < T; t++)
                 Y[(size_t)t * n_out + r] = dot_row(wb, X + (size_t)t * n_in, n_in);

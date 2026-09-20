@@ -1,0 +1,33 @@
+{
+ "blk.0.attn_norm.weight": {
+  "ifm_zero": 0.0,
+  "nani_zero": 0.0,
+  "corr": 1.0
+ },
+ "blk.0.ffn_norm.weight": {
+  "ifm_zero": 0.0,
+  "nani_zero": 0.0,
+  "corr": 0.9999999999999998
+ },
+ "blk.3.attn_norm.weight": {
+  "ifm_zero": 0.0,
+  "nani_zero": 0.0,
+  "corr": 1.0
+ },
+ "blk.0.ffn_down.weight": {
+  "corr": 0.9998122761892855,
+  "rel": 0.014936010353267193
+ },
+ "blk.3.ffn_gate_exps.weight": {
+  "corr": 0.9974515151063497,
+  "rel": 0.04098416492342949
+ },
+ "blk.3.attn_q.weight": {
+  "corr": 0.9973673936623024,
+  "rel": 0.03834157809615135
+ },
+ "blk.3.ffn_down_exps.weight": {
+  "corr": 0.999841818481861,
+  "rel": 0.015355603769421577
+ }
+}
