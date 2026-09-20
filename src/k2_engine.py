@@ -108,6 +108,56 @@ except OSError:
     LIB_B = None
 BATCH_ON = BATCH_ON and LIB_B is not None
 
+# ── 段融合 gemv（仅 IQ2_S=13）：同输入多矩阵一次 OMP 区 ──
+K2_FUSE = os.environ.get("K2_FUSE", "0") == "1"
+LIB13 = CODE_LIB.get(13)
+class _Seg(ct.Structure):
+    _fields_ = [("W", ct.c_void_p), ("n_out", ct.c_int), ("y_off", ct.c_int)]
+if LIB13 is not None:
+    try:
+        LIB13.m5_gemv13_segs.restype = ct.c_int
+        LIB13.m5_gemv13_segs.argtypes = [ct.POINTER(ct.c_float), ct.POINTER(_Seg), ct.c_int,
+                                         ct.c_int, ct.POINTER(ct.c_float)]
+        _SEG_ARR = lambda n: (_Seg * n)()
+    except AttributeError:
+        K2_FUSE = False
+else:
+    K2_FUSE = False
+K2_FUSE = K2_FUSE and LIB13 is not None
+
+
+def _seg_ptr(wb):
+    return wb.ctypes.data_as(ct.c_void_p)
+
+
+def gemv_fused4(h, qb, gb, kb, vgb, n_q, n_g, n_k, n_v):
+    """q/gate/k/v_router 共享输入 h，一次调用。返回 (q, gate_in, k, vlogits)。"""
+    y = np.empty(n_q + n_g + n_k + n_v, np.float32)
+    arr = (_Seg * 4)()
+    arr[0].W, arr[0].n_out, arr[0].y_off = _seg_ptr(qb), n_q, 0
+    arr[1].W, arr[1].n_out, arr[1].y_off = _seg_ptr(gb), n_g, n_q
+    arr[2].W, arr[2].n_out, arr[2].y_off = _seg_ptr(kb), n_k, n_q + n_g
+    arr[3].W, arr[3].n_out, arr[3].y_off = _seg_ptr(vgb), n_v, n_q + n_g + n_k
+    rc = LIB13.m5_gemv13_segs(pf(h), arr, 4, H, pf(y))
+    if rc != 0:
+        raise RuntimeError(f"segs rc={rc}")
+    return y[:n_q], y[n_q:n_q+n_g], y[n_q+n_g:n_q+n_g+n_k], y[n_q+n_g+n_k:]
+
+
+def gemv_fused_gu(h2, exb, uxb, per, uper, sel, n_inter):
+    """MoE 8 专家 gate+up 共享 h2：16 段一次调用。返回 G[8,ni], U[8,ni]。"""
+    ns = len(sel)
+    y = np.empty(ns * 2 * n_inter, np.float32)
+    arr = (_Seg * (ns * 2))()
+    for i, e in enumerate(sel):
+        arr[2*i].W,   arr[2*i].n_out,   arr[2*i].y_off   = _seg_ptr(exb[e*per:]), n_inter, i*2*n_inter
+        arr[2*i+1].W, arr[2*i+1].n_out, arr[2*i+1].y_off = _seg_ptr(uxb[e*uper:]), n_inter, i*2*n_inter + n_inter
+    rc = LIB13.m5_gemv13_segs(pf(np.ascontiguousarray(h2)), arr, ns*2, H, pf(y))
+    if rc != 0:
+        raise RuntimeError(f"segs gu rc={rc}")
+    yv = y.reshape(ns, 2, n_inter)
+    return yv[:, 0, :], yv[:, 1, :]
+
 
 def pf(a):
     return a.ctypes.data_as(ct.POINTER(ct.c_float))
@@ -291,13 +341,23 @@ def attn_ffn_common(x, L, pos):
     t0 = tp() if tp else 0
     h = grouped_rms1(x, L.norm_a)
     t0 = _tick("rms", t0)
-    q = gemv1(L.qc, L.qb, NH * HD, H, h).reshape(NH, HD)
-    k = rope1(gemv1(L.kc, L.kb, NKV * HD, H, h).reshape(NKV, HD), pos)
+    if K2_FUSE and L.qc == 13 and L.gc == 13 and L.kc == 13 and (not L.sparse or L.vgc == 13):
+        qf, gate_in, kf, vlogits = gemv_fused4(h, L.qb, L.gb, L.kb, L.vgb if L.sparse else L.qb,
+                                               NH * HD, NH * HD, NKV * HD, MEXP if L.sparse else 1)
+        if not L.sparse:
+            vlogits = None
+    else:
+        qf = gemv1(L.qc, L.qb, NH * HD, H, h)
+        kf = gemv1(L.kc, L.kb, NKV * HD, H, h)
+        gate_in = None
+        vlogits = gemv1(L.vgc, L.vgb, MEXP, H, h) if L.sparse else None
+    q = qf.reshape(NH, HD)
+    k = rope1(kf.reshape(NKV, HD), pos)
     L.K[pos] = k
     t0 = _tick("qkv", t0)
     if L.sparse:
         # MoVA：sigmoid 路由（bias 只参与选择）→ top-MUSED 专家 silu 加权，权重归一 ×scaling
-        vlogits = gemv1(L.vgc, L.vgb, MEXP, H, h)
+        pass
         sc = sigmoid1(vlogits) if GATING_FUNC == 2 else softmax(vlogits)
         sel = np.argsort(-(sc + L.vgate_b), kind="stable")[:MUSED]
         _LAST_SEL.setdefault(L.li, [None, None])[0] = sel
@@ -328,7 +388,7 @@ def attn_ffn_common(x, L, pos):
     att = softmax_last((q[:, None, :] @ Kc.transpose(0, 2, 1)) * np.float32(HD ** -0.5))  # [NH, 1, kv_n]
     out = (att @ Vc)[:, 0, :].reshape(NH * HD)
     t0 = _tick("attention", t0)
-    gate = softplus_ln2(gemv1(L.gc, L.gb, NH * HD, H, h))
+    gate = softplus_ln2(gate_in if gate_in is not None else gemv1(L.gc, L.gb, NH * HD, H, h))
     out = out * gate
     o = gemv1(L.oc, L.ob, H, NH * HD, out)
     t0 = _tick("gate_o", t0)
@@ -365,6 +425,13 @@ def moe_ffn(h2, L):
                                 sel_a.ctypes.data_as(pi_), L.dx_per, H, MOE_INTER, NUSED, pf(D))
         assert rc == 0, f"batch q6k rc={rc}"
         out = (D.reshape(NUSED, H) * rw[:, None]).sum(0)
+    elif K2_FUSE and L.exc == 13 and L.uxc == 13 and L.dxc == 13:
+        # IQ2_S：8 专家 gate+up 16 段一次调用；down 逐专家（输入互不相同）
+        G, U = gemv_fused_gu(h2, L.exb, L.uxb, L.ex_per, L.ux_per, sel, MOE_INTER)
+        gu = silu(G) * U
+        out = np.zeros(H, np.float32)
+        for k, e in enumerate(sel):
+            out += gemv1(L.dxc, L.dxb[e * L.dx_per:], H, MOE_INTER, gu[k]) * rw[k]
     else:
         out = np.zeros(H, np.float32)
         for k, e in enumerate(sel):
