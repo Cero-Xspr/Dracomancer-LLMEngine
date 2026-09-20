@@ -887,6 +887,10 @@ head_dim 256（全注意力层）、GQA 8/2，**rope 分段 [11,11,10,0]**，SSM
 **已测事实**（bench_hetero_bw.sh，Ryzen AI 9 H365，LPDDR5X-8000 128bit）：
 - CPU 单独纯读 52.8 GiB/s；iGPU(Radeon 890M RADV GFX1150, UMA, Vulkan) 推理 Qwen3.5-2B Q8 33.4 t/s ≈ 64 GiB/s，**并发下不降速**；并发时 CPU 读 32.1 GiB/s。
 - **聚合 ≈96 GiB/s = 1.8× CPU 单独**，直逼总线 128 GB/s ⇒ 共享内存池的异构并发有效。
+- **F0.5 严谨重测（bench_hetero_bw2.py，同窗采样，RAM 确认 DDR5-5600 双通道 = 名义 89.6 GB/s）**：
+  CPU 并发窗内 27.4（-48%）、iGPU 60.5（-12%）、**聚合 87.9 GB/s = 名义总线的 98%**（1.66× CPU 单独）。
+  ⇒ 聚合精确顶到总线天花板；**三硬件并发聚合带宽不成立（总线已饱和），NPU 只能做算力卸载（prefill/能效），不能加带宽**。
+  粗测版（96GiB/s/1.8×）是重叠窗口记账误差，以本测为准。
 - iGPU 报 "int dot: 0"（无 VNNI）；NPU(XDNA2) 历史数据：持续 35.7 GB/s ≈ CPU，GEMV 不友好（能效优先）。
 
 **算子亲和表**（decode 视角）：
