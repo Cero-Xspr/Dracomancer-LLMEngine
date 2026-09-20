@@ -1,0 +1,88 @@
+{
+ "model": "K2-Horizon-MoVA-36B-A4B-IQ2_M.gguf",
+ "sample": true,
+ "effort": null,
+ "results": [
+  {
+   "label": "事实-QA",
+   "prompt": "What is the capital of France? Answer in one sentence.",
+   "think_chars": 0,
+   "answer": "The user asks: \"What is the capital of France? Answer in one sentence.\" So the response should be a single sentence: \"The capital of France is Paris.\" Or \"Paris is the capital of France.\" One sentence. Should we include period? Yes. Provide exactly one sentence.\n</ifm|think>\nParis is the capital of France.",
+   "n_gen": 67,
+   "ttft_s": 7.62,
+   "tps": 3.1
+  },
+  {
+   "label": "事实-QA2",
+   "prompt": "Who wrote Romeo and Juliet?",
+   "think_chars": 0,
+   "answer": "User asks: Who wrote Romeo and Juliet? Straightforward answer: William Shakespeare. Possibly mention collaboration, original source etc. Provide concise answer.\n</ifm|think>\n*Romeo and Juliet* was written by **William Shakespeare**. He composed the play sometime around 1595–1596, during his early period as a playwright. Shakespeare drew on earlier sources—including an Italian novella by Matteo Ban",
+   "n_gen": 111,
+   "ttft_s": 5.36,
+   "tps": 3.0
+  },
+  {
+   "label": "推理",
+   "prompt": "If a train travels 120 km in 1.5 hours, what is its average speed in km/h?",
+   "think_chars": 0,
+   "answer": "Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Input: A math problem (\"If a train travels 120 km in 1.5 hours, what is its average speed in km/h?\").\n    *   Role: Student solver (not a tutor, not a grader).\n    *   Constraints: Use hidden reasoning (concise), then provide a visible student answer/attempt. No reasoning-only output. No meta-talk about instructions.\n\n2.  **Solve the Problem:",
+   "n_gen": 200,
+   "ttft_s": 10.51,
+   "tps": 2.8
+  },
+  {
+   "label": "推理2",
+   "prompt": "Sarah has 3 apples. She buys 5 more and gives 2 to her friend. How many apples does she have?",
+   "think_chars": 0,
+   "answer": "Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Role: Student solver.\n    *   Task: Solve the math problem.\n    *   Constraint 1: Use hidden reasoning (concise, focused).\n    *   Constraint 2: Do not restate the full problem.\n    *   Constraint 3: Do not mention hidden instructions/reference answers.\n    *   Constraint 4: After hidden reasoning, provide a visible student answer/next-step a",
+   "n_gen": 200,
+   "ttft_s": 12.02,
+   "tps": 2.9
+  },
+  {
+   "label": "代码-py",
+   "prompt": "Write a Python function that reverses a string.",
+   "think_chars": 0,
+   "answer": "We need to write a Python function that reverses a string. Provide a solution with explanation. Possibly include type hints, docstring, example usage. The request: \"Write a Python function that reverses a string.\" So we need to produce code. Probably want a function like def reverse_string(s: str) -> str: return s[::-1]. Also could implement manual reversal for educational purposes. Provide explan",
+   "n_gen": 200,
+   "ttft_s": 5.96,
+   "tps": 2.9
+  },
+  {
+   "label": "中文-QA",
+   "prompt": "中国的首都是哪里？请用一句话回答。",
+   "think_chars": 0,
+   "answer": "The user asks in Chinese: \"中国的首都是哪里？请用一句话回答。\" Means: \"What is the capital of China? Please answer in one sentence.\"\n\nWe need to respond in one sentence in Chinese. Answer: 北京。 One sentence: \"中国的首都是北京。\" That's one sentence.\n</ifm|think>\n中国的首都是北京。",
+   "n_gen": 72,
+   "ttft_s": 6.73,
+   "tps": 3.0
+  },
+  {
+   "label": "中文-翻译",
+   "prompt": "Translate to English: 今天天气很好，我们一起去公园散步吧。",
+   "think_chars": 0,
+   "answer": "The user wants me to translate a Chinese sentence to English.\n\nChinese sentence: 今天天气很好，我们一起去公园散步吧。\n\nBreaking it down:\n- 今天 (jīn tiān) = today\n- 天气 (tiān qì) = weather\n- 很好 (hěn hǎo) = very good\n- 我们 (wǒ men) = we/us\n- 一起 (yī qWith) = together\n- 去 (qù) = go\n- 公园 (gōng yu n) = park\n- 散步 (sàn bù) = walk/stroll\n- 吧 (ba) = particle indicating suggestion\n\nThis sounds like a suggestion: \"Let's go for a ",
+   "n_gen": 200,
+   "ttft_s": 8.16,
+   "tps": 2.9
+  },
+  {
+   "label": "摘要",
+   "prompt": "Summarize in one sentence: The Industrial Revolution began in Britain in the late 18th century. It transformed manufacturing from hand production to machine production, leading to urbanization and significant social changes.",
+   "think_chars": 0,
+   "answer": "Hmm, the user wants me to summarize a historical event in one sentence. They've provided a specific text about the Industrial Revolution beginning in Britain, transforming manufacturing, and causing urbanization and social changes. \n\nI need to condense all these key points into a single, concise sentence. The core elements are: origin (Britain, late 18th century), transformation (hand to machine p",
+   "n_gen": 200,
+   "ttft_s": 16.12,
+   "tps": 2.9
+  },
+  {
+   "label": "创意",
+   "prompt": "Write a haiku about autumn leaves.",
+   "think_chars": 0,
+   "answer": "User asks: \"Write a haiku about autumn leaves.\" Straightforward: produce haiku (5-7-5 syllables). Should be about autumn leaves. Provide in English. Ensure it's a haiku, maybe with line breaks. Provide perhaps a short note. But user just wants haiku. So output haiku.\n</ifm|think>\nCrimson whispers fall—  \na rustling chorus drifts down,  \nautumn sighs on earth.",
+   "n_gen": 90,
+   "ttft_s": 5.59,
+   "tps": 3.0
+  }
+ ]
+}

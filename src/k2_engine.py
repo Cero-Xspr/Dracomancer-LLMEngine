@@ -9,6 +9,7 @@
 v1 策略：m5 gemv 内核 + numpy 编排（正确性优先）。权重零拷贝 mmap。
 """
 import os
+import time
 import ctypes as ct
 import numpy as np
 
@@ -62,16 +63,25 @@ MOE_INTER = fint("expert_feed_forward_length", 768)
 VOUT = NKV * HD
 NGROUP = 2
 DENSE_LAYERS = [0, 1, 2]
+# 真实 36B config: router_score_func="sigmoid"、router_scaling_factor=2.5
+# （GGUF 元数据 expert_gating_func=2 即 sigmoid、expert_weights_scale=2.5）
+GATING_FUNC = fint("expert_gating_func", 2)          # 1=softmax 2=sigmoid（llama.cpp 枚举）
+R_SCALING = float(kv("expert_weights_scale") or 2.5)
+
+
+def sigmoid1(x):
+    return 1.0 / (1.0 + np.exp(-np.asarray(x, np.float32)))
 
 CODE = {"F32": 9, "F16": 7, "Q8_0": 0, "Q5_0": 8, "Q4_K": 5,
-        "Q5_K": 3, "Q6_K": 4, "IQ4_NL": 1, "IQ3_S": 2, "IQ4_XS": 6}
+        "Q5_K": 3, "Q6_K": 4, "IQ4_NL": 1, "IQ3_S": 2, "IQ4_XS": 6, "IQ2_S": 13}
 
 # ── m5 内核直连 ──
 import m5sel  # noqa: E402
 BASE_M5 = os.path.join(BASE, "m5")
 CODE_LIB = {}
 for p, codes in (("m5_kern6.so", (0, 1, 2)), ("m5_kern9.so", (3,)), ("m5_kern8.so", (4,)),
-                 ("m5_kern7.so", (5, 6)), ("m5_kernF.so", (7,)), ("m5_kern10.so", (8,))):
+                 ("m5_kern7.so", (5, 6)), ("m5_kernF.so", (7,)), ("m5_kern10.so", (8,)),
+                 ("m5_kern13.so", (13,))):
     try:
         lib = ct.CDLL(os.path.join(BASE_M5, p))
         lib.m5_gemv.restype = ct.c_int
@@ -81,6 +91,22 @@ for p, codes in (("m5_kern6.so", (0, 1, 2)), ("m5_kern9.so", (3,)), ("m5_kern8.s
             CODE_LIB[c] = lib
     except OSError:
         pass
+
+
+# ── K2 批量专家内核（gate/up 共享 x；down 逐专家 x）──
+BATCH_ON = os.environ.get("K2_BATCH", "0") == "1"
+LIB_B = None
+try:
+    LIB_B = ct.CDLL(os.path.join(BASE_M5, "m5_batch8_k.so"))
+    for _fn in ("m5_gemvn_q4k", "m5_gemvn_q6k"):
+        _f = getattr(LIB_B, _fn)
+        _f.restype = ct.c_int
+        _f.argtypes = [ct.POINTER(ct.c_float), ct.c_long, ct.POINTER(ct.c_uint8),
+                       ct.POINTER(ct.c_int), ct.c_long, ct.c_int, ct.c_int, ct.c_int,
+                       ct.POINTER(ct.c_float)]
+except OSError:
+    LIB_B = None
+BATCH_ON = BATCH_ON and LIB_B is not None
 
 
 def pf(a):
@@ -248,28 +274,52 @@ def silu(x):
     return x / (1.0 + np.exp(-x))
 
 
+_PROF = {}
+_PROF_ON = os.environ.get("K2_PROF") == "1"
+
+
+def _tick(key, t0):
+    if _PROF_ON:
+        _PROF[key] = _PROF.get(key, 0.0) + (time.perf_counter() - t0)
+        return time.perf_counter()
+    return t0
+
+
 def attn_ffn_common(x, L, pos):
     """注意力（MoVA 或稠密）+ 残差。返回层注意力输出（未加残差）。"""
+    tp = time.perf_counter if _PROF_ON else None
+    t0 = tp() if tp else 0
     h = grouped_rms1(x, L.norm_a)
+    t0 = _tick("rms", t0)
     q = gemv1(L.qc, L.qb, NH * HD, H, h).reshape(NH, HD)
     k = rope1(gemv1(L.kc, L.kb, NKV * HD, H, h).reshape(NKV, HD), pos)
     L.K[pos] = k
+    t0 = _tick("qkv", t0)
     if L.sparse:
-        # MoVA：路由 → top-MUSED 专家 silu 加权（v_gate 量化 → gemv）
+        # MoVA：sigmoid 路由（bias 只参与选择）→ top-MUSED 专家 silu 加权，权重归一 ×scaling
         vlogits = gemv1(L.vgc, L.vgb, MEXP, H, h)
-        scores = softmax(vlogits) + L.vgate_b
-        sel = np.argsort(-scores, kind="stable")[:MUSED]
+        sc = sigmoid1(vlogits) if GATING_FUNC == 2 else softmax(vlogits)
+        sel = np.argsort(-(sc + L.vgate_b), kind="stable")[:MUSED]
         _LAST_SEL.setdefault(L.li, [None, None])[0] = sel
-        wts = softmax(vlogits)[sel]
-        wts = wts / wts.sum()
-        v = np.zeros(VOUT, np.float32)
-        for k_i, e in enumerate(sel):
-            ve = gemv1(L.vec, L.veb[e * L.ve_per:], VOUT, H, h)
-            v += silu(ve) * wts[k_i]
+        wts = sc[sel]
+        wts = wts / wts.sum() * R_SCALING
+        if BATCH_ON:
+            sel_a = np.ascontiguousarray(sel, np.int32)
+            V4 = np.empty(MUSED * VOUT, np.float32)
+            rc = LIB_B.m5_gemvn_q4k(pf(h), 0, p8(L.veb), sel_a.ctypes.data_as(ct.POINTER(ct.c_int)),
+                                    L.ve_per, VOUT, H, MUSED, pf(V4))
+            assert rc == 0, f"batch q4k rc={rc}"
+            v = (silu(V4.reshape(MUSED, VOUT)) * wts[:, None]).sum(0)
+        else:
+            v = np.zeros(VOUT, np.float32)
+            for k_i, e in enumerate(sel):
+                ve = gemv1(L.vec, L.veb[e * L.ve_per:], VOUT, H, h)
+                v += silu(ve) * wts[k_i]
         L.V[pos] = v.reshape(NKV, HD)
     else:
         v = gemv1(L.vc, L.vb, VOUT, H, h)
         L.V[pos] = v.reshape(NKV, HD)
+    t0 = _tick("mova_v", t0)
     # 注意力（GQA，因果，T=1 单步）
     q = rope1(q.reshape(NH, HD), pos)
     kv_n = pos + 1
@@ -277,9 +327,11 @@ def attn_ffn_common(x, L, pos):
     Vc = np.repeat(L.V[:kv_n].transpose(1, 0, 2), NH // NKV, axis=0)
     att = softmax_last((q[:, None, :] @ Kc.transpose(0, 2, 1)) * np.float32(HD ** -0.5))  # [NH, 1, kv_n]
     out = (att @ Vc)[:, 0, :].reshape(NH * HD)
+    t0 = _tick("attention", t0)
     gate = softplus_ln2(gemv1(L.gc, L.gb, NH * HD, H, h))
     out = out * gate
     o = gemv1(L.oc, L.ob, H, NH * HD, out)
+    t0 = _tick("gate_o", t0)
     if os.environ.get("K2DBG"):
         e = lambda a: ("OK" if np.isfinite(np.asarray(a)).all() else "NAN") + "/" + str(np.asarray(a).dtype)
         print(f"[dbg] h={e(h)} q={e(q)} k={e(k)} v={e(v)} att={e(att)} out={e(out)} "
@@ -289,21 +341,42 @@ def attn_ffn_common(x, L, pos):
 
 
 def moe_ffn(h2, L):
+    t0 = time.perf_counter() if _PROF_ON else 0
     logits = L.gate_inp @ h2
-    scores = softmax(logits)
-    sel = np.argsort(-(scores + L.probs_b), kind="stable")[:NUSED]
+    sc = sigmoid1(logits) if GATING_FUNC == 2 else softmax(logits)
+    sel = np.argsort(-(sc + L.probs_b), kind="stable")[:NUSED]
     _LAST_SEL.setdefault(L.li, [None, None])[1] = sel
-    rw = scores[sel]
-    rw = rw / rw.sum()
-    out = np.zeros(H, np.float32)
-    for k, e in enumerate(sel):
-        g = gemv1(L.exc, L.exb[e * L.ex_per:], MOE_INTER, H, h2)
-        u = gemv1(L.uxc, L.uxb[e * L.ux_per:], MOE_INTER, H, h2)
-        d = gemv1(L.dxc, L.dxb[e * L.dx_per:], H, MOE_INTER, silu(g) * u)
-        out += d * rw[k]
+    rw = sc[sel]
+    rw = rw / rw.sum() * R_SCALING
+    t0 = _tick("moe_route", t0)
+    if BATCH_ON:
+        sel_a = np.ascontiguousarray(sel, np.int32)
+        pi_ = ct.POINTER(ct.c_int)
+        G = np.empty(NUSED * MOE_INTER, np.float32)
+        U = np.empty(NUSED * MOE_INTER, np.float32)
+        rc = LIB_B.m5_gemvn_q4k(pf(h2), 0, p8(L.exb), sel_a.ctypes.data_as(pi_),
+                                L.ex_per, MOE_INTER, H, NUSED, pf(G))
+        rc += LIB_B.m5_gemvn_q4k(pf(h2), 0, p8(L.uxb), sel_a.ctypes.data_as(pi_),
+                                 L.ux_per, MOE_INTER, H, NUSED, pf(U))
+        assert rc == 0, f"batch q4k rc={rc}"
+        gu = (silu(G) * U).reshape(NUSED, MOE_INTER)
+        D = np.empty(NUSED * H, np.float32)
+        rc = LIB_B.m5_gemvn_q6k(pf(np.ascontiguousarray(gu.ravel())), MOE_INTER, p8(L.dxb),
+                                sel_a.ctypes.data_as(pi_), L.dx_per, H, MOE_INTER, NUSED, pf(D))
+        assert rc == 0, f"batch q6k rc={rc}"
+        out = (D.reshape(NUSED, H) * rw[:, None]).sum(0)
+    else:
+        out = np.zeros(H, np.float32)
+        for k, e in enumerate(sel):
+            g = gemv1(L.exc, L.exb[e * L.ex_per:], MOE_INTER, H, h2)
+            u = gemv1(L.uxc, L.uxb[e * L.ux_per:], MOE_INTER, H, h2)
+            d = gemv1(L.dxc, L.dxb[e * L.dx_per:], H, MOE_INTER, silu(g) * u)
+            out += d * rw[k]
+    t0 = _tick("moe_experts", t0)
     g = gemv1(L.sgc, L.sgb, MOE_INTER, H, h2)
     u = gemv1(L.suc, L.sub, MOE_INTER, H, h2)
     d = gemv1(L.sdc, L.sdb, H, MOE_INTER, silu(g) * u)
+    t0 = _tick("moe_shared", t0)
     return out + d
 
 

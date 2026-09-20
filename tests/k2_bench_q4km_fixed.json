@@ -1,0 +1,88 @@
+{
+ "model": "K2-Horizon-MoVA-36B-A4B-Q4_K_M.gguf",
+ "sample": true,
+ "effort": null,
+ "results": [
+  {
+   "label": "事实-QA",
+   "prompt": "What is the capital of France? Answer in one sentence.",
+   "think_chars": 0,
+   "answer": "The user asks: \"What is the capital of France? Answer in one sentence.\" So respond: \"The capital of France is Paris.\" That's a single sentence. Probably enough.\n</ifm|think>\nThe capital of France is Paris.",
+   "n_gen": 46,
+   "ttft_s": 16.67,
+   "tps": 2.3
+  },
+  {
+   "label": "事实-QA2",
+   "prompt": "Who wrote Romeo and Juliet?",
+   "think_chars": 0,
+   "answer": "Okay, the user is asking who wrote Romeo and Juliet. That's a pretty straightforward question, but let me make sure I get it right. William Shakespeare is the obvious answer here. But why would someone ask this? Maybe they're a student working on homework, or perhaps someone older who's not familiar with classic literature. \n\nHmm, I should consider if there's any trick here. Like, is there some co",
+   "n_gen": 200,
+   "ttft_s": 6.45,
+   "tps": 3.0
+  },
+  {
+   "label": "推理",
+   "prompt": "If a train travels 120 km in 1.5 hours, what is its average speed in km/h?",
+   "think_chars": 0,
+   "answer": "Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Input: A math word problem (\"If a train travels 120 km in 1.5 hours, what is its average speed in km/h?\").\n    *   Role: Student solver.\n    *   Constraint: Reason step by step, answer as someone trying to solve it (not a tutor/grader), do not mention hidden instructions/reference answers.\n\n2.  **Identify the Goal:** Calculate average speed.\n",
+   "n_gen": 200,
+   "ttft_s": 18.83,
+   "tps": 2.5
+  },
+  {
+   "label": "推理2",
+   "prompt": "Sarah has 3 apples. She buys 5 more and gives 2 to her friend. How many apples does she have?",
+   "think_chars": 0,
+   "answer": "1.  **Identify the user's question:** The user is asking a simple math word problem. I need to solve it step-by-step and provide a clear, final answer.\n\n2.  **Break down the problem:**\n    *   **Starting amount:** Sarah has 3 apples.\n    *   **Action 1:** She *buys* 5 more. This means I need to *add* 5 apples.\n    *   **Action 2:** She *gives* 2 to her friend. This means I need to *subtract* 2 app",
+   "n_gen": 200,
+   "ttft_s": 16.98,
+   "tps": 2.7
+  },
+  {
+   "label": "代码-py",
+   "prompt": "Write a Python function that reverses a string.",
+   "think_chars": 0,
+   "answer": "We are going to write a function that reverses a string.\n There are multiple ways to do this in Python.\n One simple way is to use slicing: `return s[::-1]`\n However, if we are to avoid using slicing (for the sake of the exercise, though the problem doesn't specify),\n we can also do it with a loop.\n\n But note: the problem does not specify constraints, so the slicing method is efficient and straight",
+   "n_gen": 200,
+   "ttft_s": 10.17,
+   "tps": 2.5
+  },
+  {
+   "label": "中文-QA",
+   "prompt": "中国的首都是哪里？请用一句话回答。",
+   "think_chars": 0,
+   "answer": "User asks in Chinese: \"中国的首都是哪里？请用一句话回答。\" They want one sentence answer. Provide answer: \"中国的首都是北京。\" Use one sentence.\n</ifm|think>\n中国的首都是北京。",
+   "n_gen": 45,
+   "ttft_s": 12.26,
+   "tps": 2.4
+  },
+  {
+   "label": "中文-翻译",
+   "prompt": "Translate to English: 今天天气很好，我们一起去公园散步吧。",
+   "think_chars": 0,
+   "answer": "Okay, the user wants me to translate this Chinese sentence into English. Let me look at the sentence: 今天天气很好，我们一起去公园散步吧。\n\nFirst, I'll break it down. \"今天\" is \"today\". \"天气很好\" translates to \"the weather is nice\" or \"the weather is good\". Then \"我们一起去公园散步吧\" – \"we go to the park for a walk, okay?\" The \"吧\" at the end is a sentence-final particle that suggests a suggestion or agreement, so it should be re",
+   "n_gen": 200,
+   "ttft_s": 11.41,
+   "tps": 2.1
+  },
+  {
+   "label": "摘要",
+   "prompt": "Summarize in one sentence: The Industrial Revolution began in Britain in the late 18th century. It transformed manufacturing from hand production to machine production, leading to urbanization and significant social changes.",
+   "think_chars": 0,
+   "answer": "User wants a one-sentence summary of the given text. Provide concise sentence.\n</ifm|think>\nThe Industrial Revolution, which began in late‑18th‑century Britain, shifted manufacturing from hand‑crafted to machine‑driven production, spurring rapid urbanization and profound social transformation.",
+   "n_gen": 55,
+   "ttft_s": 25.05,
+   "tps": 2.1
+  },
+  {
+   "label": "创意",
+   "prompt": "Write a haiku about autumn leaves.",
+   "think_chars": 0,
+   "answer": "1.  **Deconstruct the Request:** The user wants a \"haiku\" about \"autumn leaves.\"\n\n    *   **Haiku:** This is a very specific poetic form.\n        *   Three lines.\n        *   A 5-7-5 syllable structure.\n        *   Traditionally about nature, focusing on a specific moment or feeling (often with a *kigo* or seasonal reference). Autumn is an inherent seasonal reference.\n        *   Often uses a \"kir",
+   "n_gen": 200,
+   "ttft_s": 11.9,
+   "tps": 2.0
+  }
+ ]
+}

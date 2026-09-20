@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""k2_golden.py — 真模型金标准：numpy oracle（惰性反查表）跑 K2-Horizon-MoVA-36B。
+"""k2_golden_fast.py — 金标准 v3：批量 numpy oracle 一次前向（与 torch 机制对拍过的实现）。
 
-输出 tests/golden/k2horizon_golden.json：prompt 末位 top8 + 贪心续接 8 token。
-权重名翻译：HF 名（k2_numpy 用）→ GGUF 名（blk.N 惯例），堆叠专家张量按行切片。
+存：prompt 末位 top8 + 全部 48 层**末 token** 的 |x|.sum / |x|².sum 校验和。
+引擎闸门（k2_gate.py v3）用同样的钩子逐层对拍。
+内存：LazyW 逐层逐出（含专家元组键）⇒ 单进程 ~6GB。运行 ~2 分钟。
 """
 import os, sys, json, time
 import numpy as np
@@ -13,9 +14,9 @@ import gguf
 import gguf.quants as Q
 import k2_numpy as KN
 
-GGUF = "/media/xiao_/OverSys1/gguf/k2-horizon/K2-Horizon-MoVA-36B-A4B-Q4_K_M.gguf"
+GGUF = os.environ.get("MODEL", "/media/Data-1/gguf/k2-horizon/K2-Horizon-MoVA-36B-A4B-Q4_K_M.gguf")
+OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests/golden/k2horizon_golden.json")
 
-t00 = time.time()
 r = gguf.GGUFReader(GGUF)
 T_ = {t.name: t for t in r.tensors}
 meta = {}
@@ -25,11 +26,13 @@ for m in r.fields.values():
     except Exception:
         pass
 
+
 def mval(suffix, default):
     for k, v in meta.items():
         if k.endswith(suffix):
             return v
     return default
+
 
 n_head = int(mval("attention.head_count", 32))
 n_kv = int(mval("attention.head_count_kv", 8))
@@ -42,16 +45,12 @@ NUSED = int(mval("expert_used_count", 8))
 MEXP = int(mval("mova.expert_count", 64))
 MUSED = int(mval("mova.expert_used_count", 4))
 THETA = float(mval("rope.theta", 1e7))
-print(f"[k2] L={NL} H={H} heads={n_head}/{n_kv} hd={hd} MoE={NEXP}x{NUSED} MoVA={MEXP}x{MUSED}", flush=True)
-
-experts_shape = tuple(int(v) for v in T_["blk.3.ffn_gate_exps.weight"].shape)
-vexps_shape = tuple(int(v) for v in T_["blk.3.attn_v_exps.weight"].shape)
-print(f"[k2] ffn_exps {experts_shape}  v_exps {vexps_shape}", flush=True)
+SCALING = float(mval("expert_weights_scale", 2.5))
+GATING = "sigmoid" if int(mval("expert_gating_func", 2)) == 2 else "softmax"
+print(f"[k2] L={NL} H={H} MoE={NEXP}x{NUSED} MoVA={MEXP}x{MUSED} gating={GATING} scale={SCALING}", flush=True)
 
 
 class LazyW:
-    """GGUF 名 → fp32（惰性反查）。保留最近一层的张量；embed/lm_head/output_norm 常驻。"""
-
     KEEP = ("token_embd.weight", "output.weight", "output_norm.weight")
 
     def __init__(self, T_):
@@ -60,7 +59,6 @@ class LazyW:
         self.cur_blk = None
 
     def expert(self, name, e, n_exp):
-        """★ 只反量化第 e 个专家（整张量 dequant 是 100× 浪费——oracle 慢 400s/token 的根因）。"""
         key = (name, e)
         if key in self.cache:
             return self.cache[key]
@@ -68,7 +66,7 @@ class LazyW:
         per = t.data.nbytes // n_exp
         raw = np.frombuffer(t.data, np.uint8)[e * per:(e + 1) * per]
         v = np.asarray(Q.dequantize(raw, t.tensor_type), np.float32)
-        shp = tuple(int(x) for x in t.shape)[:-1][::-1]   # 去掉专家轴再反转 = [out, in]
+        shp = tuple(int(x) for x in t.shape)[:-1][::-1]
         v = v.reshape(shp)
         self.cache[key] = v
         return v
@@ -96,13 +94,7 @@ class LazyW:
 lazy = LazyW(T_)
 
 
-NEXP_C = NEXP
-MEXP_C = MEXP
-
-
 class WMap:
-    """HF 名 → GGUF 名 + 堆叠专家切片。"""
-
     @staticmethod
     def hf2gguf(name):
         if name == "model.embed_tokens.weight": return "token_embd.weight"
@@ -119,13 +111,13 @@ class WMap:
                       .replace("self_attn.v_router", "attn_v_gate")
                       .replace("input_layernorm", "attn_norm")
                       .replace("post_attention_layernorm", "ffn_norm")
-                      .replace("mlp.gate_proj", "ffn_gate")     # ★ 稠密 FFN（必须先于 mlp.gate 规则）
+                      .replace("mlp.gate_proj", "ffn_gate")
                       .replace("mlp.up_proj", "ffn_up")
                       .replace("mlp.down_proj", "ffn_down")
-                      .replace("mlp.gate.bias", "exp_probs_b.bias")  # ★★ MoE 路由 bias（moe_gate_bias=true 时官方语义要加，缺它=静默路由错误）
-                      .replace("mlp.gate", "ffn_gate_inp"))     # MoE 路由器 weight
+                      .replace("mlp.gate.bias", "exp_probs_b.bias")
+                      .replace("mlp.gate", "ffn_gate_inp"))
             if sub.startswith("mlp.experts."):
-                return None   # 堆叠张量，走专用接口
+                return None
             if sub.startswith("mlp."):
                 sub = sub.replace("mlp.shared_experts.gate_proj", "ffn_gate_shexp") \
                          .replace("mlp.shared_experts.up_proj", "ffn_up_shexp") \
@@ -138,18 +130,16 @@ class WMap:
         self.lazy = lazy
 
     def __getitem__(self, name):
-        # 堆叠专家：mlp.experts.E.{gate,up,down}_proj.weight → ffn_*_exps.weight[E]
         if ".experts." in name:
-            # ffn_*_exps 反查表形状 [H, inter, NEXP]，专家 e = full[:, :, e].T → [inter, H]
             parts = name.split(".")
-            li, ei = int(parts[2]), int(parts[5])   # layers.N.mlp.experts.E.kind_proj
+            li, ei = int(parts[2]), int(parts[5])
             kind = parts[6].replace("_proj", "")
             base = {"gate": "ffn_gate_exps", "up": "ffn_up_exps", "down": "ffn_down_exps"}[kind] + ".weight"
-            return self.lazy.expert(f"blk.{li}.{base}", ei, NEXP_C)
+            return self.lazy.expert(f"blk.{li}.{base}", ei, NEXP)
         if ".v_experts." in name:
             li = int(name.split(".")[2])
             ei = int(name.split("v_experts.")[1].split(".")[0])
-            return self.lazy.expert(f"blk.{li}.attn_v_exps.weight", ei, MEXP_C)
+            return self.lazy.expert(f"blk.{li}.attn_v_exps.weight", ei, MEXP)
         gg = self.hf2gguf(name)
         return self.lazy[gg]
 
@@ -167,10 +157,9 @@ class WMap:
 
 wm = WMap(lazy)
 
-# ── tokenizer ──
 import falcon_tok
-tk, _ = falcon_tok.build(GGUF, add_bos=False, pre="llama3")   # pre=k2-horizon 的正则与 llama3 相同（tokenizer.json 实证）
-prompt = "The capital of France is"
+tk, _ = falcon_tok.build(GGUF, add_bos=False, pre="llama3")
+prompt = os.environ.get("PROMPT", "The capital of France is")
 ids = tk.encode(prompt).ids
 print(f"[k2] prompt ids({len(ids)}): {ids}", flush=True)
 
@@ -180,37 +169,32 @@ cfg = {
     "num_experts": NEXP, "num_experts_per_tok": NUSED, "num_shared_experts": 1,
     "mova_num_experts": MEXP, "mova_num_experts_per_tok": MUSED,
     "mlp_only_layers": [0, 1, 2], "layernorm_num_groups": 2, "rms_norm_eps": EPS,
-    "rope_theta": THETA, "router_scaling_factor": 2.5, "query_key_norm": False,
-    "router_score_func": "sigmoid",   # 真实 36B config（GGUF expert_gating_func=2）
+    "rope_theta": THETA, "router_scaling_factor": SCALING, "query_key_norm": False,
+    "router_score_func": GATING,
 }
 
-# ── prompt 前向 ──
-t0 = time.time()
-logits = KN.model_forward(np.array(ids), wm, cfg)
-print(f"[k2] prompt {len(ids)} tok 前向 {time.time()-t0:.1f}s", flush=True)
-last = logits[-1]
-top8 = np.argsort(-last)[:8]
-print("末位 top8:", [(int(i), round(float(last[i]), 3)) for i in top8])
+# ── 一次批量前向 + 逐层校验和（末 token）──
+layer_sums = []
 
-# ── 贪心 8 token（全量重跑，惰性缓存按层逐出）──
-gen = [int(np.argmax(last))]
-cur = list(ids)
-for i in range(7):
-    t0 = time.time()
-    lg = KN.model_forward(np.array(cur), wm, cfg)
-    nxt = int(lg[-1].argmax())
-    gen.append(nxt)
-    cur.append(nxt)
-    print(f"  gen {i+1}/7: {time.time()-t0:.1f}s tok={nxt}", flush=True)
+
+def hook(il, xl):
+    last = np.asarray(xl)[-1]
+    layer_sums.append((int(il), float(np.abs(last).sum()), float(np.square(last).sum())))
+
+
+t0 = time.time()
+lg = KN.model_forward(np.array(ids), wm, cfg, layer_hook=hook)
+print(f"[k2] 前向 {len(ids)} tok {time.time()-t0:.0f}s", flush=True)
+lg = np.asarray(lg)[-1]
+top8 = np.argsort(-lg)[:8]
+print("末位 top8:", [(int(i), round(float(lg[i]), 3)) for i in top8], flush=True)
 
 out = {
-    "model": "K2-Horizon-MoVA-36B-A4B-Q4_K_M",
+    "model": os.path.basename(GGUF),
     "prompt": prompt, "ids": ids,
-    "last_top8": [(int(i), float(last[i])) for i in top8],
-    "greedy8": gen,
-    "oracle": "k2_numpy（机制对齐官方 modeling_k2_horizon.py，torch 对拍 max|Δ|=1.4e-7）",
+    "last_top8": [[int(i), float(lg[i])] for i in top8],
+    "greedy8": [int(top8[0])],
+    "layer_sums": layer_sums,
 }
-gd = "/media/xiao_/OverSys1/npu-direct/hybrid/tests/golden/k2horizon_golden.json"
-os.makedirs(os.path.dirname(gd), exist_ok=True)
-json.dump(out, open(gd, "w"), indent=1)
-print("金标准已写入", gd)
+json.dump(out, open(OUT, "w"), ensure_ascii=False, indent=1)
+print("已写", OUT, flush=True)

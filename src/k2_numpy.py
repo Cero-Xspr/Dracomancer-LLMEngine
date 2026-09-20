@@ -54,9 +54,13 @@ def softmax_last(x):
     return e / e.sum(-1, keepdims=True)
 
 
-def calc_router(logits, bias, top_k, scaling):
-    """calc_router_weights：bias 只参与选择；权重=原始分数 gather 后归一 ×scaling。"""
-    scores = softmax_last(logits)
+def calc_router(logits, bias, top_k, scaling, score_func="softmax"):
+    """calc_router_weights：bias 只参与选择；权重=原始分数 gather 后归一 ×scaling。
+    真实 36B config: router_score_func="sigmoid"、router_scaling_factor=2.5。"""
+    if score_func == "sigmoid":
+        scores = 1.0 / (1.0 + np.exp(-logits.astype(np.float32)))
+    else:
+        scores = softmax_last(logits)
     sel_scores = scores + bias if bias is not None else scores
     idx = np.argsort(-sel_scores, axis=-1, kind="stable")[..., :top_k]
     w = np.take_along_axis(scores, idx, axis=-1)
@@ -91,7 +95,8 @@ def mova_attention(x, w, prefix, cfg, cos, sin):
     logits = x @ w[prefix + "v_router.weight"].T
     bias = w.get(prefix + "v_router.bias")
     topk = cfg["mova_num_experts_per_tok"]
-    rw, sel = calc_router(logits, bias, topk, cfg.get("router_scaling_factor"))
+    rw, sel = calc_router(logits, bias, topk, cfg.get("router_scaling_factor"),
+                          cfg.get("router_score_func", "softmax"))
     V = np.zeros((T, nkv * hd), np.float32)
     flat_e = sel.ravel()
     flat_t = np.repeat(np.arange(T), topk)
@@ -138,7 +143,8 @@ def sparse_moe(x, w, prefix, cfg):
     logits = x @ w[prefix + "gate.weight"].T
     bias = w.get(prefix + "gate.bias")
     topk = cfg["num_experts_per_tok"]
-    rw, sel = calc_router(logits, bias, topk, cfg.get("router_scaling_factor"))
+    rw, sel = calc_router(logits, bias, topk, cfg.get("router_scaling_factor"),
+                          cfg.get("router_score_func", "softmax"))
     out = np.zeros((T, cfg["hidden_size"]), np.float32)
     flat_e = sel.ravel()
     flat_t = np.repeat(np.arange(T), topk)

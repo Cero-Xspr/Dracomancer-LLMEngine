@@ -138,16 +138,20 @@ class FastTensor:
         self.n_bytes = n_bytes
         self.data_offset = data_off_abs
         self._mm = mm
-        item = _ITERM.get(tensor_type)
-        np_dims = tuple(int(d) for d in reversed(dims.tolist()))
+        self._rebind(mm)
+
+    def _rebind(self, mm):
+        """（重）绑定到底层缓冲——anon 装载换缓冲时复用同一套形状逻辑。"""
+        item = _ITERM.get(self.tensor_type)
+        np_dims = tuple(int(d) for d in reversed(self.shape.tolist()))
         if item is not None:
-            self.data = np.frombuffer(mm, dtype=item, count=n_elements, offset=data_off_abs)
-            if self.data.size == n_elements and np_dims:
+            self.data = np.frombuffer(mm, dtype=item, count=self.n_elements, offset=self.data_offset)
+            if self.data.size == self.n_elements and np_dims:
                 self.data = self.data.reshape(np_dims)
         else:
-            self.data = np.frombuffer(mm, dtype=np.uint8, count=n_bytes, offset=data_off_abs)
+            self.data = np.frombuffer(mm, dtype=np.uint8, count=self.n_bytes, offset=self.data_offset)
             if np_dims:
-                self.data = self.data.reshape(quant_shape_to_byte_shape(np_dims, tensor_type))
+                self.data = self.data.reshape(quant_shape_to_byte_shape(np_dims, self.tensor_type))
 
     def raw_bytes(self):
         """该张量的裸字节视图（零拷贝）。"""
@@ -183,6 +187,23 @@ class FastGGUF:
         self._fd = os.open(self.path, os.O_RDONLY)
         self._mm = _mmap.mmap(self._fd, 0, access=_mmap.ACCESS_READ)
         self.data = np.frombuffer(self._mm, dtype=np.uint8)   # gguf-py 风格的全文件视图
+        # ★ 大页建议：文件映射走 2MB THP，把每 token 的 4KB 缺页数砍 512×
+        #   (专家选择逐 token 变化 ⇒ 触碰新页 ⇒ minor fault ~1µs/页，是 decode 主导项之一)
+        if os.environ.get("DRACO_THP", "1") == "1":
+            try:
+                import ctypes as _ct
+                _libc = _ct.CDLL("libc.so.6", use_errno=True)
+                _mv = _libc.madvise
+                _mv.argtypes = [_ct.c_void_p, _ct.c_size_t, _ct.c_int]
+                _mv.restype = _ct.c_int
+                buf = (_ct.c_char * len(self._mm)).from_buffer(self._mm)
+                addr = _ct.addressof(buf)
+                MADV_HUGEPAGE, MADV_WILLNEED = 14, 3
+                _mv(addr, len(self._mm), MADV_HUGEPAGE)
+                _mv(addr, min(len(self._mm), 1 << 30), MADV_WILLNEED)   # 先预读头部 1GB
+                del buf
+            except Exception:
+                pass
         try:
             self._parse()
         except Exception:
@@ -290,6 +311,30 @@ class FastGGUF:
             self.tensors.append(FastTensor(name, gt, dims, t_off, self._mm, abs_off,
                                            n_elements=n_elems, n_bytes=n_bytes))
         self._by_name = {t.name: t for t in self.tensors}
+        # ★ 匿名内存装载（DRACO_ANON=1）：把张量字节 pread 进 malloc'd 缓冲。
+        #   动机：decode 时专家选择逐 token 变化 ⇒ 每token几十万次 4KB minor fault 主导耗时；
+        #   anon 内存可享 THP(madvise)，页表在装载时一次建好。适合 <RAM 的模型（如 IQ2_M 12.4GB）。
+        if os.environ.get("DRACO_ANON", "0") == "1":
+            import ctypes as _ct
+            total = max((t.data_offset + t.n_bytes) for t in self.tensors)
+            buf = (_ct.c_char * total)()
+            MADV_HUGEPAGE = 14
+            _libc = _ct.CDLL("libc.so.6", use_errno=True)
+            _libc.madvise(_ct.c_void_p(_ct.addressof(buf)), _ct.c_size_t(total), _ct.c_int(MADV_HUGEPAGE))
+            # 分段 pread（大块，避免 read() 一次 12GB 的信号问题）
+            fd = os.open(self.path, os.O_RDONLY)
+            CH = 1 << 28
+            off = 0
+            while off < total:
+                n = min(CH, total - off)
+                mv = memoryview(buf)[off:off + n]
+                got = os.preadv(fd, [mv], off)
+                off += got
+            os.close(fd)
+            for t in self.tensors:
+                t._mm = buf
+                t._rebind(buf)
+            self._anon_buf = buf
 
     def _value_array(self, o, t, n):
         """连续读 n 个标量 → np 数组（一次 frombuffer）。"""
