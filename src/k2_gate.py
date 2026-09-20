@@ -11,8 +11,8 @@ import k2_engine as KE
 import falcon_tok
 
 tk, _ = falcon_tok.build(KE.MODEL, add_bos=False, pre="llama3")
-gold = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                   "tests/golden/k2horizon_golden.json")))
+gold = json.load(open(os.environ.get("GOLDEN", os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                         "tests/golden/k2horizon_golden.json"))))
 ids = gold["ids"]
 
 sums = {}

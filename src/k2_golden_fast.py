@@ -15,7 +15,7 @@ import gguf.quants as Q
 import k2_numpy as KN
 
 GGUF = os.environ.get("MODEL", "/media/Data-1/gguf/k2-horizon/K2-Horizon-MoVA-36B-A4B-Q4_K_M.gguf")
-OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests/golden/k2horizon_golden.json")
+OUT = os.environ.get("GOLDEN_OUT", os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests/golden/k2horizon_golden.json"))
 
 r = gguf.GGUFReader(GGUF)
 T_ = {t.name: t for t in r.tensors}

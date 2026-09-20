@@ -125,6 +125,11 @@ else:
     K2_FUSE = False
 K2_FUSE = K2_FUSE and LIB13 is not None
 
+# ── F1c：iGPU 驻留（K2_VK=1）。IQ2_S 张量上传 GPU，六个相位走 libvkrun ──
+K2_VK = os.environ.get("K2_VK", "0") == "1"
+VK = None
+VK_SKIP = set(x for x in os.environ.get("K2_VK_SKIP", "").split(",") if x)
+
 
 def _seg_ptr(wb):
     return wb.ctypes.data_as(ct.c_void_p)
@@ -264,11 +269,66 @@ class Layer:
         self.V = np.zeros((MAXT, NKV, HD), np.float32)
         STATES.extend([self.K, self.V])
 
+    def attach_vk(self, VK):
+        """K2_VK: 登记 GPU 常驻矩阵 ((G, n_out) 或 G)；None = 该张量留 CPU。"""
+        self.qg = self.kg = self.gg = self.vgg = None
+        self.veg = self.exg = self.uxg = self.dxg = None
+        self.sgg = self.sug = self.sdg = None
+        if not self.sparse:
+            return
+        p = f"blk.{self.li}."
+
+        def g(name, n_out=None):
+            gg = VK.reg.get(name)
+            return (gg, n_out) if (gg is not None and n_out is not None) else gg
+
+        self.qg = g(p + "attn_q.weight", NH * HD)
+        self.kg = g(p + "attn_k.weight", NKV * HD)
+        self.gg = g(p + "attn_gate.weight", NH * HD)
+        self.vgg = g(p + "attn_v_gate.weight", MEXP)
+        self.veg = g(p + "attn_v_exps.weight")
+        self.exg = g(p + "ffn_gate_exps.weight")
+        self.uxg = g(p + "ffn_up_exps.weight")
+        self.dxg = g(p + "ffn_down_exps.weight")
+        self.sgg = g(p + "ffn_gate_shexp.weight")
+        self.sug = g(p + "ffn_up_shexp.weight")
+        self.sdg = g(p + "ffn_down_shexp.weight")
+
 
 print("[k2] 装载层权重...", flush=True)
 LOGITS = np.zeros(1, np.float32)
 LAYERS = [Layer(li) for li in range(NL)]
 ONORM = wf32("output_norm.weight")
+
+if K2_VK:
+    try:
+        import k2_vk as _k2vk
+
+        def _is13(name):
+            return tcode(name) == 13
+
+        _wanted = []
+        for L in LAYERS:
+            if not L.sparse:
+                continue
+            p = f"blk.{L.li}."
+            for s in ("attn_q.weight", "attn_k.weight", "attn_gate.weight",
+                      "attn_v_gate.weight", "attn_v_exps.weight",
+                      "ffn_gate_exps.weight", "ffn_up_exps.weight"):
+                if _is13(p + s):
+                    _wanted.append(p + s)
+            if _is13(p + "ffn_down_exps.weight"):
+                _wanted.append(p + "ffn_down_exps.weight")
+        # ★ shexp(g/u/d) ~0.6MB/个不上 GPU：单次调用开销(~0.15ms) > CPU 计算(~0.09ms)，净亏
+        VK = _k2vk.VKCtx(T, _wanted).arm(upload=not os.environ.get("K2_VK_NOUPLOAD"))
+        for L in LAYERS:
+            L.attach_vk(VK)
+        if not os.environ.get("K2_VK_NOUPLOAD"):
+            VK.drop_cache()
+        print("[vk] 引擎已切 iGPU 驻留", flush=True)
+    except Exception as e:
+        print(f"[vk] 初始化失败，回落 CPU：{e!r}", flush=True)
+        VK = None
 
 
 def grouped_rms1(x, wv):
@@ -341,7 +401,9 @@ def attn_ffn_common(x, L, pos):
     t0 = tp() if tp else 0
     h = grouped_rms1(x, L.norm_a)
     t0 = _tick("rms", t0)
-    if K2_FUSE and L.qc == 13 and L.gc == 13 and L.kc == 13 and (not L.sparse or L.vgc == 13):
+    if VK is not None and "fused4" not in VK_SKIP and L.sparse and L.qg and L.kg and L.gg and L.vgg:
+        qf, gate_in, kf, vlogits = VK.fused4(h, L.qg, L.gg, L.kg, L.vgg)
+    elif K2_FUSE and L.qc == 13 and L.gc == 13 and L.kc == 13 and (not L.sparse or L.vgc == 13):
         qf, gate_in, kf, vlogits = gemv_fused4(h, L.qb, L.gb, L.kb, L.vgb if L.sparse else L.qb,
                                                NH * HD, NH * HD, NKV * HD, MEXP if L.sparse else 1)
         if not L.sparse:
@@ -363,7 +425,10 @@ def attn_ffn_common(x, L, pos):
         _LAST_SEL.setdefault(L.li, [None, None])[0] = sel
         wts = sc[sel]
         wts = wts / wts.sum() * R_SCALING
-        if BATCH_ON:
+        if VK is not None and "mova" not in VK_SKIP and L.veg is not None:
+            V4 = VK.mova4(h, L.veg, sel, L.ve_per, VOUT)
+            v = (silu(V4) * wts[:, None]).sum(0)
+        elif BATCH_ON:
             sel_a = np.ascontiguousarray(sel, np.int32)
             V4 = np.empty(MUSED * VOUT, np.float32)
             rc = LIB_B.m5_gemvn_q4k(pf(h), 0, p8(L.veb), sel_a.ctypes.data_as(ct.POINTER(ct.c_int)),
@@ -409,7 +474,17 @@ def moe_ffn(h2, L):
     rw = sc[sel]
     rw = rw / rw.sum() * R_SCALING
     t0 = _tick("moe_route", t0)
-    if BATCH_ON:
+    if VK is not None and "moe" not in VK_SKIP and L.exg and L.uxg:
+        G8, U8 = VK.gate_up(h2, L.exg, L.uxg, sel, L.ex_per, L.ux_per, MOE_INTER)
+        gu8 = silu(G8) * U8
+        if L.dxg is not None:
+            D8 = VK.down(gu8, L.dxg, sel, L.dx_per, H, MOE_INTER)
+            out = (D8 * rw[:, None]).sum(0)
+        else:
+            out = np.zeros(H, np.float32)
+            for k, e in enumerate(sel):
+                out += gemv1(L.dxc, L.dxb[e * L.dx_per:], H, MOE_INTER, gu8[k]) * rw[k]
+    elif BATCH_ON:
         sel_a = np.ascontiguousarray(sel, np.int32)
         pi_ = ct.POINTER(ct.c_int)
         G = np.empty(NUSED * MOE_INTER, np.float32)
@@ -440,9 +515,16 @@ def moe_ffn(h2, L):
             d = gemv1(L.dxc, L.dxb[e * L.dx_per:], H, MOE_INTER, silu(g) * u)
             out += d * rw[k]
     t0 = _tick("moe_experts", t0)
-    g = gemv1(L.sgc, L.sgb, MOE_INTER, H, h2)
-    u = gemv1(L.suc, L.sub, MOE_INTER, H, h2)
-    d = gemv1(L.sdc, L.sdb, H, MOE_INTER, silu(g) * u)
+    if VK is not None and L.sgg and L.sug:
+        g, u = VK.shared_gu(h2, L.sgg, L.sug, MOE_INTER)
+    else:
+        g = gemv1(L.sgc, L.sgb, MOE_INTER, H, h2)
+        u = gemv1(L.suc, L.sub, MOE_INTER, H, h2)
+    su = silu(g) * u
+    if VK is not None and L.sdg is not None:
+        d = VK.shared_d(su, L.sdg, H, MOE_INTER)
+    else:
+        d = gemv1(L.sdc, L.sdb, H, MOE_INTER, su)
     t0 = _tick("moe_shared", t0)
     return out + d
 

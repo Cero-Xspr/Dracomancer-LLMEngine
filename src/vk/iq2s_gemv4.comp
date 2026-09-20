@@ -1,0 +1,56 @@
+#version 450
+// iq2s_gemv4.comp — v3 + SMEM 块暂存。
+// v3 实测 ~4-5GB/s：根因是每 lane 每块 5-6 次全局 32-bit 载入（一个 WG 每块 ~21 个
+// L1 sector，有效数据只有 82B，放大 ~33×）。v4 由 lane<22 协作把覆盖块的 88B 窗口
+// （22 word）一次搬进 SMEM，全部字节读改走 SMEM；每块 2 个 barrier。
+// PC 与 v3 完全一致（5×u32），可无缝替换。
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer WQ { uint wq[]; };
+layout(set = 0, binding = 1) readonly buffer G16 { uint g16[]; };
+layout(set = 0, binding = 2) readonly buffer XV { float xv[]; };
+layout(set = 0, binding = 3) writeonly buffer YV { float yv[]; };
+layout(push_constant) uniform PC { uint w_off; uint x_off; uint y_off; uint n_out; uint nb; } pc;
+shared uint sw[22];       // 88B 窗口（覆盖 82B 块）
+shared float sred[256];
+void main() {
+    uint row  = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    uint rowbase = pc.w_off + row * pc.nb * 82u;
+    uint sb = lane >> 3u;
+    float acc = 0.0f;
+    for (uint b = 0u; b < pc.nb; b++) {
+        uint boff = rowbase + b * 82u;
+        uint wstart = boff & ~3u;                 // 窗口起点（word 对齐）
+        uint wbase = wstart >> 2u;
+        barrier();
+        if (lane < 22u) sw[lane] = wq[wbase + lane];
+        barrier();
+        // 字节读：窗口内下标 = bd + 块内偏移（bd = boff&3 ∈ {0,2}）；d 在窗口 word0 的 [bd,bd+1] 字节
+        uint bd = (boff & 3u);
+        uint dlo = (sw[0] >> (bd * 8u)) & 0xFFu;
+        uint dhi = (sw[0] >> (bd * 8u + 8u)) & 0xFFu;
+        float d = unpackHalf2x16(dlo | (dhi << 8u)).x;
+        uint qb_i = bd + 2u + sb;
+        uint qs  = (sw[qb_i >> 2u] >> ((qb_i & 3u) * 8u)) & 0xFFu;
+        uint sb_i = bd + 34u + sb;
+        uint sgn = (sw[sb_i >> 2u] >> ((sb_i & 3u) * 8u)) & 0xFFu;
+        uint hb_i = bd + 66u + (sb >> 2u);
+        uint qhb = (sw[hb_i >> 2u] >> ((hb_i & 3u) * 8u)) & 0xFFu;
+        uint cb_i = bd + 74u + (sb >> 2u);
+        uint scb = (sw[cb_i >> 2u] >> ((cb_i & 3u) * 8u)) & 0xFFu;
+        uint idx10 = qs | (((qhb >> ((sb & 3u) * 2u)) & 3u) << 8u);
+        float nibv = (((sb >> 1u) & 1u) == 0u) ? float(scb & 0xFu) : float((scb >> 4u) & 0xFu);
+        float db = d * 0.25f * (0.5f + nibv);
+        uint code = (g16[idx10] >> (2u * (lane & 7u))) & 3u;
+        float v = 8.0f + 17.0f * float(code) + 0.5f * float(code) * float(code - 1u);
+        float sign = (((sgn >> (lane & 7u)) & 1u) == 1u) ? -1.0f : 1.0f;
+        acc += db * v * sign * xv[pc.x_off + b * 256u + lane];
+    }
+    sred[lane] = acc;
+    barrier();
+    for (uint stp = 128u; stp > 0u; stp >>= 1u) {
+        if (lane < stp) sred[lane] += sred[lane + stp];
+        barrier();
+    }
+    if (lane == 0u) yv[pc.y_off + row] = sred[0];
+}

@@ -1,0 +1,48 @@
+#version 450
+// iq2s_gemv3.comp — F1c 引擎版：v2（已对拍 PASS 5.96e-7）+ 缓冲内偏移。
+// 每矩阵一次 vkCmdDispatch（一 WG 一行），PC 携带 5×u32：
+//   w_off: 本矩阵在所绑 W 缓冲内的字节偏移（缓冲 ≤4GB ⇒ u32 安全；行内偏移 <32MB）
+//   x_off / y_off: X/Y 缓冲内的 float 下标
+//   n_out / nb: 行数、每行块数
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer WQ { uint wq[]; };
+layout(set = 0, binding = 1) readonly buffer G16 { uint g16[]; };
+layout(set = 0, binding = 2) readonly buffer XV { float xv[]; };
+layout(set = 0, binding = 3) writeonly buffer YV { float yv[]; };
+layout(push_constant) uniform PC { uint w_off; uint x_off; uint y_off; uint n_out; uint nb; } pc;
+shared float sred[256];
+uint wbyte(uint off) {
+    // ★ 不用 bitfieldExtract（本机 RADV/ACO 疑似误编译）
+    return (wq[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu;
+}
+void main() {
+    uint row  = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;      // = 块内元素下标 0..255
+    uint rowbase = pc.w_off + row * pc.nb * 82u;
+    uint sb = lane >> 3u;                    // 子块 0..31
+    float acc = 0.0f;
+    for (uint b = 0u; b < pc.nb; b++) {
+        uint boff = rowbase + b * 82u;
+        uint lo = wbyte(boff), hi = wbyte(boff + 1u);
+        float d = unpackHalf2x16(uint(lo) | (uint(hi) << 8u)).x;
+        uint qs  = wbyte(boff + 2u + sb);
+        uint sgn = wbyte(boff + 34u + sb);
+        uint qhb = wbyte(boff + 66u + (sb >> 2u));
+        uint scb = wbyte(boff + 74u + (sb >> 2u));   // ★ llama.cpp: 子块 4g+0,1→低 nib，4g+2,3→高 nib
+        uint idx10 = qs | (((qhb >> ((sb & 3u) * 2u)) & 3u) << 8u);
+        float nibv = (((sb >> 1u) & 1u) == 0u) ? float(scb & 0xFu) : float((scb >> 4u) & 0xFu);
+        float db = d * 0.25f * (0.5f + nibv);
+        uint code = (g16[idx10] >> (2u * (lane & 7u))) & 3u;
+        float v = 8.0f + 17.0f * float(code) + 0.5f * float(code) * float(code - 1u);
+        float sign = (((sgn >> (lane & 7u)) & 1u) == 1u) ? -1.0f : 1.0f;
+        acc += db * v * sign * xv[pc.x_off + b * 256u + lane];
+    }
+    sred[lane] = acc;
+    barrier();
+    // ★ 并行树形归约（串行版 lane0 逐个加 256 项是首版瓶颈）
+    for (uint stp = 128u; stp > 0u; stp >>= 1u) {
+        if (lane < stp) sred[lane] += sred[lane + stp];
+        barrier();
+    }
+    if (lane == 0u) yv[pc.y_off + row] = sred[0];
+}
