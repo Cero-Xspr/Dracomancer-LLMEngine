@@ -15,18 +15,17 @@ uint wbyte(uint off) {
 void main() {
     uint row  = gl_WorkGroupID.x;
     uint lane = gl_LocalInvocationID.x;      // = 块内元素下标 0..255
-    yv[row] = 12345.0f + float(row);         // ★ 标记：证明 kernel 执行过
     uint rowbase = row * pc.nb * 82u;
     uint sb = lane >> 3u;                    // 子块 0..31
-    float acc = 12345.0f + float(row);
-    for (uint b = 0u; b < 0u; b++) {   // ★ 诊断：跳过计算循环
+    float acc = 0.0f;
+    for (uint b = 0u; b < pc.nb; b++) {
         uint boff = rowbase + b * 82u;
         uint lo = wbyte(boff), hi = wbyte(boff + 1u);
         float d = unpackHalf2x16(uint(lo) | (uint(hi) << 8u)).x;
         uint qs  = wbyte(boff + 2u + sb);
         uint sgn = wbyte(boff + 34u + sb);
         uint qhb = wbyte(boff + 66u + (sb >> 2u));
-        uint scb = wbyte(boff + 74u + (sb >> 1u));
+        uint scb = wbyte(boff + 74u + (sb >> 2u));   // ★ llama.cpp: 子块 4g+0,1→低 nib，4g+2,3→高 nib
         uint idx10 = qs | (((qhb >> ((sb & 3u) * 2u)) & 3u) << 8u);
         float nibv = (((sb >> 1u) & 1u) == 0u) ? float(scb & 0xFu) : float((scb >> 4u) & 0xFu);
         float db = d * 0.25f * (0.5f + nibv);
@@ -37,9 +36,10 @@ void main() {
     }
     sred[lane] = acc;
     barrier();
-    if (lane == 0u) {
-        float s = 0.0f;
-        for (uint k = 0u; k < 256u; k++) s += sred[k];
-        yv[row] = s;
+    // ★ 并行树形归约（串行版 lane0 逐个加 256 项是首版瓶颈）
+    for (uint stp = 128u; stp > 0u; stp >>= 1u) {
+        if (lane < stp) sred[lane] += sred[lane + stp];
+        barrier();
     }
+    if (lane == 0u) yv[row] = sred[0];
 }

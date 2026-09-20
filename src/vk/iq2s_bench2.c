@@ -109,7 +109,8 @@ int main(void) {
             if (!(mr.memoryTypeBits & (1u << k))) continue;
             VkMemoryPropertyFlags fl = mp.memoryTypes[k].propertyFlags;
             if (!(fl & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) || !(fl & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) continue;
-        if (i < 2 && !(fl & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) continue;   // W/GRID 必须 DEV_LOCAL（heap0 写入对 GPU 不可见的坑）    
+        // ★ 实测：heap1(DEV_LOCAL) 的 CPU mmap 写入对 GPU 不可见（CPU 回读一致也没用）；
+        //   heap0(GTT) 写入 GPU 可读 ✓。大缓冲进 heap1 需 staging+vkCmdCopyBuffer。
             if (mp.memoryHeaps[mp.memoryTypes[k].heapIndex].size < sizes[i]) continue;
             mt = (int)k; break;
         }
