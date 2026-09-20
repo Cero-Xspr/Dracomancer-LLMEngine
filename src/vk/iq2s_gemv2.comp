@@ -1,0 +1,45 @@
+#version 450
+// iq2s_gemv2.comp — IQ2_S gemv v2：workgroup=256 lane 恰好覆盖一块 256 值
+// grid 码表缩到 2KB（uint[1024]，L1 常驻）；码值闭式展开 8+17c+c(c-1)/2 ∈ {8,25,43}
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer WQ { uint wq[]; };
+layout(set = 0, binding = 1) readonly buffer G16 { uint g16[]; };
+layout(set = 0, binding = 2) readonly buffer XV { float xv[]; };
+layout(set = 0, binding = 3) writeonly buffer YV { float yv[]; };
+layout(push_constant) uniform PC { uint n_out; uint nb; } pc;
+shared float sred[256];
+uint wbyte(uint off) {
+    // ★ 不用 bitfieldExtract（本机 RADV/ACO 疑似误编译）
+    return (wq[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu;
+}
+void main() {
+    uint row  = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;      // = 块内元素下标 0..255
+    yv[row] = 12345.0f + float(row);         // ★ 标记：证明 kernel 执行过
+    uint rowbase = row * pc.nb * 82u;
+    uint sb = lane >> 3u;                    // 子块 0..31
+    float acc = 12345.0f + float(row);
+    for (uint b = 0u; b < 0u; b++) {   // ★ 诊断：跳过计算循环
+        uint boff = rowbase + b * 82u;
+        uint lo = wbyte(boff), hi = wbyte(boff + 1u);
+        float d = unpackHalf2x16(uint(lo) | (uint(hi) << 8u)).x;
+        uint qs  = wbyte(boff + 2u + sb);
+        uint sgn = wbyte(boff + 34u + sb);
+        uint qhb = wbyte(boff + 66u + (sb >> 2u));
+        uint scb = wbyte(boff + 74u + (sb >> 1u));
+        uint idx10 = qs | (((qhb >> ((sb & 3u) * 2u)) & 3u) << 8u);
+        float nibv = (((sb >> 1u) & 1u) == 0u) ? float(scb & 0xFu) : float((scb >> 4u) & 0xFu);
+        float db = d * 0.25f * (0.5f + nibv);
+        uint code = (g16[idx10] >> (2u * (lane & 7u))) & 3u;
+        float v = 8.0f + 17.0f * float(code) + 0.5f * float(code) * float(code - 1u);
+        float sign = (((sgn >> (lane & 7u)) & 1u) == 1u) ? -1.0f : 1.0f;
+        acc += db * v * sign * xv[b * 256u + lane];
+    }
+    sred[lane] = acc;
+    barrier();
+    if (lane == 0u) {
+        float s = 0.0f;
+        for (uint k = 0u; k < 256u; k++) s += sred[k];
+        yv[row] = s;
+    }
+}

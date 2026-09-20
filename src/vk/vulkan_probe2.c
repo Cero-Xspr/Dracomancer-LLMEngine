@@ -90,11 +90,12 @@ int main(int argc, char** argv) {
     printf("权重: %.2f GB\n", fsz / 1e9);
 
     // ── 堆拆分：先 heap1(DEV_LOCAL|HV|C=0x7) 装满预算，余量 heap0(HV|C=0x6) ──
-    long szA = fsz > 8400000000L ? 8400000000L : fsz;   // ★ F1a-v3：只用 heap1（VRAM 域）
+    long szA = fsz > 8000000000L ? 8000000000L : fsz;   // ★ F1a-v3：只用 heap1（VRAM 域）
     long szB = 0;                                        //   避开 GTT 域提交墙（无根解法）
     BigBuf A = {0}, B = {0};
-    int pref_h1[1] = { 0x7 };           // DEV_LOCAL|HOST_VISIBLE|HOST_COHERENT
-    int pref_h0[1] = { 0x6 };           // HOST_VISIBLE|HOST_COHERENT
+    int useH1 = getenv("HEAPH1") ? atoi(getenv("HEAPH1")) : 1;
+    int pref_h1[1] = { getenv("HEAPH1") ? (useH1 ? 0x7 : 0x6) : 0x7 };  // 0x7=DEV_LOCAL|HV|C  0x6=HV|C(heap0)
+    int pref_h0[1] = { getenv("HEAPH1") ? (useH1 ? 0x7 : 0x6) : 0x6 };
     VkResult ra = alloc_buf(dev, &mp, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, szA,
                             (szA > 0) ? pref_h1 : pref_h0, 1, &A);
     if (ra != VK_SUCCESS) { fprintf(stderr, "heap1 分配 %.2fGB 失败 (%d)\n", szA / 1e9, ra); return 2; }
