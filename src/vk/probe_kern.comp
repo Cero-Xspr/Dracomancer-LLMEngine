@@ -1,0 +1,13 @@
+#version 450
+// probe_kern.comp — 带宽探针：网格步进读大 SSBO，每调用写一个 uint 和
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer InBuf { uint data[]; };
+layout(set = 0, binding = 1) writeonly buffer OutBuf { uint sums[]; };
+layout(push_constant) uniform PC { uint count; } pc;
+void main() {
+    uint gi = gl_GlobalInvocationID.x;
+    uint grid = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    uint acc = 0u;
+    for (uint i = gi; i < pc.count; i += grid) acc += data[i] ^ 0x5Au;
+    sums[gi] = acc;
+}

@@ -1,0 +1,17 @@
+#version 450
+// probe_kern2.comp — 双输入缓冲版带宽探针（堆拆分：heap1 8.4G + heap0 余量）
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer A { uint a[]; };
+layout(set = 0, binding = 1) readonly buffer B { uint b[]; };
+layout(set = 0, binding = 2) writeonly buffer O { uint sums[]; };
+layout(push_constant) uniform PC { uint countA; uint count; } pc;
+void main() {
+    uint gi = gl_GlobalInvocationID.x;
+    uint grid = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    uint acc = 0u;
+    for (uint i = gi; i < pc.count; i += grid) {
+        uint v = (i < pc.countA) ? a[i] : b[i - pc.countA];
+        acc += v ^ 0x5Au;
+    }
+    sums[gi] = acc;
+}
