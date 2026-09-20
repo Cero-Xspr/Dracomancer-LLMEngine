@@ -10,6 +10,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
+#include <sched.h>
+#include <pthread.h>
 #include <vulkan/vulkan.h>
 #ifdef _OPENMP
 #include <omp.h>
@@ -18,6 +21,9 @@
 #define MAXW 8
 #define CHECK(expr, msg) do { VkResult _r = (expr); if (_r != VK_SUCCESS) { \
     fprintf(stderr, "[vkrun] VkError %d @ %s\n", _r, msg); return -1; } } while (0)
+// 锁内版本：失败先解锁（否则下次 submit 死锁）
+#define CHECK2(expr, msg) do { VkResult _r = (expr); if (_r != VK_SUCCESS) { \
+    fprintf(stderr, "[vkrun] VkError %d @ %s\n", _r, msg); pthread_mutex_unlock(&vg->qlock); return -1; } } while (0)
 
 struct VGMat { uint32_t w_off; uint32_t x_off; uint32_t y_off; uint32_t n_out; uint32_t nb; uint32_t wset; };
 struct VGInfo { int n_w; unsigned long w_bytes[MAXW]; int w_heap[MAXW]; void* w_map[MAXW]; };
@@ -31,6 +37,11 @@ struct VG {
     VkBuffer xb, yb, gb, sb; VkDeviceMemory xm, ym, gm, sm;
     void* xmap; void* ymap; void* gmap; void* smap;
     unsigned long xbytes, ybytes, sbytes;
+    // keeper：DVFS 保活线程（CPU 相位期 GPU 空闲会掉频 ⇒ 持续小 dispatch 钉高频）
+    pthread_mutex_t qlock;          // 队列互斥（keeper 与主线程的 submit 互斥）
+    VkCommandBuffer kcmd; VkFence kfence;
+    pthread_t keeper_thr; volatile int keeper_on; int keeper_started;
+    VkQueue kqueue;                 // keeper 专用队列（NULL = 与主队列共享，走互斥+sleep）
 };
 typedef struct VG VG;
 
@@ -76,6 +87,40 @@ static int mk_buf(VG* vg, VkBuffer* b, VkDeviceMemory* m, void** map,
     return 0;
 }
 
+// keeper：持续提交 64 行哑 dispatch（读 W 起始的零区、写 Y 尾部 scratch），
+// 把 amdgpu DVFS 钉在高频。与主线程共用 queue ⇒ 用 qlock 互斥。
+static void* keeper_fn(void* p) {
+    VG* vg = (VG*)p;
+    uint32_t pc[5] = { 0, 0, (uint32_t)(vg->ybytes / 4) - 64u, 64u, 10u };
+    VkCommandBufferBeginInfo bbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                     .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                        .commandBufferCount = 1, .pCommandBuffers = &vg->kcmd };
+    int shared_queue = (vg->kqueue == NULL);
+    VkQueue q = shared_queue ? vg->queue : vg->kqueue;
+    while (vg->keeper_on) {
+        if (shared_queue) pthread_mutex_lock(&vg->qlock);
+        if (!vg->keeper_on) { if (shared_queue) pthread_mutex_unlock(&vg->qlock); break; }
+        vkResetCommandBuffer(vg->kcmd, 0);
+        if (vkBeginCommandBuffer(vg->kcmd, &bbi) == VK_SUCCESS) {
+            vkCmdBindPipeline(vg->kcmd, VK_PIPELINE_BIND_POINT_COMPUTE, vg->pipe);
+            vkCmdBindDescriptorSets(vg->kcmd, VK_PIPELINE_BIND_POINT_COMPUTE, vg->playout,
+                                    0, 1, &vg->dsets[0], 0, NULL);
+            vkCmdPushConstants(vg->kcmd, vg->playout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 20, pc);
+            vkCmdDispatch(vg->kcmd, 64u, 1, 1);
+            vkEndCommandBuffer(vg->kcmd);
+            vkResetFences(vg->dev, 1, &vg->kfence);
+            if (vkQueueSubmit(q, 1, &si, vg->kfence) == VK_SUCCESS)
+                vkWaitForFences(vg->dev, 1, &vg->kfence, VK_TRUE, UINT64_MAX);
+        }
+        if (shared_queue) {
+            pthread_mutex_unlock(&vg->qlock);
+            usleep(500);            // ★ 共享队列模式必须留窗口，否则饿死主线程
+        }
+    }
+    return NULL;
+}
+
 int vg_init(struct VG** out, unsigned long total_bytes, const char* spv_path,
             unsigned long x_bytes, unsigned long y_bytes, unsigned long stage_bytes,
             struct VGInfo* info) {
@@ -97,13 +142,17 @@ int vg_init(struct VG** out, unsigned long total_bytes, const char* spv_path,
     int qf = -1;
     for (uint32_t i = 0; i < qn; i++) if (qp[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { qf = (int)i; break; }
     vg->qf = (uint32_t)qf;
-    float prio = 1.0f;
+    float prio[2] = { 1.0f, 0.5f };
+    uint32_t want_q = (qp[qf].queueCount >= 2) ? 2u : 1u;   // keeper 用第 2 条 queue，免锁
     VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-                                    .queueFamilyIndex = vg->qf, .queueCount = 1, .pQueuePriorities = &prio };
+                                    .queueFamilyIndex = vg->qf, .queueCount = want_q,
+                                    .pQueuePriorities = prio };
     VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
                                .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci };
     CHECK(vkCreateDevice(vg->pd, &dci, NULL, &vg->dev), "dev");
     vkGetDeviceQueue(vg->dev, vg->qf, 0, &vg->queue);
+    vg->kqueue = NULL;
+    if (want_q >= 2u) vkGetDeviceQueue(vg->dev, vg->qf, 1, &vg->kqueue);
 
     // ── W 缓冲切分：≤min(4GB, maxStorageBufferRange)，heap1 优先 ──
     unsigned long cap = 4UL << 30;
@@ -223,6 +272,20 @@ int vg_init(struct VG** out, unsigned long total_bytes, const char* spv_path,
     CHECK(vkAllocateCommandBuffers(vg->dev, &cbai, &vg->cmd), "cmd");
     VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
     CHECK(vkCreateFence(vg->dev, &fci, NULL, &vg->fence), "fence");
+    pthread_mutex_init(&vg->qlock, NULL);
+    VkCommandBufferAllocateInfo kbai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                         .commandPool = vg->cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                                         .commandBufferCount = 1 };
+    CHECK(vkAllocateCommandBuffers(vg->dev, &kbai, &vg->kcmd), "kcmd");
+    CHECK(vkCreateFence(vg->dev, &fci, NULL, &vg->kfence), "kfence");
+    vg->keeper_on = (getenv("VKRUN_KEEPER") && strcmp(getenv("VKRUN_KEEPER"), "0") == 0) ? 0 : 1;
+    vg->keeper_started = 0;
+    if (vg->keeper_on && pthread_create(&vg->keeper_thr, NULL, keeper_fn, vg) == 0)
+        vg->keeper_started = 1;
+    else
+        vg->keeper_on = 0;
+    if (vg->keeper_on)
+        fprintf(stderr, "[vkrun] keeper 线程已启动（DVFS 保活）\n");
 
     if (info) {
         info->n_w = vg->n_w;
@@ -244,16 +307,18 @@ int vg_upload_grid(struct VG* vg, const void* src /* 4KB = uint32[1024] */) {
 static int submit_copy(VG* vg, unsigned long src_off, int wbuf, unsigned long dst_off, unsigned long len) {
     VkCommandBufferBeginInfo bbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
-    CHECK(vkResetCommandBuffer(vg->cmd, 0), "rc");
-    CHECK(vkBeginCommandBuffer(vg->cmd, &bbi), "begin");
+    pthread_mutex_lock(&vg->qlock);
+    CHECK2(vkResetCommandBuffer(vg->cmd, 0), "rc");
+    CHECK2(vkBeginCommandBuffer(vg->cmd, &bbi), "begin");
     VkBufferCopy bc = { src_off, dst_off, len };
     vkCmdCopyBuffer(vg->cmd, vg->sb, vg->wb[wbuf], 1, &bc);
-    CHECK(vkEndCommandBuffer(vg->cmd), "end");
+    CHECK2(vkEndCommandBuffer(vg->cmd), "end");
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                         .commandBufferCount = 1, .pCommandBuffers = &vg->cmd };
-    CHECK(vkResetFences(vg->dev, 1, &vg->fence), "rf");
-    CHECK(vkQueueSubmit(vg->queue, 1, &si, vg->fence), "submit");
-    CHECK(vkWaitForFences(vg->dev, 1, &vg->fence, VK_TRUE, UINT64_MAX), "wait");
+    CHECK2(vkResetFences(vg->dev, 1, &vg->fence), "rf");
+    CHECK2(vkQueueSubmit(vg->queue, 1, &si, vg->fence), "submit");
+    CHECK2(vkWaitForFences(vg->dev, 1, &vg->fence, VK_TRUE, UINT64_MAX), "wait");
+    pthread_mutex_unlock(&vg->qlock);
     return 0;
 }
 
@@ -300,10 +365,11 @@ int vg_run(struct VG* vg, const struct VGMat* mats, int n, const float* x, unsig
     if (x) memcpy(vg->xmap, x, x_floats * 4);   // x=NULL：调用者已直接写 X 映射
     for (int i = 0; i < n; i++)
         if (mats[i].wset >= (uint32_t)vg->n_w) return -2;
-    CHECK(vkResetCommandBuffer(vg->cmd, 0), "rc");
+    pthread_mutex_lock(&vg->qlock);
+    CHECK2(vkResetCommandBuffer(vg->cmd, 0), "rc");
     VkCommandBufferBeginInfo bbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
-    CHECK(vkBeginCommandBuffer(vg->cmd, &bbi), "begin");
+    CHECK2(vkBeginCommandBuffer(vg->cmd, &bbi), "begin");
     vkCmdBindPipeline(vg->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vg->pipe);
     int cur_set = -1;
     for (int i = 0; i < n; i++) {
@@ -316,14 +382,15 @@ int vg_run(struct VG* vg, const struct VGMat* mats, int n, const float* x, unsig
         vkCmdPushConstants(vg->cmd, vg->playout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 20, pc);
         vkCmdDispatch(vg->cmd, mats[i].n_out, 1, 1);
     }
-    CHECK(vkEndCommandBuffer(vg->cmd), "end");
+    CHECK2(vkEndCommandBuffer(vg->cmd), "end");
     double t_rec = getenv("VKRUN_TIMING") ? now_s() - tt0 : 0;
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                         .commandBufferCount = 1, .pCommandBuffers = &vg->cmd };
-    CHECK(vkResetFences(vg->dev, 1, &vg->fence), "rf");
-    CHECK(vkQueueSubmit(vg->queue, 1, &si, vg->fence), "submit");
+    CHECK2(vkResetFences(vg->dev, 1, &vg->fence), "rf");
+    CHECK2(vkQueueSubmit(vg->queue, 1, &si, vg->fence), "submit");
     double t_sub = getenv("VKRUN_TIMING") ? now_s() - tt0 - t_rec : 0;
-    CHECK(vkWaitForFences(vg->dev, 1, &vg->fence, VK_TRUE, UINT64_MAX), "wait");
+    CHECK2(vkWaitForFences(vg->dev, 1, &vg->fence, VK_TRUE, UINT64_MAX), "wait");
+    pthread_mutex_unlock(&vg->qlock);
     if (getenv("VKRUN_TIMING"))
         fprintf(stderr, "[vgt] n=%d record=%.3f submit=%.3f wait=%.3f ms\n",
                 n, t_rec * 1e3, t_sub * 1e3, (now_s() - tt0 - t_rec - t_sub) * 1e3);
@@ -334,6 +401,11 @@ void* vg_xmap(struct VG* vg) { return vg->xmap; }
 void* vg_ymap(struct VG* vg) { return vg->ymap; }
 void vg_free(struct VG* vg) {
     if (!vg) return;
+    if (vg->keeper_started) {
+        vg->keeper_on = 0;
+        pthread_mutex_lock(&vg->qlock); pthread_mutex_unlock(&vg->qlock);  // 确保离开临界区
+        pthread_join(vg->keeper_thr, NULL);
+    }
     vkDeviceWaitIdle(vg->dev);
     for (int i = 0; i < vg->n_w; i++) { vkDestroyBuffer(vg->dev, vg->wb[i], NULL); vkFreeMemory(vg->dev, vg->wm[i], NULL); }
     vkDestroyBuffer(vg->dev, vg->xb, NULL); vkFreeMemory(vg->dev, vg->xm, NULL);

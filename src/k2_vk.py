@@ -215,6 +215,36 @@ class VKCtx:
         self._run(mats, None, X_FLOATS)
         return self.yv[:ns * n_out].copy().reshape(ns, n_out)
 
+    def gate_up9(self, h2, eg, ug, sel, per_e, per_u, sgg, sug, n_inter):
+        """MoE 8 专家 gate+up + shared sg/su，一次 submit（18 dispatch）。
+        返回 (G8, U8, g, u)，G8/U8 [ns,ni]，g/u [ni]。"""
+        ns = len(sel)
+        mats = []
+        for k, e in enumerate(sel):
+            mats.append((G(eg.wset, eg.w_off + int(e) * per_e), 0, 2 * k * n_inter, n_inter, NB_H))
+            mats.append((G(ug.wset, ug.w_off + int(e) * per_u), 0, 2 * k * n_inter + n_inter,
+                         n_inter, NB_H))
+        sy = 2 * ns * n_inter
+        mats.append((sgg, 0, sy, n_inter, NB_H))
+        mats.append((sug, 0, sy + n_inter, n_inter, NB_H))
+        self._run(mats, h2, H)
+        y = self.yv[:sy + 2 * n_inter].copy()
+        y8 = y[:sy].reshape(ns, 2, n_inter)
+        return y8[:, 0, :], y8[:, 1, :], y[sy:sy + n_inter], y[sy + n_inter:]
+
+    def down9(self, gu, su, dg, sel, per, sdg, n_out, n_inter):
+        """MoE 8 专家 down + shared sd，一次 submit（9 dispatch）。
+        su 写 X[10240:]（gu 占 [4096,10240)）。返回 (D8 [ns,n_out], d [n_out])。"""
+        ns = len(sel)
+        self.xv[4096:4096 + ns * n_inter] = gu.reshape(-1)
+        self.xv[10240:10240 + n_inter] = su
+        mats = [(G(dg.wset, dg.w_off + int(e) * per), 4096 + k * n_inter, k * n_out, n_out, NB_I)
+                for k, e in enumerate(sel)]
+        mats.append((sdg, 10240, ns * n_out, n_out, NB_I))
+        self._run(mats, None, X_FLOATS)
+        y = self.yv[:ns * n_out + n_out].copy()
+        return y[:ns * n_out].reshape(ns, n_out), y[ns * n_out:]
+
     def shared_gu(self, h2, sgg, sug, n_inter):
         mats = [(sgg, 0, 0, n_inter, NB_H), (sug, 0, n_inter, n_inter, NB_H)]
         self._run(mats, h2, H)

@@ -7,12 +7,21 @@ assert os.environ.get("MODEL"), "需要 MODEL 环境变量"
 os.environ.setdefault("OMP_NUM_THREADS", "8")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np
+
+# ★ 强制路由：先读金标准、设好引擎环境，再 import 引擎（引擎 import 时读 env）
+_gold_path = os.environ.get("GOLDEN", os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "tests/golden/k2horizon_golden.json"))
+gold = json.load(open(_gold_path))
+if os.environ.get("K2_NO_FORCE") != "1":
+    _sels_path = os.environ.get("SELS", os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "tests/golden/k2horizon_sels_iq2m.json"))
+    if os.path.exists(_sels_path):
+        os.environ["K2_FORCE_SEL"] = _sels_path
+        os.environ["K2_FORCE_POS"] = str(len(gold["ids"]) - 1)
 import k2_engine as KE
 import falcon_tok
 
 tk, _ = falcon_tok.build(KE.MODEL, add_bos=False, pre="llama3")
-gold = json.load(open(os.environ.get("GOLDEN", os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                         "tests/golden/k2horizon_golden.json"))))
 ids = gold["ids"]
 
 sums = {}

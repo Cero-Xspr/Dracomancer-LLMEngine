@@ -314,12 +314,15 @@ if K2_VK:
             p = f"blk.{L.li}."
             for s in ("attn_q.weight", "attn_k.weight", "attn_gate.weight",
                       "attn_v_gate.weight", "attn_v_exps.weight",
-                      "ffn_gate_exps.weight", "ffn_up_exps.weight"):
+                      "ffn_gate_exps.weight", "ffn_up_exps.weight",
+                      "ffn_gate_shexp.weight", "ffn_up_shexp.weight",
+                      "ffn_down_shexp.weight"):
                 if _is13(p + s):
                     _wanted.append(p + s)
             if _is13(p + "ffn_down_exps.weight"):
                 _wanted.append(p + "ffn_down_exps.weight")
-        # ★ shexp(g/u/d) ~0.6MB/个不上 GPU：单次调用开销(~0.15ms) > CPU 计算(~0.09ms)，净亏
+        # F2：shexp(g/u/d) 并入 gate_up/down 同一 submit（多 dispatch 免费）；
+        # 仅单层混量化（IQ3_S）的缺角张量走 CPU 分支。
         VK = _k2vk.VKCtx(T, _wanted).arm(upload=not os.environ.get("K2_VK_NOUPLOAD"))
         for L in LAYERS:
             L.attach_vk(VK)
@@ -329,6 +332,17 @@ if K2_VK:
     except Exception as e:
         print(f"[vk] 初始化失败，回落 CPU：{e!r}", flush=True)
         VK = None
+
+
+# ── 闸门强制路由：GPU 与 CPU 走同一组专家，消除 fp 序噪声的 argsort 翻转级联 ──
+FORCE = None
+FORCE_POS = -1
+if os.environ.get("K2_FORCE_SEL"):
+    import json as _json
+    _f = _json.load(open(os.environ["K2_FORCE_SEL"]))
+    FORCE = _f["last_sels"]
+    FORCE_POS = int(_f.get("pos", os.environ.get("K2_FORCE_POS", -1)))
+    print(f"[k2] 强制路由生效 pos={FORCE_POS}（闸门模式）", flush=True)
 
 
 def grouped_rms1(x, wv):
@@ -421,7 +435,10 @@ def attn_ffn_common(x, L, pos):
         # MoVA：sigmoid 路由（bias 只参与选择）→ top-MUSED 专家 silu 加权，权重归一 ×scaling
         pass
         sc = sigmoid1(vlogits) if GATING_FUNC == 2 else softmax(vlogits)
-        sel = np.argsort(-(sc + L.vgate_b), kind="stable")[:MUSED]
+        if FORCE is not None and pos == FORCE_POS and FORCE[L.li][0]:
+            sel = np.array(FORCE[L.li][0])
+        else:
+            sel = np.argsort(-(sc + L.vgate_b), kind="stable")[:MUSED]
         _LAST_SEL.setdefault(L.li, [None, None])[0] = sel
         wts = sc[sel]
         wts = wts / wts.sum() * R_SCALING
@@ -465,16 +482,45 @@ def attn_ffn_common(x, L, pos):
     return o
 
 
-def moe_ffn(h2, L):
+def moe_ffn(h2, L, pos=-1):
     t0 = time.perf_counter() if _PROF_ON else 0
     logits = L.gate_inp @ h2
     sc = sigmoid1(logits) if GATING_FUNC == 2 else softmax(logits)
-    sel = np.argsort(-(sc + L.probs_b), kind="stable")[:NUSED]
+    if FORCE is not None and pos == FORCE_POS and FORCE[L.li][1]:
+        sel = np.array(FORCE[L.li][1])
+    else:
+        sel = np.argsort(-(sc + L.probs_b), kind="stable")[:NUSED]
     _LAST_SEL.setdefault(L.li, [None, None])[1] = sel
     rw = sc[sel]
     rw = rw / rw.sum() * R_SCALING
     t0 = _tick("moe_route", t0)
-    if VK is not None and "moe" not in VK_SKIP and L.exg and L.uxg:
+    shared_done = False
+    if VK is not None and "moe" not in VK_SKIP and L.exg and L.uxg and L.sgg and L.sug:
+        # F2：gate_up(16) + shared sg/su(2) 一次 submit
+        G8, U8, sg_, su_ = VK.gate_up9(h2, L.exg, L.uxg, sel, L.ex_per, L.ux_per,
+                                       L.sgg, L.sug, MOE_INTER)
+        gu8 = silu(G8) * U8
+        su_in = silu(sg_) * su_
+        if L.dxg is not None and L.sdg is not None:
+            D8, d9 = VK.down9(gu8, su_in, L.dxg, sel, L.dx_per, L.sdg, H, MOE_INTER)
+            out = (D8 * rw[:, None]).sum(0)   # d9 由末尾 return out + d 统一加（勿双计）
+            shared_done = True
+        elif L.dxg is not None:
+            D8 = VK.down(gu8, L.dxg, sel, L.dx_per, H, MOE_INTER)
+            out = (D8 * rw[:, None]).sum(0)
+            d9 = gemv1(L.sdc, L.sdb, H, MOE_INTER, su_in)
+            shared_done = True
+        else:
+            out = np.zeros(H, np.float32)
+            for k, e in enumerate(sel):
+                out += gemv1(L.dxc, L.dxb[e * L.dx_per:], H, MOE_INTER, gu8[k]) * rw[k]
+            if L.sdg is not None:
+                d9 = VK.shared_d(su_in, L.sdg, H, MOE_INTER)
+                shared_done = True
+            else:
+                d9 = gemv1(L.sdc, L.sdb, H, MOE_INTER, su_in)
+                shared_done = True
+    elif VK is not None and "moe" not in VK_SKIP and L.exg and L.uxg:
         G8, U8 = VK.gate_up(h2, L.exg, L.uxg, sel, L.ex_per, L.ux_per, MOE_INTER)
         gu8 = silu(G8) * U8
         if L.dxg is not None:
@@ -515,16 +561,19 @@ def moe_ffn(h2, L):
             d = gemv1(L.dxc, L.dxb[e * L.dx_per:], H, MOE_INTER, silu(g) * u)
             out += d * rw[k]
     t0 = _tick("moe_experts", t0)
-    if VK is not None and L.sgg and L.sug:
-        g, u = VK.shared_gu(h2, L.sgg, L.sug, MOE_INTER)
+    if not shared_done:
+        if VK is not None and L.sgg and L.sug:
+            g, u = VK.shared_gu(h2, L.sgg, L.sug, MOE_INTER)
+        else:
+            g = gemv1(L.sgc, L.sgb, MOE_INTER, H, h2)
+            u = gemv1(L.suc, L.sub, MOE_INTER, H, h2)
+        su = silu(g) * u
+        if VK is not None and L.sdg is not None:
+            d = VK.shared_d(su, L.sdg, H, MOE_INTER)
+        else:
+            d = gemv1(L.sdc, L.sdb, H, MOE_INTER, su)
     else:
-        g = gemv1(L.sgc, L.sgb, MOE_INTER, H, h2)
-        u = gemv1(L.suc, L.sub, MOE_INTER, H, h2)
-    su = silu(g) * u
-    if VK is not None and L.sdg is not None:
-        d = VK.shared_d(su, L.sdg, H, MOE_INTER)
-    else:
-        d = gemv1(L.sdc, L.sdb, H, MOE_INTER, su)
+        d = d9
     t0 = _tick("moe_shared", t0)
     return out + d
 
@@ -551,7 +600,7 @@ def forward(tid, pos, layer_hook=None):
         x = x + attn
         h2 = grouped_rms1(x, L.norm_f)
         if L.sparse:
-            x = x + moe_ffn(h2, L)
+            x = x + moe_ffn(h2, L, pos)
         else:
             x = x + dense_ffn(h2, L)
         if layer_hook is not None:
