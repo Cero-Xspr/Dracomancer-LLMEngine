@@ -1,0 +1,56 @@
+#version 450
+// iq2s_batch.comp — 批量多矩阵 IQ2_S gemv v2
+// MT[m] = uvec4(w_off_words, y_off_rows, n_out, x_off)
+//   权重字索引 = w_off_words + row_local*205 + (b*82 + meta)>>2
+//   x 元素     = x_off + b*256 + lane
+//   y 行       = y_off + row_local
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer WQ { uint wq[]; };
+layout(set = 0, binding = 1) readonly buffer G16 { uint g16[]; };
+layout(set = 0, binding = 2) readonly buffer XV { float xv[]; };
+layout(set = 0, binding = 3) writeonly buffer YV { float yv[]; };
+layout(set = 0, binding = 4) readonly buffer MT { uvec4 mt[]; };
+layout(push_constant) uniform PC { uint n_mat; uint nb; uint rowwords; uint pad; } pc;
+shared float sred[256];
+uint wbyte(uint wbase, uint off) {
+    uint a = wbase + off;
+    return (wq[a >> 2u] >> ((a & 3u) * 8u)) & 0xFFu;
+}
+void main() {
+    uint rr   = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    uint m = 0u, base = 0u, w_off = 0u, y_off = 0u, n_out = 0u, x_off = 0u;
+    for (uint k = 0u; k < pc.n_mat; k++) {
+        if (rr < base + mt[k].z) { m = k; w_off = mt[k].x; y_off = mt[k].y; n_out = mt[k].z; x_off = mt[k].w; break; }
+        base += mt[k].z;
+    }
+    uint row_local = rr - base;
+    uint wrow = w_off + row_local * pc.rowwords;   // 该行的首 word
+    float acc = 0.0f;
+    for (uint b = 0u; b < pc.nb; b++) {
+        uint wboff = wrow + b * 82u / 4u;         // 82B = 20.5 words ⇒ 不整除，用字节算
+        // ↑ 82B 不整除 word ⇒ 逐字节寻址（wbase 用字节更简单——改为：
+        uint boff = w_off * 4u + row_local * (pc.nb * 82u) + b * 82u;   // 字节偏移（w_off 单位=字）
+        uint lo = wbyte(boff), hi = wbyte(boff + 1u);
+        float d = unpackHalf2x16(uint(lo) | (uint(hi) << 8u)).x;
+        uint sb = lane >> 3u;
+        uint qs  = wbyte(boff + 2u + sb);
+        uint sgn = wbyte(boff + 34u + sb);
+        uint qhb = wbyte(boff + 66u + (sb >> 2u));
+        uint scb = wbyte(boff + 74u + (sb >> 1u));
+        uint idx10 = qs | (((qhb >> ((sb & 3u) * 2u)) & 3u) << 8u);
+        float nibv = (((sb >> 1u) & 1u) == 0u) ? float(scb & 0xFu) : float((scb >> 4u) & 0xFu);
+        float db = d * 0.25f * (0.5f + nibv);
+        uint code = (g16[idx10] >> (2u * (lane & 7u))) & 3u;
+        float v = 8.0f + 17.0f * float(code) + 0.5f * float(code) * float(code - 1u);
+        float sign = (((sgn >> (lane & 7u)) & 1u) == 1u) ? -1.0f : 1.0f;
+        acc += db * v * sign * xv[x_off + b * 256u + lane];
+    }
+    sred[lane] = acc;
+    barrier();
+    for (uint stp = 128u; stp > 0u; stp >>= 1u) {
+        if (lane < stp) sred[lane] += sred[lane + stp];
+        barrier();
+    }
+    if (lane == 0u) yv[y_off + row_local] = sred[0];
+}
