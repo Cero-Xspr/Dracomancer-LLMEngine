@@ -1,0 +1,46 @@
+#version 450
+// iq2s_gemv.comp — IQ2_S gemv：每 workgroup 一行（32 调用 = 每块的 32 子块，LDS 无需，
+// 各调用按块循环累加，最后 lane0 写出）。绑定：0=权重原始字节 1=GRIDSGN f32 表 2=h 3=y
+layout(local_size_x = 32) in;
+layout(set = 0, binding = 0) readonly buffer WQ { uint wq[]; };
+layout(set = 0, binding = 1) readonly buffer GRID { float gs[]; };
+layout(set = 0, binding = 2) readonly buffer XV { float xv[]; };
+layout(set = 0, binding = 3) writeonly buffer YV { float yv[]; };
+layout(push_constant) uniform PC { uint n_out; uint nb; } pc;
+shared float sred[32];
+uint wbyte(uint off) {
+    // ★ 不用 bitfieldExtract：本机 RADV/gfx1150 (ACO) 对动态位域提取疑似误编译，
+    //   曾导致读出整个 word（移位+掩码是安全的）。
+    return (wq[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu;
+}
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint sb  = gl_LocalInvocationID.x;          // 0..31 子块
+    uint rowbase = row * pc.nb * 82u;
+    float acc = 0.0f;
+    for (uint b = 0u; b < pc.nb; b++) {
+        uint boff = rowbase + b * 82u;
+        uint lo = wbyte(boff), hi = wbyte(boff + 1u);
+        float d = unpackHalf2x16(uint(lo) | (uint(hi) << 8u)).x;
+        uint qs  = wbyte(boff + 2u + sb);
+        uint sgn = wbyte(boff + 34u + sb);
+        uint qhb = wbyte(boff + 66u + (sb >> 2u));
+        uint scb = wbyte(boff + 74u + (sb >> 2u));   // ★ llama.cpp 语义：子块 4g+0,1→低，4g+2,3→高
+        uint idx10 = qs | (((qhb >> ((sb & 3u) * 2u)) & 3u) << 8u);
+        float nibv = (((sb >> 1u) & 1u) == 0u) ? float(scb & 0x0Fu) : float((scb >> 4) & 0x0Fu);
+        float scale = d * 0.25f * (0.5f + nibv);
+        const uint gbase = (idx10 * 256u + sgn) * 8u;
+        const uint xoff = b * 256u + sb * 8u;
+        float dot = 0.0f;
+        for (uint j = 0u; j < 8u; j++)
+            dot += gs[gbase + j] * xv[xoff + j];
+        acc += scale * dot;
+    }
+    sred[sb] = acc;              // ★ 32 lane 各自的部分和必须归约——否则 31/32 的值被丢弃
+    barrier();
+    if (sb == 0u) {
+        float s = 0.0f;
+        for (uint k = 0u; k < 32u; k++) s += sred[k];
+        yv[row] = s;
+    }
+}

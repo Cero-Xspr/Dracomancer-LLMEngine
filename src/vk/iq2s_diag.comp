@@ -1,0 +1,14 @@
+#version 450
+// iq2s_diag.comp — GPU 视角回显：xv、wq 字节、gs 切片
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) readonly buffer WQ { uint wq[]; };
+layout(set = 0, binding = 1) readonly buffer GRID { float gs[]; };
+layout(set = 0, binding = 2) readonly buffer XV { float xv[]; };
+layout(set = 0, binding = 3) writeonly buffer OUT { float o[]; };
+layout(push_constant) uniform PC { uint n_out; uint nb; } pc;
+void main() {
+    uint gi = gl_GlobalInvocationID.x;
+    if (gi < 256u)      o[gi] = xv[gi];                       // h 前 256
+    else if (gi < 512u) o[gi] = float(wq[gi - 256u]);         // wq 前 256 字（1024 字节）
+    else if (gi < 768u) o[gi] = gs[gi - 512u];                // gs 前 256 float
+}
