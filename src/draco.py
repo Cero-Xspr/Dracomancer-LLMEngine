@@ -872,7 +872,7 @@ class Server:
 # ─────────────────────────── 聊天（流式 SSE） ───────────────────────────
 
 def stream_chat(url, messages, temp, seed, max_tokens, system=None, think=None,
-                repeat_penalty=1.1, hold=None):
+                repeat_penalty=1.1, hold=None, top_p=1.0):
     """POST /v1/chat/completions，逐块 yield (文本增量, timing)。
 
     ★ 必须同时处理 `reasoning_content`：这类模型（Ling、Qwen3.5 系等）在"思考模式"下
@@ -888,6 +888,7 @@ def stream_chat(url, messages, temp, seed, max_tokens, system=None, think=None,
         #   （json.exception.type_error.302 "type must be number, but is null"）。
         #   两个服务端对"缺键"的默认都是不限 ⇒ 省掉分支，统一不发。
         "repeat_penalty": repeat_penalty,
+        "top_p": top_p,
     }
     if max_tokens > 0:
         req_body["max_tokens"] = max_tokens
@@ -1403,6 +1404,8 @@ def apply_profile_defaults(args, model):
         args.temp = sp["temp"]
     if args.repeat_penalty == 1.1 and "repeat_penalty" in sp:
         args.repeat_penalty = sp["repeat_penalty"]
+    if getattr(args, "top_p", 1.0) == 1.0 and "top_p" in sp:
+        args.top_p = sp["top_p"]
     if not args.max_tokens and "max_tokens_default" in sp:
         args.max_tokens = sp["max_tokens_default"]
     args.think_default = sp.get("think_default", False)
@@ -1537,6 +1540,7 @@ def loop_chat(srv, args):
     think = getattr(args, "think_default", False)
     hold = getattr(args, "think_hold", None)   # 档案推荐值；/hold 可覆盖（仅 dengine 生效）
     rep = args.repeat_penalty
+    top_p = getattr(args, "top_p", 1.0)
     in_think = [False]
     while True:
         try:
@@ -1603,7 +1607,7 @@ def loop_chat(srv, args):
         rst = "\x1b[0m" if sys.stdout.isatty() else ""
         try:
             for kind, delta, tim in stream_chat(
-                    srv.url, msgs, temp, seed, maxtok, system, think, rep, hold):
+                    srv.url, msgs, temp, seed, maxtok, system, think, rep, hold, top_p):
                 if delta:
                     if t_last is None:
                         t_last = time.time()          # 首 token 到达
@@ -1800,6 +1804,7 @@ def main():
             p.add_argument("--seed", type=int, default=-1, help="随机种子（-1=随机）")
             p.add_argument("--max-tokens", type=int, default=0, help="单次最多生成（0=不限）")
             p.add_argument("--system", "-sys", help="系统提示")
+            p.add_argument("--top-p", type=float, default=1.0, help="核采样截断（1=关）")
             p.add_argument("--repeat-penalty", type=float, default=1.1,
                            help="重复惩罚（默认 1.1；低温度下防重复循环，1.0=关）")
         p.set_defaults(fn=fn)

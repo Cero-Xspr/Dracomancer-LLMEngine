@@ -713,8 +713,11 @@ def render_chatml_generic(messages, enable_thinking, system_default, default_sys
     return "".join(parts)
 
 
-def sample(logits, temp, seed_rng, repeat_penalty, recent, pen_texts=None):
-    """温度采样 + 简单重复惩罚。temp=0 ⇒ 贪心。
+def sample(logits, temp, seed_rng, repeat_penalty, recent, pen_texts=None, top_p=1.0):
+    """温度采样 + top_p 核采样 + 简单重复惩罚。temp=0 ⇒ 贪心。
+
+    ★ top_p：按概率降序累计到 top_p 截断再归一（nucleus）。思考模型长生成在贪心下
+    会进复读循环（整段答案重复两遍实测），IFM 官方推荐 temp=1.0/top_p=0.95。
 
     ★ pen_texts（id→解码文本）：按文本等价惩罚——字节级 BPE 词表里惩罚「你好」的
       token id 后，模型会用字节序列重新表达同一文本（不同 id 逃过惩罚）⇒ 字节碎片+�。
@@ -732,12 +735,19 @@ def sample(logits, temp, seed_rng, repeat_penalty, recent, pen_texts=None):
     if temp and temp > 0:
         p = np.exp((z - z.max()) / temp)
         p /= p.sum()
+        if top_p and 0.0 < top_p < 1.0:
+            order = np.argsort(-p)
+            cum = np.cumsum(p[order])
+            cut = int(np.searchsorted(cum, top_p) + 1)
+            keep = order[:cut]
+            pk = p[keep] / p[keep].sum()
+            return int(seed_rng.choices(keep.tolist(), weights=pk.tolist())[0])
         # ★ random.Random.choice 没有 p= 参数（那是 numpy 的）—— 用 choices(weights=)
         return int(seed_rng.choices(range(len(p)), weights=p.tolist())[0])
     return int(np.argmax(z))
 
 
-def generate(messages, max_tokens, temp, seed, repeat_penalty, enable_thinking=None, hold=None):
+def generate(messages, max_tokens, temp, seed, repeat_penalty, enable_thinking=None, hold=None, top_p=1.0):
     """**同步**做完准备工作（渲染/分词/上下文预算），返回真正的生成器。
 
     ★ 为什么拆两层（2026-09-15 实测）：整个函数若是生成器，异常要等第一次 next() 才抛 ——
@@ -758,7 +768,7 @@ def generate(messages, max_tokens, temp, seed, repeat_penalty, enable_thinking=N
         raise ValueError(f"提示词太长：{len(ids)} token > 本引擎上下文 {MAXT}。"
                          f"（draco 侧可用 -c 调大，桥接会用同一个值）")
     n_gen = min(max_tokens if max_tokens and max_tokens > 0 else 256, budget)
-    return _gen(ids, n_gen, temp, seed, repeat_penalty, think_now, hold,
+    return _gen(ids, n_gen, temp, seed, repeat_penalty, think_now, hold, top_p=top_p,
                 skey=_session_key(messages))
 
 
@@ -779,14 +789,14 @@ def _decodable_prefix(text):
     return text[:len(text) - n] if n else text
 
 
-def _gen(ids, n_gen, temp, seed, repeat_penalty, think_now, hold=None, skey=None):
+def _gen(ids, n_gen, temp, seed, repeat_penalty, think_now, hold=None, skey=None, top_p=1.0):
     """持锁整代串行：锁横跨内部生成器的整个生命周期（yield 挂起时不释放——并发第二个
     请求只会排队；客户端断连时 GeneratorExit 走 with 退出，锁照样释放）。"""
     with _ENG_LOCK:
-        yield from _gen_locked(ids, n_gen, temp, seed, repeat_penalty, think_now, hold, skey)
+        yield from _gen_locked(ids, n_gen, temp, seed, repeat_penalty, think_now, hold, skey, top_p)
 
 
-def _gen_locked(ids, n_gen, temp, seed, repeat_penalty, think_now, hold=None, skey=None):
+def _gen_locked(ids, n_gen, temp, seed, repeat_penalty, think_now, hold=None, skey=None, top_p=1.0):
     """生成器：yield (kind, 文本增量, 计时dict)。调用方必须已持 _ENG_LOCK。"""
     rng = random.Random(seed if seed and seed > 0 else None)
 
@@ -847,7 +857,7 @@ def _gen_locked(ids, n_gen, temp, seed, repeat_penalty, think_now, hold=None, sk
         #   只罚已生成时，字节级词表模型会换 token 化复读 prompt（falcon temp=0 乱码实证）
         recent = (ids + gen_ids)[-64:]
         nid = sample(lg, temp, rng, repeat_penalty, recent,
-                     pen_texts=AP.get("pen_texts"))
+                     pen_texts=AP.get("pen_texts"), top_p=top_p)
         if _prof:
             _q2 = time.perf_counter(); _p["logits"] += _q2 - _q
         if nid == AP["eos"] or nid == AP["im_end"]:
@@ -1081,13 +1091,14 @@ class Handler(BaseHTTPRequestHandler):
         temp = float(req.get("temperature") or 0)
         seed = int(req.get("seed") or -1)
         rp = float(req.get("repeat_penalty") or 1.0)
+        tp = float(req.get("top_p") or 1.0)
         ctk = req.get("chat_template_kwargs") or {}
         think = ctk.get("enable_thinking")          # None = 按模型默认
         hold = req.get("draco_think_hold")          # 思考流式粒度（line/token/dup）；None=按环境变量
         rid = f"draco-eng-{int(time.time()*1000)}"
         # ★ 准备阶段在发响应头之前完成 ⇒ 超长/渲染失败都能回一个像样的 400
         try:
-            gen = generate(msgs, mt, temp, seed, rp, think, hold)
+            gen = generate(msgs, mt, temp, seed, rp, think, hold, top_p=tp)
         except ValueError as e:
             return self._json(400, {"error": {"message": str(e), "type": "invalid_request_error"}})
         except Exception as e:

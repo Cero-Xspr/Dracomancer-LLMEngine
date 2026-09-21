@@ -17,9 +17,10 @@
   },
   "notes": "MBZUAI K2-Horizon-MoVA-36B-A4B（48 层 = 3 稠密 + 45 稀疏，MoVA 64×4，MoE 100×8+1 共享，sigmoid×2.5 路由，思考模型 <ifm|think>）。本机三档：IQ2_M 11.6GB（推荐）/ Q4_K_M 20.8GB / BF16 74.9GB。\n三路并发实测（F3）：NPU(FLM 1B) 与 K2 同跑 ⇒ NPU -5%、K2 -16%（1B@61t/s ≈ 43GB/s 总线拉力）；NPU 定位=独立并行小模型/能效档。\n剪枝否定（专家级 29.7% 覆盖 + 神经元级 top50% 仅 69%）；投机解码否定（draft 同引擎被每调用开销拖死、异词表不可行）。",
   "sampling": {
-    "temp": 0,
+    "temp": 0.7,
+    "top_p": 0.95,
     "repeat_penalty": 1.0,
     "think_default": false,
-    "notes": "K2 全部验证（k2_gate/9 探针）都是贪心；temp>0+惩罚 1.1 会让思考模型退化成空白 token 瀑布（2026-09-21 实测）。/think on 可开思考（质量更好但要等思考段）。"
+    "notes": "实测定档（2026-09-21）：贪心长生成进复读循环（整段答案重复两遍）；temp1.0/top_p0.95 偶发多语言词沙拉（IQ2_M 尾部肥）；0.7/0.95 三种子干净+600字零重复。/think on 开思考。"
   }
 }
