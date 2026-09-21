@@ -1482,11 +1482,13 @@ def cmd_chat(args):
         m = pick_model(ms, sel) if sel else next((x for x in ms if x.supported), None)
         if m is None:
             raise SystemExit("没有可用的模型")
-        if not m.supported:
-            raise SystemExit(f"'{m.name}' 架构 {m.arch} llama.cpp 不支持")
+        # ★ llama.cpp 不支持的架构（k2-horizon 等）不在这里拒——后面按已解析 backend
+        #   的守卫裁决（dengine 是自研实现，由 dracomancer 档案守卫）
         if backend is None:
             if m.arch in _NEEDS_LOCAL or m.needs_local_build():
                 hint = "local（该架构只有本地构建有实现）"
+            elif default_backend(m) == "dengine":
+                hint = "dengine（自研引擎，档案 works）"
             elif profile_backend(m):
                 hint = f"{profile_backend(m)}（模型档案推荐的默认后端）"
             else:

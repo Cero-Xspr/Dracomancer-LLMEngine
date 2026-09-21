@@ -265,9 +265,9 @@ class Layer:
             self.g1b, self.g1c = wview(p + "ffn_gate.weight"), tcode(p + "ffn_gate.weight")
             self.u1b, self.u1c = wview(p + "ffn_up.weight"), tcode(p + "ffn_up.weight")
             self.d1b, self.d1c = wview(p + "ffn_down.weight"), tcode(p + "ffn_down.weight")
-        # ★ F2.5：KV 只留转置布局（[NKV,MAXT,HD] 连续），注意力走分组 GEMM。
-        #   旧的非转置 K/V 已无读者 ⇒ 移除（ctx4096 省 1.6GB——OOM 事件的内存预算之一）
-        self.Kt = np.zeros((NKV, MAXT, HD), np.float32)
+        # ★ F2.6：KV 只留转置布局。K 存 [NKV,HD,MAXT]（BLAS 友好：scores=qg@Kt[:,:,:n]
+        #   直接是 batched GEMM，实测比 einsum 快 6.7×）；V 存 [NKV,MAXT,HD]。
+        self.Kt = np.zeros((NKV, HD, MAXT), np.float32)
         self.Vt = np.zeros((NKV, MAXT, HD), np.float32)
         STATES.extend([self.Kt, self.Vt])
 
@@ -439,7 +439,7 @@ def attn_ffn_common(x, L, pos):
         vlogits = gemv1(L.vgc, L.vgb, MEXP, H, h) if L.sparse else None
     q = qf.reshape(NH, HD)
     k = rope1(kf.reshape(NKV, HD), pos)
-    L.Kt[:, pos, :] = k
+    L.Kt[:, :, pos] = k
     t0 = _tick("qkv", t0)
     if L.sparse:
         # MoVA：sigmoid 路由（bias 只参与选择）→ top-MUSED 专家 silu 加权，权重归一 ×scaling
@@ -475,10 +475,10 @@ def attn_ffn_common(x, L, pos):
     # 注意力（GQA，因果，T=1 单步）
     q = rope1(q.reshape(NH, HD), pos)
     kv_n = pos + 1
-    # ★ 分组 GQA GEMM：q [NKV,4,HD] × Kt/Vt [NKV,kv_n,HD]（连续），免 repeat 拷贝
+    # ★ 分组 GQA GEMM（BLAS）：scores=qg[NKV,4,HD] @ Kt[NKV,HD,kv_n]；免 repeat 拷贝
     qg = q.reshape(NKV, NH // NKV, HD)
-    att = softmax_last(np.einsum('gjd,gkd->gjk', qg, L.Kt[:, :kv_n, :]) * np.float32(HD ** -0.5))
-    out = np.einsum('gjk,gkd->gjd', att, L.Vt[:, :kv_n, :]).reshape(NH * HD)
+    att = softmax_last(np.matmul(qg, L.Kt[:, :, :kv_n]) * np.float32(HD ** -0.5))
+    out = np.matmul(att, L.Vt[:, :kv_n, :]).reshape(NH * HD)
     t0 = _tick("attention", t0)
     gate = softplus_ln2(gate_in if gate_in is not None else gemv1(L.gc, L.gb, NH * HD, H, h))
     out = out * gate
