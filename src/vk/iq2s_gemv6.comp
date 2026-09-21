@@ -1,0 +1,69 @@
+#version 450
+// iq2s_gemv6.comp — F1d：R=8 行/WG，每 lane 负责一个子块（8 值）。
+// 对 v5 的反思：逐字节提取 ALU（~17 load+shift+and/lane/块）与重复 g16 查表
+// 才是大头。本版每 lane：读 qs[sb]/sgn[sb]/qh/scb 各 1 字节（跨 lane 合并成
+// 连续 32B，完美合并）+ g16 查表 1 次（8 码全在 word 里，寄存器移位展开）
+// + db 子块内共享 + 8 个 x 连续地址。dispatch = ceil(n_out/8)。
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer WQ { uint wq[]; };
+layout(set = 0, binding = 1) readonly buffer G16 { uint g16[]; };
+layout(set = 0, binding = 2) readonly buffer XV { float xv[]; };
+layout(set = 0, binding = 3) writeonly buffer YV { float yv[]; };
+layout(push_constant) uniform PC { uint w_off; uint x_off; uint y_off; uint n_out; uint nb; } pc;
+shared float sred[256];
+
+uint wbyte(uint off) {
+    return (wq[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu;
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint r_in = lane >> 5u;            // WG 内行号 0..7
+    uint sb   = lane & 31u;            // 子块号 0..31
+    uint row  = gl_WorkGroupID.x * 8u + r_in;
+    bool live = row < pc.n_out;
+    uint rowbase = pc.w_off + row * pc.nb * 82u;
+
+    float a0=0.0f, a1=0.0f, a2=0.0f, a3=0.0f, a4=0.0f, a5=0.0f, a6=0.0f, a7=0.0f;
+    for (uint b = 0u; b < pc.nb; b++) {
+        uint boff = rowbase + b * 82u;
+        uint lo = wbyte(boff), hi = wbyte(boff + 1u);
+        float d = unpackHalf2x16(lo | (hi << 8u)).x;
+        uint qs  = wbyte(boff + 2u + sb);
+        uint sgn = wbyte(boff + 34u + sb);
+        uint qhb = wbyte(boff + 66u + (sb >> 2u));
+        uint scb = wbyte(boff + 74u + (sb >> 2u));
+        uint idx10 = qs | (((qhb >> ((sb & 3u) * 2u)) & 3u) << 8u);
+        float nibv = (((sb >> 1u) & 1u) == 0u) ? float(scb & 0xFu) : float((scb >> 4u) & 0xFu);
+        float db = d * 0.25f * (0.5f + nibv);
+        uint g = g16[idx10];
+        uint xbase = pc.x_off + b * 256u + (sb << 3u);
+        float x0 = xv[xbase],     x1 = xv[xbase + 1u], x2 = xv[xbase + 2u], x3 = xv[xbase + 3u];
+        float x4 = xv[xbase + 4u], x5 = xv[xbase + 5u], x6 = xv[xbase + 6u], x7 = xv[xbase + 7u];
+        uint c; float v; float sgnf;
+        c = g & 3u;             v = 8.0f + 17.0f * float(c) + 0.5f * float(c) * float(c - 1u);
+        sgnf = (((sgn) & 1u) == 1u) ? -1.0f : 1.0f;         a0 += db * v * sgnf * x0;
+        c = (g >> 2u) & 3u;     v = 8.0f + 17.0f * float(c) + 0.5f * float(c) * float(c - 1u);
+        sgnf = (((sgn >> 1u) & 1u) == 1u) ? -1.0f : 1.0f;   a1 += db * v * sgnf * x1;
+        c = (g >> 4u) & 3u;     v = 8.0f + 17.0f * float(c) + 0.5f * float(c) * float(c - 1u);
+        sgnf = (((sgn >> 2u) & 1u) == 1u) ? -1.0f : 1.0f;   a2 += db * v * sgnf * x2;
+        c = (g >> 6u) & 3u;     v = 8.0f + 17.0f * float(c) + 0.5f * float(c) * float(c - 1u);
+        sgnf = (((sgn >> 3u) & 1u) == 1u) ? -1.0f : 1.0f;   a3 += db * v * sgnf * x3;
+        c = (g >> 8u) & 3u;     v = 8.0f + 17.0f * float(c) + 0.5f * float(c) * float(c - 1u);
+        sgnf = (((sgn >> 4u) & 1u) == 1u) ? -1.0f : 1.0f;   a4 += db * v * sgnf * x4;
+        c = (g >> 10u) & 3u;    v = 8.0f + 17.0f * float(c) + 0.5f * float(c) * float(c - 1u);
+        sgnf = (((sgn >> 5u) & 1u) == 1u) ? -1.0f : 1.0f;   a5 += db * v * sgnf * x5;
+        c = (g >> 12u) & 3u;    v = 8.0f + 17.0f * float(c) + 0.5f * float(c) * float(c - 1u);
+        sgnf = (((sgn >> 6u) & 1u) == 1u) ? -1.0f : 1.0f;   a6 += db * v * sgnf * x6;
+        c = (g >> 14u) & 3u;    v = 8.0f + 17.0f * float(c) + 0.5f * float(c) * float(c - 1u);
+        sgnf = (((sgn >> 7u) & 1u) == 1u) ? -1.0f : 1.0f;   a7 += db * v * sgnf * x7;
+    }
+    sred[lane] = live ? ((((a0+a1)+(a2+a3))+((a4+a5)+(a6+a7)))) : 0.0f;
+    barrier();
+    uint base = r_in * 32u;
+    for (uint stp = 16u; stp > 0u; stp >>= 1u) {
+        if (sb < stp) sred[base + sb] += sred[base + sb + stp];
+        barrier();
+    }
+    if (sb == 0u && live) yv[pc.y_off + row] = sred[base];
+}

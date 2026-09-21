@@ -1,0 +1,95 @@
+#version 450
+// iq2s_gemv5.comp — F1d：R=4 行/WG，64 lane/行，每 lane 4 值（stride 64）。
+// 动机：v3≈v4 ⇒ 加载路径/barrier 非瓶颈；嫌疑是每值依赖链（qs→idx10→g16 查表
+// →FMA 两次串行 L1 访问）ILP 不足。本版每 lane 4 条独立链（ILP×4），barrier
+// 与 x 读流量 ÷4，权重 word 加载 ÷2.4。PC 布局与 v3/v4 完全一致；
+// dispatch = ceil(n_out/4)（由 VKRUN_WG_ROWS=4 控制）。
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer WQ { uint wq[]; };
+layout(set = 0, binding = 1) readonly buffer G16 { uint g16[]; };
+layout(set = 0, binding = 2) readonly buffer XV { float xv[]; };
+layout(set = 0, binding = 3) writeonly buffer YV { float yv[]; };
+layout(push_constant) uniform PC { uint w_off; uint x_off; uint y_off; uint n_out; uint nb; } pc;
+shared float sred[256];
+
+uint wbyte(uint off) {
+    return (wq[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu;
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint r_in = lane >> 6u;            // WG 内行号 0..3
+    uint sl   = lane & 63u;            // 行内 lane 0..63
+    uint row  = gl_WorkGroupID.x * 4u + r_in;
+    bool live = row < pc.n_out;
+    uint rowbase = pc.w_off + row * pc.nb * 82u;
+    uint cpos = (sl & 7u) * 2u;        // 4 个值的码/符号位位置相同（64 ≡ 0 mod 8）
+
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    for (uint b = 0u; b < pc.nb; b++) {
+        uint boff = rowbase + b * 82u;
+        uint lo = wbyte(boff), hi = wbyte(boff + 1u);
+        float d = unpackHalf2x16(lo | (hi << 8u)).x;
+        uint xbase = pc.x_off + b * 256u + sl;
+        float x0 = xv[xbase], x1 = xv[xbase + 64u], x2 = xv[xbase + 128u], x3 = xv[xbase + 192u];
+        uint s0 = sl, s1 = sl + 64u, s2 = sl + 128u, s3 = sl + 192u;   // 值下标
+        uint sb0 = s0 >> 3u, sb1 = s1 >> 3u, sb2 = s2 >> 3u, sb3 = s3 >> 3u;
+        // i=0
+        uint qs = wbyte(boff + 2u + sb0);
+        uint sgn = wbyte(boff + 34u + sb0);
+        uint qhb = wbyte(boff + 66u + (sb0 >> 2u));
+        uint scb = wbyte(boff + 74u + (sb0 >> 2u));
+        uint idx10 = qs | (((qhb >> ((sb0 & 3u) * 2u)) & 3u) << 8u);
+        float nibv = (((sb0 >> 1u) & 1u) == 0u) ? float(scb & 0xFu) : float((scb >> 4u) & 0xFu);
+        float db = d * 0.25f * (0.5f + nibv);
+        uint code = (g16[idx10] >> cpos) & 3u;
+        float v = 8.0f + 17.0f * float(code) + 0.5f * float(code) * float(code - 1u);
+        float sign = (((sgn >> (sl & 7u)) & 1u) == 1u) ? -1.0f : 1.0f;
+        a0 += db * v * sign * x0;
+        // i=1
+        qs = wbyte(boff + 2u + sb1);
+        sgn = wbyte(boff + 34u + sb1);
+        qhb = wbyte(boff + 66u + (sb1 >> 2u));
+        scb = wbyte(boff + 74u + (sb1 >> 2u));
+        idx10 = qs | (((qhb >> ((sb1 & 3u) * 2u)) & 3u) << 8u);
+        nibv = (((sb1 >> 1u) & 1u) == 0u) ? float(scb & 0xFu) : float((scb >> 4u) & 0xFu);
+        db = d * 0.25f * (0.5f + nibv);
+        code = (g16[idx10] >> cpos) & 3u;
+        v = 8.0f + 17.0f * float(code) + 0.5f * float(code) * float(code - 1u);
+        sign = (((sgn >> (sl & 7u)) & 1u) == 1u) ? -1.0f : 1.0f;
+        a1 += db * v * sign * x1;
+        // i=2
+        qs = wbyte(boff + 2u + sb2);
+        sgn = wbyte(boff + 34u + sb2);
+        qhb = wbyte(boff + 66u + (sb2 >> 2u));
+        scb = wbyte(boff + 74u + (sb2 >> 2u));
+        idx10 = qs | (((qhb >> ((sb2 & 3u) * 2u)) & 3u) << 8u);
+        nibv = (((sb2 >> 1u) & 1u) == 0u) ? float(scb & 0xFu) : float((scb >> 4u) & 0xFu);
+        db = d * 0.25f * (0.5f + nibv);
+        code = (g16[idx10] >> cpos) & 3u;
+        v = 8.0f + 17.0f * float(code) + 0.5f * float(code) * float(code - 1u);
+        sign = (((sgn >> (sl & 7u)) & 1u) == 1u) ? -1.0f : 1.0f;
+        a2 += db * v * sign * x2;
+        // i=3
+        qs = wbyte(boff + 2u + sb3);
+        sgn = wbyte(boff + 34u + sb3);
+        qhb = wbyte(boff + 66u + (sb3 >> 2u));
+        scb = wbyte(boff + 74u + (sb3 >> 2u));
+        idx10 = qs | (((qhb >> ((sb3 & 3u) * 2u)) & 3u) << 8u);
+        nibv = (((sb3 >> 1u) & 1u) == 0u) ? float(scb & 0xFu) : float((scb >> 4u) & 0xFu);
+        db = d * 0.25f * (0.5f + nibv);
+        code = (g16[idx10] >> cpos) & 3u;
+        v = 8.0f + 17.0f * float(code) + 0.5f * float(code) * float(code - 1u);
+        sign = (((sgn >> (sl & 7u)) & 1u) == 1u) ? -1.0f : 1.0f;
+        a3 += db * v * sign * x3;
+    }
+    sred[lane] = live ? (a0 + a1 + a2 + a3) : 0.0f;
+    barrier();
+    // 行内 64-lane 树形归约（sred 每 64 一段）
+    uint base = r_in * 64u;
+    for (uint stp = 32u; stp > 0u; stp >>= 1u) {
+        if (sl < stp) sred[base + sl] += sred[base + sl + stp];
+        barrier();
+    }
+    if (sl == 0u && live) yv[pc.y_off + row] = sred[base];
+}

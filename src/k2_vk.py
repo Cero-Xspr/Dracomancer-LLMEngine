@@ -14,8 +14,10 @@ import numpy as np
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 LIB = os.path.join(BASE, "vk", "libvkrun.so")
-SPV = os.environ.get("K2_VK_SPV", os.path.join(BASE, "vk", "iq2s_gemv3.spv"))
+SPV = os.environ.get("K2_VK_SPV", os.path.join(BASE, "vk", "iq2s_gemv6.spv"))   # v6：子块/lane，2.6-3.1×
 G16 = os.path.join(BASE, "vk", "g16.bin")
+# v6 每 WG 处理 8 行 ⇒ dispatch=ceil(n_out/8)（libvkrun 从环境读）
+os.environ.setdefault("VKRUN_WG_ROWS", "8")
 
 H = 2560
 NB_H = H // 256          # n_in=2560 → 10 块

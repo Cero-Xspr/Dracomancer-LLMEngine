@@ -42,6 +42,7 @@ struct VG {
     VkCommandBuffer kcmd; VkFence kfence;
     pthread_t keeper_thr; volatile int keeper_on; int keeper_started;
     VkQueue kqueue;                 // keeper 专用队列（NULL = 与主队列共享，走互斥+sleep）
+    unsigned wg_rows;               // 每 WG 处理的行数（v5=4 ⇒ dispatch=ceil(n_out/4)）
 };
 typedef struct VG VG;
 
@@ -272,6 +273,7 @@ int vg_init(struct VG** out, unsigned long total_bytes, const char* spv_path,
     CHECK(vkAllocateCommandBuffers(vg->dev, &cbai, &vg->cmd), "cmd");
     VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
     CHECK(vkCreateFence(vg->dev, &fci, NULL, &vg->fence), "fence");
+    vg->wg_rows = getenv("VKRUN_WG_ROWS") ? (unsigned)atoi(getenv("VKRUN_WG_ROWS")) : 1u;
     pthread_mutex_init(&vg->qlock, NULL);
     VkCommandBufferAllocateInfo kbai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
                                          .commandPool = vg->cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
@@ -380,7 +382,9 @@ int vg_run(struct VG* vg, const struct VGMat* mats, int n, const float* x, unsig
         }
         uint32_t pc[5] = { mats[i].w_off, mats[i].x_off, mats[i].y_off, mats[i].n_out, mats[i].nb };
         vkCmdPushConstants(vg->cmd, vg->playout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 20, pc);
-        vkCmdDispatch(vg->cmd, mats[i].n_out, 1, 1);
+        uint32_t wgr = vg->wg_rows > 0 ? vg->wg_rows : 1u;
+        uint32_t groups = (mats[i].n_out + wgr - 1u) / wgr;
+        vkCmdDispatch(vg->cmd, groups, 1, 1);
     }
     CHECK2(vkEndCommandBuffer(vg->cmd), "end");
     double t_rec = getenv("VKRUN_TIMING") ? now_s() - tt0 : 0;
