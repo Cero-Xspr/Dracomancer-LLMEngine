@@ -15,6 +15,7 @@ import numpy as np
 BASE = os.path.dirname(os.path.abspath(__file__))
 LIB = os.path.join(BASE, "vk", "libvkrun.so")
 SPV = os.environ.get("K2_VK_SPV", os.path.join(BASE, "vk", "iq2s_gemv6.spv"))   # v6：子块/lane，2.6-3.1×
+SPV3S = os.environ.get("K2_VK_SPV3S", os.path.join(BASE, "vk", "iq3s_gemv1.spv"))  # IQ3_S（o-proj）
 G16 = os.path.join(BASE, "vk", "g16.bin")
 # v6 每 WG 处理 8 行 ⇒ dispatch=ceil(n_out/8)（libvkrun 从环境读）
 os.environ.setdefault("VKRUN_WG_ROWS", "8")
@@ -30,7 +31,8 @@ Y_FLOATS = 24576         # 单次调用最大输出 8×2560
 
 class VGMat(ct.Structure):
     _fields_ = [("w_off", ct.c_uint32), ("x_off", ct.c_uint32), ("y_off", ct.c_uint32),
-                ("n_out", ct.c_uint32), ("nb", ct.c_uint32), ("wset", ct.c_uint32)]
+                ("n_out", ct.c_uint32), ("nb", ct.c_uint32), ("wset", ct.c_uint32),
+                ("pipe", ct.c_uint32)]
 
 
 class VGInfo(ct.Structure):
@@ -52,10 +54,10 @@ class VKCtx:
     def __lib(self):
         lib = ct.CDLL(LIB)
         lib.vg_init.restype = ct.c_int
-        lib.vg_init.argtypes = [ct.POINTER(ct.c_void_p), ct.c_ulong, ct.c_char_p,
+        lib.vg_init.argtypes = [ct.POINTER(ct.c_void_p), ct.c_ulong, ct.c_char_p, ct.c_char_p,
                                 ct.c_ulong, ct.c_ulong, ct.c_ulong, ct.POINTER(VGInfo)]
         lib.vg_upload_grid.restype = ct.c_int
-        lib.vg_upload_grid.argtypes = [ct.c_void_p, ct.c_void_p]
+        lib.vg_upload_grid.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_ulong]
         lib.vg_upload.restype = ct.c_int
         lib.vg_upload.argtypes = [ct.c_void_p, ct.c_int, ct.c_ulong, ct.c_void_p, ct.c_ulong]
         lib.vg_run.restype = ct.c_int
@@ -80,7 +82,7 @@ class VKCtx:
         total = sum(self.T[n].n_bytes for n in self.order)
         info = VGInfo()
         h = ct.c_void_p()
-        rc = self.lib.vg_init(ct.byref(h), total, SPV.encode(),
+        rc = self.lib.vg_init(ct.byref(h), total, SPV.encode(), SPV3S.encode(),
                               X_FLOATS * 4, Y_FLOATS * 4, 128 << 20, ct.byref(info))
         if rc != 0:
             raise RuntimeError(f"vg_init rc={rc}")
@@ -100,10 +102,16 @@ class VKCtx:
                     break
             else:
                 raise RuntimeError(f"{n} 放不下")
-        # G16 码表（uint32[1024]）
-        g16 = np.fromfile(G16, np.uint16).astype(np.uint32)
-        assert g16.size == 1024
-        rc = self.lib.vg_upload_grid(self.h, g16.ctypes.data_as(ct.c_void_p))
+        # 码表区：uint32[0:1024)=IQ2S 码表；[1024:1536)=IQ3S 网格（512×uint32，每 4×int8 值 1..15）
+        g16 = np.zeros(1536, np.uint32)
+        g16[:1024] = np.fromfile(G16, np.uint16).astype(np.uint32)
+        import re as _re
+        _hdr = open(os.path.join(BASE, "m5", "iq3s_grid.h")).read()
+        _vals = [int(x) for x in _re.findall(r"-?\d+", _hdr.split("{", 1)[1].split("}", 1)[0])]
+        assert len(_vals) == 2048, len(_vals)
+        _i8 = np.array(_vals, np.int8)
+        g16[1024:1536] = np.frombuffer(_i8.tobytes(), np.uint32)   # 小端：字节0=值0
+        rc = self.lib.vg_upload_grid(self.h, g16.ctypes.data_as(ct.c_void_p), 1536 * 4)
         assert rc == 0
         # X/Y numpy 视图
         self.xv = np.frombuffer((ct.c_float * X_FLOATS).from_address(
@@ -170,9 +178,11 @@ class VKCtx:
     # ── 低层 ──
     def _run(self, mats, x, x_floats):
         arr = (VGMat * len(mats))()
-        for i, (g, xo, yo, nout, nb) in enumerate(mats):
+        for i, m in enumerate(mats):
+            g, xo, yo, nout, nb = m[0], m[1], m[2], m[3], m[4]
             arr[i].w_off, arr[i].x_off, arr[i].y_off = g.w_off, xo, yo
             arr[i].n_out, arr[i].nb, arr[i].wset = nout, nb, g.wset
+            arr[i].pipe = m[5] if len(m) > 5 else 0
         xp = None if x is None else x.ctypes.data_as(ct.c_void_p)
         rc = self.lib.vg_run(self.h, arr, len(mats), xp, x_floats)
         if rc != 0:
@@ -246,6 +256,11 @@ class VKCtx:
         self._run(mats, None, X_FLOATS)
         y = self.yv[:ns * n_out + n_out].copy()
         return y[:ns * n_out].reshape(ns, n_out), y[ns * n_out:]
+
+    def oproj(self, x, og, n_out, n_in):
+        """IQ3_S o-proj（单矩阵，pipe=1，R=4 行/WG 由 C 侧固定）。x 长度 = n_in。"""
+        self._run([(og, 0, 0, n_out, n_in // 256, 1)], x, n_in)
+        return self.yv[:n_out].copy()
 
     def shared_gu(self, h2, sgg, sug, n_inter):
         mats = [(sgg, 0, 0, n_inter, NB_H), (sug, 0, n_inter, n_inter, NB_H)]

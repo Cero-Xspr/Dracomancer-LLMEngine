@@ -1,0 +1,67 @@
+#version 450
+// iq3s_gemv1.comp — IQ3_S gemv（o-proj 用）。布局照 m5_kern6.c（已验证）：
+//   块 110B/256 值 = d(f16) + qs[64] + qh[8] + signs[8] + scales[8]
+//   值 i：idx = qs[i] | ((qh[i>>3]>>(i&7) &1)<<8)；网格表 512×uint32（4×int8，值 1..15）
+//         作用于 x[i*4..+4)；sign = signs 流第 i 位；scale dg = d*(1+2*nib(g))，
+//         g=i>>3，nib=(g&1)? hi:lo of scales[g>>1]。
+// 几何：WG=256 = 4 行 × 64 lane，lane sl 负责各块的值组 sl。dispatch=ceil(n_out/4)。
+// 网格表在 G16 缓冲 uint 偏移 1024 处。
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer WQ { uint wq[]; };
+layout(set = 0, binding = 1) readonly buffer G16 { uint g16[]; };
+layout(set = 0, binding = 2) readonly buffer XV { float xv[]; };
+layout(set = 0, binding = 3) writeonly buffer YV { float yv[]; };
+layout(push_constant) uniform PC { uint w_off; uint x_off; uint y_off; uint n_out; uint nb; } pc;
+shared float sred[256];
+
+uint wbyte(uint off) {
+    return (wq[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu;
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint r_in = lane >> 6u;
+    uint sl   = lane & 63u;            // 值组 0..63
+    uint row  = gl_WorkGroupID.x * 4u + r_in;
+    bool live = row < pc.n_out;
+    uint rowbase = pc.w_off + row * pc.nb * 110u;
+    uint g    = sl >> 3u;              // 子块 0..7
+    uint qhb8 = sl >> 3u;              // qh 字节号（= g）
+    uint qbase = sl & 4u;              // qh 9th 位基（值 b 用 qbase+b）
+    uint scb_i = sl >> 4u;             // scales 字节号
+    uint nib_sh = ((sl >> 3u) & 1u) * 4u;
+    uint sbase = sl << 2u;             // signs 流内位基 = 4*sl（值 b 用 sbase+b）
+
+    float acc = 0.0f;
+    for (uint b = 0u; b < pc.nb; b++) {
+        uint boff = rowbase + b * 110u;
+        uint lo = wbyte(boff), hi = wbyte(boff + 1u);
+        float d = unpackHalf2x16(lo | (hi << 8u)).x;
+        uint qs  = wbyte(boff + 2u + sl);
+        uint qhb = wbyte(boff + 66u + qhb8);
+        uint scb = wbyte(boff + 106u + scb_i);
+        float dg = d * (1.0f + 2.0f * float(scb >> nib_sh & 0xFu));
+        uint xbase = pc.x_off + b * 256u + (sl << 2u);
+        float x0 = xv[xbase], x1 = xv[xbase + 1u], x2 = xv[xbase + 2u], x3 = xv[xbase + 3u];
+        // 组 sl 的网格索引 = qs | qh bit(sl&7)<<8（一组一个）；4 值 = 该字 4 字节
+        uint idx = qs | (((qhb >> (sl & 7u)) & 1u) << 8u);
+        uint gw = g16[1024u + idx];
+        // signs 流 bit (4*sl + b) 为值 b 的符号
+        // sbase=4sl 恒 4 对齐 ⇒ 4 个符号位必在同一字节 (sbase&7)..+3
+        uint sbits = wbyte(boff + 74u + (sl >> 1u));
+        uint sb = (sbits >> (sbase & 7u)) & 0xFu;   // 4 个符号位打包
+        float v0 = float((gw)       & 0xFu) * (((sb       ) & 1u) == 1u ? -1.0f : 1.0f);
+        float v1 = float((gw >> 8u)  & 0xFu) * (((sb >> 1u) & 1u) == 1u ? -1.0f : 1.0f);
+        float v2 = float((gw >> 16u) & 0xFu) * (((sb >> 2u) & 1u) == 1u ? -1.0f : 1.0f);
+        float v3 = float((gw >> 24u) & 0xFu) * (((sb >> 3u) & 1u) == 1u ? -1.0f : 1.0f);
+        acc += dg * (v0 * x0 + v1 * x1 + v2 * x2 + v3 * x3);
+    }
+    sred[lane] = live ? acc : 0.0f;
+    barrier();
+    uint base = r_in * 64u;
+    for (uint stp = 32u; stp > 0u; stp >>= 1u) {
+        if (sl < stp) sred[base + sl] += sred[base + sl + stp];
+        barrier();
+    }
+    if (sl == 0u && live) yv[pc.y_off + row] = sred[base];
+}

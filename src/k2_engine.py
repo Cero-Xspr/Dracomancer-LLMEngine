@@ -274,6 +274,7 @@ class Layer:
         self.qg = self.kg = self.gg = self.vgg = None
         self.veg = self.exg = self.uxg = self.dxg = None
         self.sgg = self.sug = self.sdg = None
+        self.og = None
         if not self.sparse:
             return
         p = f"blk.{self.li}."
@@ -282,6 +283,7 @@ class Layer:
             gg = VK.reg.get(name)
             return (gg, n_out) if (gg is not None and n_out is not None) else gg
 
+        self.og = g(p + "attn_output.weight")
         self.qg = g(p + "attn_q.weight", NH * HD)
         self.kg = g(p + "attn_k.weight", NKV * HD)
         self.gg = g(p + "attn_gate.weight", NH * HD)
@@ -321,6 +323,8 @@ if K2_VK:
                     _wanted.append(p + s)
             if _is13(p + "ffn_down_exps.weight"):
                 _wanted.append(p + "ffn_down_exps.weight")
+            if tcode(p + "attn_output.weight") == 2:      # IQ3_S o-proj 上 GPU（pipe1）
+                _wanted.append(p + "attn_output.weight")
         # F2：shexp(g/u/d) 并入 gate_up/down 同一 submit（多 dispatch 免费）；
         # 仅单层混量化（IQ3_S）的缺角张量走 CPU 分支。
         VK = _k2vk.VKCtx(T, _wanted).arm(upload=not os.environ.get("K2_VK_NOUPLOAD"))
@@ -472,7 +476,10 @@ def attn_ffn_common(x, L, pos):
     t0 = _tick("attention", t0)
     gate = softplus_ln2(gate_in if gate_in is not None else gemv1(L.gc, L.gb, NH * HD, H, h))
     out = out * gate
-    o = gemv1(L.oc, L.ob, H, NH * HD, out)
+    if VK is not None and "oproj" not in VK_SKIP and L.og is not None:
+        o = VK.oproj(out, L.og, H, NH * HD)
+    else:
+        o = gemv1(L.oc, L.ob, H, NH * HD, out)
     t0 = _tick("gate_o", t0)
     if os.environ.get("K2DBG"):
         e = lambda a: ("OK" if np.isfinite(np.asarray(a)).all() else "NAN") + "/" + str(np.asarray(a).dtype)
