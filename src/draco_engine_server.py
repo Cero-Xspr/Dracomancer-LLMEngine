@@ -584,6 +584,9 @@ def _load_k2():
                                        #   不设的话会静默用默认 Q4_K_M（22GB 纯 CPU 磁盘流式）！
     import k2_engine as E
     import falcon_tok as FT
+    # ★ 不接 forward_chunk（CPU 批量 prefill）：实测 IQ2_M 上 CPU GEMM ~700ms/tok，
+    #   比 GPU 增量路径（~250ms/tok）慢 2-3×——iGPU gemv 已是最快 prefill。
+    #   真 TTFT 杠杆 = GPU GEMM 内核（F2.7 候选）。k2_prefill.py 保留作 CPU 模式工具。
     tk, _R = FT.build(ARGS.model, add_bos=False, pre="llama3")   # pre=k2-horizon 的正则与 llama3 相同
     render = _template_renderer(ARGS.model, think_default=False)
     if render is None:
@@ -600,6 +603,7 @@ def _load_k2():
               system_default=None, bos=0,
               think_block=False, think_default=False,
               state_arrays=(lambda: E.STATES) if hasattr(E, "STATES") else None,
+              forward_chunk=_forward_chunk,
               render=render)
     return ap
 

@@ -181,18 +181,17 @@ class Prefiller:
                 V = self.gemm_w(h, L.vc, L.vb, NKV * HD, H, T)
             if os.environ.get("K2DBG3") and li == 3:
                 DBG.update(h3=h.copy(), q3=q.copy(), k3=k.copy(), V3=V.copy())
-            # 写 KV 缓存
-            L.K[pos0:pos0 + T] = k
-            L.V[pos0:pos0 + T] = V.reshape(T, NKV, HD)
-            # 批量注意力（因果）
+            # 写 KV 缓存（F2.6 转置布局：Kt [NKV,HD,MAXT]、Vt [NKV,MAXT,HD]）
+            L.Kt[:, :, pos0:pos0 + T] = k.transpose(1, 2, 0)   # Kt [NKV,HD,MAXT]
+            L.Vt[:, pos0:pos0 + T, :] = V.reshape(T, NKV, HD).transpose(1, 0, 2)
+            # 批量注意力（因果）：分组 GQA batched GEMM，q [NKV,grp,T,HD] 广播批维
             kv_n = pos0 + T
-            Kc = np.repeat(L.K[:kv_n].transpose(1, 0, 2), grp, axis=0)   # [NH, kv_n, HD]
-            Vc = np.repeat(L.V[:kv_n].transpose(1, 0, 2), grp, axis=0)
-            qh = np.ascontiguousarray(q.transpose(1, 0, 2))              # [NH, T, HD]
+            qg4 = np.ascontiguousarray(
+                q.reshape(T, NKV, grp, HD).transpose(1, 2, 0, 3))        # [NKV,grp,T,HD]
+            scores = np.matmul(qg4, L.Kt[:, None, :, :kv_n])             # [NKV,grp,T,kv_n]
             att = KE.softmax_last(
-                (qh @ Kc.transpose(0, 2, 1)) * np.float32(HD ** -0.5)
-                + self._causal_mask(T, pos0))                            # [NH, T, kv_n]
-            out = (att @ Vc).transpose(1, 0, 2).reshape(T, NH * HD)
+                scores * np.float32(HD ** -0.5) + self._causal_mask(T, pos0))
+            out = np.matmul(att, L.Vt[:, None, :kv_n, :]).transpose(2, 0, 1, 3).reshape(T, NH * HD)
             gate = KE.softplus_ln2(self.gemm_w(h, L.gc, L.gb, NH * HD, H, T))
             attn = self.gemm_w(out * gate, L.oc, L.ob, H, NH * HD, T)
             x = x + attn
