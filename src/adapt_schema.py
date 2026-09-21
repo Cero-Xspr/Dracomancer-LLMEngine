@@ -43,8 +43,8 @@ _TOP_KEYS = ("schema_version", "match", "requires_local_build", "launch",
              "sampling", "backend_hint", "notes", "source",
              "engines", "status", "display_name")
 _LAUNCH_KEYS = ("extra_args", "ngl")
-_SAMPLING_KEYS = ("temp", "repeat_penalty", "max_tokens_default", "think_default",
-                  "think_hold")   # think_hold: line|token|dup（思考流式粒度，仅自研引擎生效）
+_SAMPLING_KEYS = ("temp", "top_p", "repeat_penalty", "max_tokens_default", "think_default",
+                  "think_hold")   # top_p: 核采样截断（1=关）；think_hold: line|token|dup
 _ENGINE_KEYS = ("launch", "requires_local_build", "backend_hint", "status", "notes",
                 "display_name", "selfcheck_ref")
 
@@ -150,6 +150,8 @@ def validate_profile(p, origin="<submission>"):
                 raise ValueError(f"sampling.{k} 必须是数字")
         if "think_default" in s and not isinstance(s["think_default"], bool):
             raise ValueError("sampling.think_default 必须是布尔")
+        if "top_p" in s and not (0.0 < float(s["top_p"]) <= 1.0):
+            errs.append(f"sampling.'top_p' 应在 (0,1]")
         if "think_hold" in s and s["think_hold"] not in ("line", "token", "dup"):
             raise ValueError("sampling.think_hold 只能是 line / token / dup")
     if "backend_hint" in p and p["backend_hint"] not in KNOWN_BACKENDS:

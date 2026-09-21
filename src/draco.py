@@ -726,7 +726,7 @@ class Server:
             _ma = 0
             for _ln in open("/proc/meminfo"):
                 if _ln.startswith("MemAvailable"):
-                    _ma = int(_ln.split()[0]) >> 10   # MB
+                    _ma = int(_ln.split()[1]) >> 10   # kB → MB（split()[0] 是键名！）
                     break
             if _ma and _ma < 9000 and not os.environ.get("DRACO_FORCE_DENGINE"):
                 raise SystemExit(
