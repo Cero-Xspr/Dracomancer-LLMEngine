@@ -1484,10 +1484,12 @@ def cmd_chat(args):
 
     # ★ 支持性检查必须在"装载…"提示**之前** —— 否则会先打"装载 X"再报"X 跑不了"，
     #   自相矛盾（我实测看到过）。档案标 broken 的情况同理（也走这条更可读的理由）。
-    _broken = broken_reason(m)
+    # ★ 这两道守卫只约束 llama.cpp 系后端——dengine 是自研实现，正确性由
+    #   engines.dracomancer 档案守卫（Server.__init__ 里 broken_reason(m,"dracomancer")）
+    _broken = broken_reason(m) if backend in ("cpu", "igpu", "local") else None
     if _broken:
         raise SystemExit(f"'{m.name}' 在当前引擎上不可用 —— {_broken}")
-    if not m.supported:
+    if not m.supported and backend != "dengine":
         raise SystemExit(
             f"'{m.name}'（架构 {m.arch}）llama.cpp b10819 不支持，cpu/igpu 都跑不了。\n"
             f"  这类模型需要我们自己的内核（见 STAGE1_NPU.md）。"
