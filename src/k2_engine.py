@@ -265,12 +265,11 @@ class Layer:
             self.g1b, self.g1c = wview(p + "ffn_gate.weight"), tcode(p + "ffn_gate.weight")
             self.u1b, self.u1c = wview(p + "ffn_up.weight"), tcode(p + "ffn_up.weight")
             self.d1b, self.d1c = wview(p + "ffn_down.weight"), tcode(p + "ffn_down.weight")
-        self.K = np.zeros((MAXT, NKV, HD), np.float32)
-        self.V = np.zeros((MAXT, NKV, HD), np.float32)
-        # ★ F2.5：转置布局（[NKV,MAXT,HD] 连续），注意力走分组 GEMM 免 4× KV 复制
+        # ★ F2.5：KV 只留转置布局（[NKV,MAXT,HD] 连续），注意力走分组 GEMM。
+        #   旧的非转置 K/V 已无读者 ⇒ 移除（ctx4096 省 1.6GB——OOM 事件的内存预算之一）
         self.Kt = np.zeros((NKV, MAXT, HD), np.float32)
         self.Vt = np.zeros((NKV, MAXT, HD), np.float32)
-        STATES.extend([self.K, self.V, self.Kt, self.Vt])
+        STATES.extend([self.Kt, self.Vt])
 
     def attach_vk(self, VK):
         """K2_VK: 登记 GPU 常驻矩阵 ((G, n_out) 或 G)；None = 该张量留 CPU。"""
@@ -440,7 +439,6 @@ def attn_ffn_common(x, L, pos):
         vlogits = gemv1(L.vgc, L.vgb, MEXP, H, h) if L.sparse else None
     q = qf.reshape(NH, HD)
     k = rope1(kf.reshape(NKV, HD), pos)
-    L.K[pos] = k
     L.Kt[:, pos, :] = k
     t0 = _tick("qkv", t0)
     if L.sparse:
@@ -469,12 +467,10 @@ def attn_ffn_common(x, L, pos):
             for k_i, e in enumerate(sel):
                 ve = gemv1(L.vec, L.veb[e * L.ve_per:], VOUT, H, h)
                 v += silu(ve) * wts[k_i]
-        L.V[pos] = v.reshape(NKV, HD)
-        L.Vt[:, pos, :] = L.V[pos]
+        L.Vt[:, pos, :] = v.reshape(NKV, HD)
     else:
         v = gemv1(L.vc, L.vb, VOUT, H, h)
-        L.V[pos] = v.reshape(NKV, HD)
-        L.Vt[:, pos, :] = L.V[pos]
+        L.Vt[:, pos, :] = v.reshape(NKV, HD)
     t0 = _tick("mova_v", t0)
     # 注意力（GQA，因果，T=1 单步）
     q = rope1(q.reshape(NH, HD), pos)

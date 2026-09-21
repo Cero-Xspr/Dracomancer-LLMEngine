@@ -721,6 +721,18 @@ class Server:
             exe = os.path.join(b["dir"], "draco_engine_server.py")
             if not os.path.exists(exe):
                 raise SystemExit(f"找不到 {exe}")
+            # ★ 内存预算闸：dengine 的 iGPU 混合要 GTT(~3GB)+上下文状态+映射，实测
+            #   双实例叠加直接把 22GB 打穿触发 OOM（2026-09-21 桌面被 oomd 端掉）。
+            _ma = 0
+            for _ln in open("/proc/meminfo"):
+                if _ln.startswith("MemAvailable"):
+                    _ma = int(_ln.split()[0]) >> 10   # MB
+                    break
+            if _ma and _ma < 9000 and not os.environ.get("DRACO_FORCE_DENGINE"):
+                raise SystemExit(
+                    f"可用内存 {_ma}MB < 9000MB：K2 iGPU 混合实例约需 9GB（GTT 钉死+上下文状态+映射）。\n"
+                    f"  大概率已有一个引擎实例在跑（pgrep -fa draco_engine_server 查看）；\n"
+                    f"  或关掉大件再试；强行启动设 DRACO_FORCE_DENGINE=1。")
             self.url = f"http://127.0.0.1:{self.port}"
             eng_adapter = dengine_adapter(model)
             if eng_adapter is None:
