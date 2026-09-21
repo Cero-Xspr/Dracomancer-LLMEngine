@@ -370,7 +370,11 @@ class Model:
     def line(self):
         sz = f"{self.size/1e9:.2f} GB"
         v = draco_view(self) if self.profile else {}
-        if v.get("status") == "broken":
+        # ★ dengine 有适配器且 dracomancer 视角 works ⇒ 显示 dengine（而非被 llama_cpp
+        #   视角的 broken 盖掉——k2-horizon 就是这种情况：llama.cpp 不支持但自研引擎能跑）
+        if (default_backend(self) == "dengine" and not broken_reason(self, "dracomancer")):
+            sup = "dengine"
+        elif v.get("status") == "broken":
             sup = "—（档案标注不可用）"
         elif not self.supported:
             sup = "—（llama.cpp 不支持该架构）"
@@ -398,7 +402,8 @@ def discover():
 _DENGINE_ADAPTERS = (("zaya", "zaya"), ("smollm2", "smol"), ("ling", "ling"),
                      ("granite 4.0 h", "granite"), ("llama 3.2", "llama"))
 # ★ 有些模型 general.name 无意义（falcon-h1 的叫 "Original"），名字匹配不可用 ⇒ 按架构兜底。
-_DENGINE_ADAPTERS_ARCH = {"falcon-h1": "falcon", "qwen35": "qwen35", "qwen35moe": "qwen35"}
+_DENGINE_ADAPTERS_ARCH = {"falcon-h1": "falcon", "qwen35": "qwen35", "qwen35moe": "qwen35",
+                          "k2-horizon": "k2"}
 
 
 def dengine_adapter(model):
@@ -687,7 +692,9 @@ class Server:
             print(f"[draco] {model.arch} 只有**本地构建**里有实现（官方二进制没有；"
                   f"档案 {src}）→ 后端 {backend} 自动换成 local")
             backend = "local"
-        if not model.supported:
+        if not model.supported and backend != "dengine":
+            # dengine 是我们自己的实现，不受 llama.cpp 支持性约束
+            # （正确性由档案 engines.dracomancer.status + broken_reason 守卫，见下）
             raise SystemExit(
                 f"'{model.name}'（架构 {model.arch}）llama.cpp b10819 不支持，"
                 f"cpu/igpu 都跑不了。\n"
@@ -696,7 +703,8 @@ class Server:
         self.model, self.backend = model, backend
         prof = model.profile or {}
         view = draco_view(model)
-        reason = broken_reason(model)
+        # llama_cpp 视角的 broken 只约束真正走 llama.cpp 的后端（dengine/npu 有自己的守卫）
+        reason = broken_reason(model) if backend in ("cpu", "igpu", "local") else None
         if reason:
             # 档案已标注"在这个引擎上不可用"（负结果）——给出理由，比让 llama.cpp
             # 抛一句 'unknown architecture' 有用得多。
@@ -716,9 +724,9 @@ class Server:
             self.url = f"http://127.0.0.1:{self.port}"
             eng_adapter = dengine_adapter(model)
             if eng_adapter is None:
-                raise SystemExit("自研引擎（Darco）目前只接了 SmolLM2 / ZAYA1 / Ling"
-                                 "（其余模型/架构待逐个过数值对账后再接线；"
-                                 "清单见 draco._DENGINE_ADAPTERS 与各档案的 engines.dracomancer 段）")
+                raise SystemExit("自研引擎（Darco）目前接了 SmolLM2 / ZAYA1 / Ling / granite / "
+                                 "falcon / llama / qwen35(+moe) / k2-horizon"
+                                 "（清单见 draco._DENGINE_ADAPTERS(_ARCH) 与各档案）")
             self.cmd = [sys.executable, exe, "--model", model.path,
                         "--port", str(self.port), "--engine", eng_adapter,
                         "--threads", str(threads), "--ctx", str(ctx)]

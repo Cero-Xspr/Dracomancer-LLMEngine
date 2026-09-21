@@ -82,8 +82,13 @@ def _template_renderer(model_path, think_default=True):
     f = r.fields.get("tokenizer.chat_template")
     if f is None:
         return None
-    import jinja2
-    tpl = jinja2.Environment().from_string(f.contents())
+    import jinja2, re as _re
+    _src = f.contents()
+    # ★ transformers 专用标签（{% generation %}）plain jinja 不认——K2 官方模板带
+    #   （k2_bench.py 同款剥法；对渲染出的人来说它们只影响 token 流切分，不影响文本）
+    _src = _re.sub(r"\{%-?\s*endgeneration\s*-?%\}", "",
+                   _re.sub(r"\{%-?\s*generation\s*-?%\}", "", _src))
+    tpl = jinja2.Environment().from_string(_src)
     # 模板里可能引用 <role>/<|role_end|> 这类字面量 token —— 从 token_id 反查文本喂进去
     vars_ = {}
     tf = r.fields.get("tokenizer.ggml.tokens")
@@ -569,9 +574,14 @@ def _load_k2():
     """K2-Horizon（k2-horizon 架构，MoVA）适配器。
 
     架构要点见 k2_engine.py。oracle = 官方 transformers 实现（k2_numpy 对拍 max|Δ|=1.4e-7）。
-    ★ 已知性能特征：模型 22.4GB > 可用内存 ⇒ 每 token 激活 2.68GB 权重从磁盘流式读
-    （实测 ~6.7 GB/s ≈ S730 顺序读上限），decode 0.4-0.6 s/token。K2_PREFETCH=1 时按上次
-    路由做专家预读（SS-MoE 思路）。"""
+    ★ 性能（2026-09-21 F1c-F1d 后）：默认 **iGPU 混合**（K2_VK=1）——IQ2_S 权重 10.4GB
+    GPU 驻留（heap1 7.9 + GTT 2.7）、v6 子块内核 + IQ3_S o-proj + keeper 保活，
+    静机 decode 5.8+ t/s（CPU-only 2.98 的 2 倍；Q4_K_M GGUF 无 IQ2_S 张量会自动
+    回落 CPU 路径）。显式 CPU：环境 K2_VK=0。首 token 前有 ~40s 的 GPU 上传。"""
+    # F1c 起 iGPU 混合是主线（k2_gate PASS 4.12e-07）；显式 K2_VK=0 回落 CPU
+    os.environ.setdefault("K2_VK", "1")
+    os.environ["MODEL"] = ARGS.model   # ★ k2_engine 从 MODEL 环境变量读权重——
+                                       #   不设的话会静默用默认 Q4_K_M（22GB 纯 CPU 磁盘流式）！
     import k2_engine as E
     import falcon_tok as FT
     tk, _R = FT.build(ARGS.model, add_bos=False, pre="llama3")   # pre=k2-horizon 的正则与 llama3 相同

@@ -327,11 +327,15 @@ if K2_VK:
                 _wanted.append(p + "attn_output.weight")
         # F2：shexp(g/u/d) 并入 gate_up/down 同一 submit（多 dispatch 免费）；
         # 仅单层混量化（IQ3_S）的缺角张量走 CPU 分支。
-        VK = _k2vk.VKCtx(T, _wanted).arm(upload=not os.environ.get("K2_VK_NOUPLOAD"))
-        for L in LAYERS:
-            L.attach_vk(VK)
-        if not os.environ.get("K2_VK_NOUPLOAD"):
-            VK.drop_cache()
+        if not _wanted:
+            print("[vk] 该 GGUF 无 IQ2_S/IQ3_S 上图张量（如 Q4_K_M 版）⇒ 纯 CPU 路径", flush=True)
+        else:
+            VK = _k2vk.VKCtx(T, _wanted).arm(upload=not os.environ.get("K2_VK_NOUPLOAD"))
+        if VK is not None:
+            for L in LAYERS:
+                L.attach_vk(VK)
+            if not os.environ.get("K2_VK_NOUPLOAD"):
+                VK.drop_cache()
         print("[vk] 引擎已切 iGPU 驻留", flush=True)
     except Exception as e:
         print(f"[vk] 初始化失败，回落 CPU：{e!r}", flush=True)

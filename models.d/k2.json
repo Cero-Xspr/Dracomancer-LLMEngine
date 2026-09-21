@@ -1,0 +1,19 @@
+{
+  "schema_version": 2,
+  "match": {
+    "arch": "k2-horizon"
+  },
+  "display_name": "K2-Horizon MoVA 36B A4B",
+  "engines": {
+    "llama_cpp": {
+      "status": "broken",
+      "notes": "llama.cpp 无 k2-horizon 支持（上游 issue #28361，无 PR）——加载即 'unknown architecture'。"
+    },
+    "dracomancer": {
+      "backend_hint": "dengine",
+      "status": "works",
+      "notes": "k2 驱动（k2_engine.py，MoVA 64×4 + MoE 100×8+1，sigmoid×2.5 路由）。\n★ 2026-09-21 F1c-F1d：默认 **iGPU 混合**——IQ2_S 权重 10.4GB GPU 驻留（DEV_LOCAL 7.9GB + GTT 2.7GB），v6 子块内核（26-31GB/s）+ IQ3_S o-proj + keeper DVFS 保活；静机 decode 5.8+ t/s（CPU-only 2.98 的 2 倍），prefill 5.4 t/s（4.5×）。\n★ 正确性：k2_gate 逐层校验和 vs numpy oracle max 4.12e-07 PASS；IQ2_S/IQ3_S 内核对拍 CPU kern 4.8e-7/6.6e-7。\n★ 量化档：**IQ2_M（11.6GB）是快档**（上图张量 10.4GB）；Q4_K_M（20.8GB）无 IQ2_S 张量自动回落纯 CPU（~3 t/s）；BF16 74.9GB 别选。\n★ 显式 CPU：环境 K2_VK=0。服务启动含 ~40s GPU 上传（逐张量 madvise 防 OOM）。"
+    }
+  },
+  "notes": "MBZUAI K2-Horizon-MoVA-36B-A4B（48 层 = 3 稠密 + 45 稀疏，MoVA 64×4，MoE 100×8+1 共享，sigmoid×2.5 路由，思考模型 <ifm|think>）。本机三档：IQ2_M 11.6GB（推荐）/ Q4_K_M 20.8GB / BF16 74.9GB。\n三路并发实测（F3）：NPU(FLM 1B) 与 K2 同跑 ⇒ NPU -5%、K2 -16%（1B@61t/s ≈ 43GB/s 总线拉力）；NPU 定位=独立并行小模型/能效档。\n剪枝否定（专家级 29.7% 覆盖 + 神经元级 top50% 仅 69%）；投机解码否定（draft 同引擎被每调用开销拖死、异词表不可行）。"
+}
