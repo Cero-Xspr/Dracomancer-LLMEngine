@@ -1,0 +1,75 @@
+#version 450
+// iq2s_gemm16.comp — F2.7：IQ2_S GEMM，T_TILE=16（T 恒按 16 补零，python 侧处理）。
+// 每 lane 负责一个子块（8 值）：每块解码一次（v0..v7），对 16 个 token 各做
+// 8 次 FMA —— 权重每行每 16-token 块只读一次。X 为转置布局 [n_in, 16]：
+// x[(b*256 + sb*8 + k)*16 + t]，token 维连续（16×4B=64B 合并访问）。
+// dispatch = ceil(n_out/8)；y[y_off + row*16 + t]。
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer WQ { uint wq[]; };
+layout(set = 0, binding = 1) readonly buffer G16 { uint g16[]; };
+layout(set = 0, binding = 2) readonly buffer XV { float xv[]; };
+layout(set = 0, binding = 3) writeonly buffer YV { float yv[]; };
+layout(push_constant) uniform PC { uint w_off; uint x_off; uint y_off; uint n_out; uint nb; } pc;
+shared float sred[256];
+
+float dval(uint g, uint k, float db, uint sgn, uint kbit) {
+    uint c = (g >> (2u * k)) & 3u;
+    float v = db * (8.0f + 17.0f * float(c) + 0.5f * float(c) * float(c - 1u));
+    return (((sgn >> k) & 1u) == 1u) ? -v : v;
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint r_in = lane >> 5u;
+    uint sb   = lane & 31u;
+    uint row  = gl_WorkGroupID.x * 8u + r_in;
+    bool live = row < pc.n_out;
+    uint rowbase = pc.w_off + row * pc.nb * 82u;
+
+    float a[16];
+    for (uint t = 0u; t < 16u; t++) a[t] = 0.0f;
+
+    for (uint b = 0u; b < pc.nb; b++) {
+        uint boff = rowbase + b * 82u;
+        uint lo = (wq[boff >> 2u] >> ((boff & 3u) * 8u)) & 0xFFu;
+        uint hi = (wq[(boff + 1u) >> 2u] >> (((boff + 1u) & 3u) * 8u)) & 0xFFu;
+        float d = unpackHalf2x16(lo | (hi << 8u)).x;
+        uint qs  = (wq[(boff + 2u + sb) >> 2u] >> (((boff + 2u + sb) & 3u) * 8u)) & 0xFFu;
+        uint sgn = (wq[(boff + 34u + sb) >> 2u] >> (((boff + 34u + sb) & 3u) * 8u)) & 0xFFu;
+        uint qhi = boff + 66u + (sb >> 2u);
+        uint qhb = (wq[qhi >> 2u] >> ((qhi & 3u) * 8u)) & 0xFFu;
+        uint sci = boff + 74u + (sb >> 2u);
+        uint scb = (wq[sci >> 2u] >> ((sci & 3u) * 8u)) & 0xFFu;
+        uint idx = qs | (((qhb >> ((sb & 3u) * 2u)) & 3u) << 8u);
+        float nib = (((sb >> 1u) & 1u) == 0u) ? float(scb & 0xFu) : float((scb >> 4u) & 0xFu);
+        float db = d * 0.25f * (0.5f + nib);
+        uint g = g16[idx];
+        float v0 = dval(g, 0u, db, sgn, 0u), v1 = dval(g, 1u, db, sgn, 1u);
+        float v2 = dval(g, 2u, db, sgn, 2u), v3 = dval(g, 3u, db, sgn, 3u);
+        float v4 = dval(g, 4u, db, sgn, 4u), v5 = dval(g, 5u, db, sgn, 5u);
+        float v6 = dval(g, 6u, db, sgn, 6u), v7 = dval(g, 7u, db, sgn, 7u);
+        uint xb = pc.x_off + (b * 256u + sb * 8u) * 16u;
+        for (uint t = 0u; t < 16u; t++) {
+            a[t] += v0 * xv[xb +            t]
+                  + v1 * xv[xb +     16u + t]
+                  + v2 * xv[xb + 2u*16u + t]
+                  + v3 * xv[xb + 3u*16u + t]
+                  + v4 * xv[xb + 4u*16u + t]
+                  + v5 * xv[xb + 5u*16u + t]
+                  + v6 * xv[xb + 6u*16u + t]
+                  + v7 * xv[xb + 7u*16u + t];
+        }
+    }
+
+    for (uint t = 0u; t < 16u; t++) {
+        sred[lane] = live ? a[t] : 0.0f;
+        barrier();
+        uint base = r_in * 32u;
+        for (uint stp = 16u; stp > 0u; stp >>= 1u) {
+            if (sb < stp) sred[base + sb] += sred[base + sb + stp];
+            barrier();
+        }
+        if (sb == 0u && live) yv[pc.y_off + row * 16u + t] = sred[base];
+        barrier();
+    }
+}

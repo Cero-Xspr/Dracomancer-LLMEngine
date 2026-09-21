@@ -1,0 +1,92 @@
+#version 450
+// iq2s_gemm16u.comp — v7 全展开版（a0..a15 显式标量，零动态索引——ACO 对
+// 局部数组动态索引可能不进寄存器）。T 恒 16（python 补零列）。其余同 v6 布局。
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer WQ { uint wq[]; };
+layout(set = 0, binding = 1) readonly buffer G16 { uint g16[]; };
+layout(set = 0, binding = 2) readonly buffer XV { float xv[]; };
+layout(set = 0, binding = 3) writeonly buffer YV { float yv[]; };
+layout(push_constant) uniform PC { uint w_off; uint x_off; uint y_off; uint n_out; uint nb; } pc;
+shared float sred[256];
+
+float dval(uint g, uint k, float db, uint sgn) {
+    uint c = (g >> (2u * k)) & 3u;
+    float v = db * (8.0f + 17.0f * float(c) + 0.5f * float(c) * float(c - 1u));
+    return (((sgn >> k) & 1u) == 1u) ? -v : v;
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint r_in = lane >> 5u;
+    uint sb   = lane & 31u;
+    uint row  = gl_WorkGroupID.x * 8u + r_in;
+    bool live = row < pc.n_out;
+    uint rowbase = pc.w_off + row * pc.nb * 82u;
+    float a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15;
+    a0 = a1 = a2 = a3 = a4 = a5 = a6 = a7 = a8 = a9 = a10 = a11 = a12 = a13 = a14 = a15 = 0.0f;
+    for (uint b = 0u; b < pc.nb; b++) {
+        uint boff = rowbase + b * 82u;
+        uint lo = (wq[boff >> 2u] >> ((boff & 3u) * 8u)) & 0xFFu;
+        uint hi = (wq[(boff + 1u) >> 2u] >> (((boff + 1u) & 3u) * 8u)) & 0xFFu;
+        float d = unpackHalf2x16(lo | (hi << 8u)).x;
+        uint qs  = (wq[(boff + 2u + sb) >> 2u] >> (((boff + 2u + sb) & 3u) * 8u)) & 0xFFu;
+        uint sgn = (wq[(boff + 34u + sb) >> 2u] >> (((boff + 34u + sb) & 3u) * 8u)) & 0xFFu;
+        uint qhi = boff + 66u + (sb >> 2u);
+        uint qhb = (wq[qhi >> 2u] >> ((qhi & 3u) * 8u)) & 0xFFu;
+        uint sci = boff + 74u + (sb >> 2u);
+        uint scb = (wq[sci >> 2u] >> ((sci & 3u) * 8u)) & 0xFFu;
+        uint idx = qs | (((qhb >> ((sb & 3u) * 2u)) & 3u) << 8u);
+        float nib = (((sb >> 1u) & 1u) == 0u) ? float(scb & 0xFu) : float((scb >> 4u) & 0xFu);
+        float db = d * 0.25f * (0.5f + nib);
+        uint g = g16[idx];
+        float v0 = dval(g, 0u, db, sgn), v1 = dval(g, 1u, db, sgn);
+        float v2 = dval(g, 2u, db, sgn), v3 = dval(g, 3u, db, sgn);
+        float v4 = dval(g, 4u, db, sgn), v5 = dval(g, 5u, db, sgn);
+        float v6 = dval(g, 6u, db, sgn), v7 = dval(g, 7u, db, sgn);
+        uint xb = pc.x_off + (b * 256u + sb * 8u) * 16u;
+        a0 += v0 * xv[xb + 0u*16u + 0u] + v1 * xv[xb + 1u*16u + 0u] + v2 * xv[xb + 2u*16u + 0u] + v3 * xv[xb + 3u*16u + 0u] + v4 * xv[xb + 4u*16u + 0u] + v5 * xv[xb + 5u*16u + 0u] + v6 * xv[xb + 6u*16u + 0u] + v7 * xv[xb + 7u*16u + 0u];
+        a1 += v0 * xv[xb + 0u*16u + 1u] + v1 * xv[xb + 1u*16u + 1u] + v2 * xv[xb + 2u*16u + 1u] + v3 * xv[xb + 3u*16u + 1u] + v4 * xv[xb + 4u*16u + 1u] + v5 * xv[xb + 5u*16u + 1u] + v6 * xv[xb + 6u*16u + 1u] + v7 * xv[xb + 7u*16u + 1u];
+        a2 += v0 * xv[xb + 0u*16u + 2u] + v1 * xv[xb + 1u*16u + 2u] + v2 * xv[xb + 2u*16u + 2u] + v3 * xv[xb + 3u*16u + 2u] + v4 * xv[xb + 4u*16u + 2u] + v5 * xv[xb + 5u*16u + 2u] + v6 * xv[xb + 6u*16u + 2u] + v7 * xv[xb + 7u*16u + 2u];
+        a3 += v0 * xv[xb + 0u*16u + 3u] + v1 * xv[xb + 1u*16u + 3u] + v2 * xv[xb + 2u*16u + 3u] + v3 * xv[xb + 3u*16u + 3u] + v4 * xv[xb + 4u*16u + 3u] + v5 * xv[xb + 5u*16u + 3u] + v6 * xv[xb + 6u*16u + 3u] + v7 * xv[xb + 7u*16u + 3u];
+        a4 += v0 * xv[xb + 0u*16u + 4u] + v1 * xv[xb + 1u*16u + 4u] + v2 * xv[xb + 2u*16u + 4u] + v3 * xv[xb + 3u*16u + 4u] + v4 * xv[xb + 4u*16u + 4u] + v5 * xv[xb + 5u*16u + 4u] + v6 * xv[xb + 6u*16u + 4u] + v7 * xv[xb + 7u*16u + 4u];
+        a5 += v0 * xv[xb + 0u*16u + 5u] + v1 * xv[xb + 1u*16u + 5u] + v2 * xv[xb + 2u*16u + 5u] + v3 * xv[xb + 3u*16u + 5u] + v4 * xv[xb + 4u*16u + 5u] + v5 * xv[xb + 5u*16u + 5u] + v6 * xv[xb + 6u*16u + 5u] + v7 * xv[xb + 7u*16u + 5u];
+        a6 += v0 * xv[xb + 0u*16u + 6u] + v1 * xv[xb + 1u*16u + 6u] + v2 * xv[xb + 2u*16u + 6u] + v3 * xv[xb + 3u*16u + 6u] + v4 * xv[xb + 4u*16u + 6u] + v5 * xv[xb + 5u*16u + 6u] + v6 * xv[xb + 6u*16u + 6u] + v7 * xv[xb + 7u*16u + 6u];
+        a7 += v0 * xv[xb + 0u*16u + 7u] + v1 * xv[xb + 1u*16u + 7u] + v2 * xv[xb + 2u*16u + 7u] + v3 * xv[xb + 3u*16u + 7u] + v4 * xv[xb + 4u*16u + 7u] + v5 * xv[xb + 5u*16u + 7u] + v6 * xv[xb + 6u*16u + 7u] + v7 * xv[xb + 7u*16u + 7u];
+        a8 += v0 * xv[xb + 0u*16u + 8u] + v1 * xv[xb + 1u*16u + 8u] + v2 * xv[xb + 2u*16u + 8u] + v3 * xv[xb + 3u*16u + 8u] + v4 * xv[xb + 4u*16u + 8u] + v5 * xv[xb + 5u*16u + 8u] + v6 * xv[xb + 6u*16u + 8u] + v7 * xv[xb + 7u*16u + 8u];
+        a9 += v0 * xv[xb + 0u*16u + 9u] + v1 * xv[xb + 1u*16u + 9u] + v2 * xv[xb + 2u*16u + 9u] + v3 * xv[xb + 3u*16u + 9u] + v4 * xv[xb + 4u*16u + 9u] + v5 * xv[xb + 5u*16u + 9u] + v6 * xv[xb + 6u*16u + 9u] + v7 * xv[xb + 7u*16u + 9u];
+        a10 += v0 * xv[xb + 0u*16u + 10u] + v1 * xv[xb + 1u*16u + 10u] + v2 * xv[xb + 2u*16u + 10u] + v3 * xv[xb + 3u*16u + 10u] + v4 * xv[xb + 4u*16u + 10u] + v5 * xv[xb + 5u*16u + 10u] + v6 * xv[xb + 6u*16u + 10u] + v7 * xv[xb + 7u*16u + 10u];
+        a11 += v0 * xv[xb + 0u*16u + 11u] + v1 * xv[xb + 1u*16u + 11u] + v2 * xv[xb + 2u*16u + 11u] + v3 * xv[xb + 3u*16u + 11u] + v4 * xv[xb + 4u*16u + 11u] + v5 * xv[xb + 5u*16u + 11u] + v6 * xv[xb + 6u*16u + 11u] + v7 * xv[xb + 7u*16u + 11u];
+        a12 += v0 * xv[xb + 0u*16u + 12u] + v1 * xv[xb + 1u*16u + 12u] + v2 * xv[xb + 2u*16u + 12u] + v3 * xv[xb + 3u*16u + 12u] + v4 * xv[xb + 4u*16u + 12u] + v5 * xv[xb + 5u*16u + 12u] + v6 * xv[xb + 6u*16u + 12u] + v7 * xv[xb + 7u*16u + 12u];
+        a13 += v0 * xv[xb + 0u*16u + 13u] + v1 * xv[xb + 1u*16u + 13u] + v2 * xv[xb + 2u*16u + 13u] + v3 * xv[xb + 3u*16u + 13u] + v4 * xv[xb + 4u*16u + 13u] + v5 * xv[xb + 5u*16u + 13u] + v6 * xv[xb + 6u*16u + 13u] + v7 * xv[xb + 7u*16u + 13u];
+        a14 += v0 * xv[xb + 0u*16u + 14u] + v1 * xv[xb + 1u*16u + 14u] + v2 * xv[xb + 2u*16u + 14u] + v3 * xv[xb + 3u*16u + 14u] + v4 * xv[xb + 4u*16u + 14u] + v5 * xv[xb + 5u*16u + 14u] + v6 * xv[xb + 6u*16u + 14u] + v7 * xv[xb + 7u*16u + 14u];
+        a15 += v0 * xv[xb + 0u*16u + 15u] + v1 * xv[xb + 1u*16u + 15u] + v2 * xv[xb + 2u*16u + 15u] + v3 * xv[xb + 3u*16u + 15u] + v4 * xv[xb + 4u*16u + 15u] + v5 * xv[xb + 5u*16u + 15u] + v6 * xv[xb + 6u*16u + 15u] + v7 * xv[xb + 7u*16u + 15u];
+    }
+    for (uint t = 0u; t < 16u; t++) {
+        float v;
+        if (t == 0u) v = a0;
+        if (t == 1u) v = a1;
+        if (t == 2u) v = a2;
+        if (t == 3u) v = a3;
+        if (t == 4u) v = a4;
+        if (t == 5u) v = a5;
+        if (t == 6u) v = a6;
+        if (t == 7u) v = a7;
+        if (t == 8u) v = a8;
+        if (t == 9u) v = a9;
+        if (t == 10u) v = a10;
+        if (t == 11u) v = a11;
+        if (t == 12u) v = a12;
+        if (t == 13u) v = a13;
+        if (t == 14u) v = a14;
+        if (t == 15u) v = a15;
+        sred[lane] = live ? v : 0.0f;
+        barrier();
+        uint base = r_in * 32u;
+        for (uint stp = 16u; stp > 0u; stp >>= 1u) {
+            if (sb < stp) sred[base + sb] += sred[base + sb + stp];
+            barrier();
+        }
+        if (sb == 0u && live) yv[pc.y_off + row * 16u + t] = sred[base];
+        barrier();
+    }
+}
