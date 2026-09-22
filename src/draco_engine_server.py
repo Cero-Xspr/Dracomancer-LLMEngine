@@ -603,7 +603,6 @@ def _load_k2():
               system_default=None, bos=0,
               think_block=False, think_default=False,
               state_arrays=(lambda: E.STATES) if hasattr(E, "STATES") else None,
-              forward_chunk=_forward_chunk,
               render=render)
     return ap
 
