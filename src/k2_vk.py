@@ -16,6 +16,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 LIB = os.path.join(BASE, "vk", "libvkrun.so")
 SPV = os.environ.get("K2_VK_SPV", os.path.join(BASE, "vk", "iq2s_gemv6.spv"))   # v6：子块/lane，2.6-3.1×
 SPV3S = os.environ.get("K2_VK_SPV3S", os.path.join(BASE, "vk", "iq3s_gemv1.spv"))  # IQ3_S（o-proj）
+SPVG = os.environ.get("K2_VK_SPVG", os.path.join(BASE, "vk", "iq2s_gemm16u.spv"))  # GEMM16（prefill）
 G16 = os.path.join(BASE, "vk", "g16.bin")
 # v6 每 WG 处理 8 行 ⇒ dispatch=ceil(n_out/8)（libvkrun 从环境读）
 os.environ.setdefault("VKRUN_WG_ROWS", "8")
@@ -25,8 +26,10 @@ NB_H = H // 256          # n_in=2560 → 10 块
 NB_I = 768 // 256        # n_in=768  → 3 块（MoE down）
 
 # X 布局（float 下标）：[0,2560)=h/h2；[4096,4096+6144)=8×gu；[8192,8960)=shared silu·u
-X_FLOATS = 12288        # 4096+8×768=10240 需求取整
-Y_FLOATS = 24576         # 单次调用最大输出 8×2560
+# F2.7：解码布局之外，GEMM16 prefill 需要 X/Y ≥ n_in×16/ n_out×16 × 专家组最大 T
+# （专家组 ≤ T=ctx，所以 X/Y 各给 2M floats=8MB GTT，够 ctx≤2048 的组）
+X_FLOATS = 2 << 20
+Y_FLOATS = 2 << 20
 
 
 class VGMat(ct.Structure):
@@ -55,7 +58,7 @@ class VKCtx:
         lib = ct.CDLL(LIB)
         lib.vg_init.restype = ct.c_int
         lib.vg_init.argtypes = [ct.POINTER(ct.c_void_p), ct.c_ulong, ct.c_char_p, ct.c_char_p,
-                                ct.c_ulong, ct.c_ulong, ct.c_ulong, ct.POINTER(VGInfo)]
+                                ct.c_char_p, ct.c_ulong, ct.c_ulong, ct.c_ulong, ct.POINTER(VGInfo)]
         lib.vg_upload_grid.restype = ct.c_int
         lib.vg_upload_grid.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_ulong]
         lib.vg_upload.restype = ct.c_int
@@ -82,7 +85,7 @@ class VKCtx:
         total = sum(self.T[n].n_bytes for n in self.order)
         info = VGInfo()
         h = ct.c_void_p()
-        rc = self.lib.vg_init(ct.byref(h), total, SPV.encode(), SPV3S.encode(),
+        rc = self.lib.vg_init(ct.byref(h), total, SPV.encode(), SPV3S.encode(), SPVG.encode(),
                               X_FLOATS * 4, Y_FLOATS * 4, 128 << 20, ct.byref(info))
         if rc != 0:
             raise RuntimeError(f"vg_init rc={rc}")
@@ -256,6 +259,22 @@ class VKCtx:
         self._run(mats, None, X_FLOATS)
         y = self.yv[:ns * n_out + n_out].copy()
         return y[:ns * n_out].reshape(ns, n_out), y[ns * n_out:]
+
+    def gemm16(self, X, g, n_out, n_in):
+        """F2.7：IQ2_S GEMM。X [T, n_in]（CPU）→ 按 16-token 分块（核内 T_TILE=16），
+        每块转置上传 → GEMM16 → 拼回 [T, n_out]。g 为该张量的 GPU 登记 G
+        （专家调用传 G(wset, base+e*per)）。"""
+        T = X.shape[0]
+        nb = n_in // 256
+        out = np.empty((T, n_out), np.float32)
+        for t0 in range(0, T, 16):
+            n = min(16, T - t0)
+            XT = np.zeros((n_in, 16), np.float32)
+            XT[:, :n] = X[t0:t0 + n].T
+            self.xv[:n_in * 16] = XT.reshape(-1)
+            self._run([(g, 0, 0, n_out, nb, 2)], None, n_in * 16)
+            out[t0:t0 + n] = self.yv[:n_out * 16].reshape(n_out, 16)[:, :n].T
+        return out
 
     def oproj(self, x, og, n_out, n_in):
         """IQ3_S o-proj（单矩阵，pipe=1，R=4 行/WG 由 C 侧固定）。x 长度 = n_in。"""

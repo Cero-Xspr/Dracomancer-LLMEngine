@@ -68,7 +68,18 @@ class Prefiller:
         code, wb, n_out, n_in, per = m[which]
         return code, wb, n_out, n_in, per
 
-    def gemm_w(self, X, code, W, n_out, n_in, T):
+    def gemm_w(self, X, code, W, n_out, n_in, T, gname=None, goff=0):
+        # ★ F2.7：IQ2_S + GPU 登记 ⇒ GEMM16 原语。⚠️ 实测（2026-09-22）：仅 T_e≤8 的
+        #   小专家组赢 CPU（1.45×）；T_e≥14 被 CPU m5_gemm(AVX512,~160GFLOPS) 反超
+        #   4-5×——GPU GEMM prefill 整体不合算，默认关，K2_PF_GPU=1 可实验。
+        VK = getattr(self.KE, "VK", None)
+        if os.environ.get("K2_PF_GPU") == "1" and VK is not None and code == 13 and gname is not None:
+            g = VK.reg.get(gname)
+            if g is not None:
+                return VK.gemm16(np.ascontiguousarray(X, np.float32),
+                                 type("G2", (), {"wset": g.wset,
+                                                 "w_off": g.w_off + goff})(),
+                                 n_out, n_in)
         Y = np.empty((T, n_out), np.float32)
         assert self.G.m5_gemm(code, _pf(np.ascontiguousarray(X)), _p8(W), T, n_out, n_in,
                               _pf(Y), _pf(self.wbuf)) == 0
@@ -87,7 +98,8 @@ class Prefiller:
         for e in np.unique(sel.ravel()):
             ts, kk = np.nonzero(sel == e)
             if len(ts) >= 3:
-                ve = self.gemm_w(h[ts], L.vec, L.veb[e * L.ve_per:], KE.NKV * KE.HD, KE.H, len(ts))
+                ve = self.gemm_w(h[ts], L.vec, L.veb[e * L.ve_per:], KE.NKV * KE.HD, KE.H, len(ts),
+                                 gname=f"blk.{L.li}.attn_v_exps.weight", goff=e * L.ve_per)
             else:
                 ve = np.stack([KE.gemv1(L.vec, L.veb[e * L.ve_per:], KE.NKV * KE.HD, KE.H, h[tix])
                                for tix in ts])
@@ -118,10 +130,13 @@ class Prefiller:
             ts, kk = np.nonzero(sel == e)
             ne = len(ts)
             if ne >= 3:   # 批量 GEMM：去量化一次摊 T 行
-                g = self.gemm_w(h2[ts], L.exc, L.exb[e * L.ex_per:], KE.MOE_INTER, KE.H, ne)
-                u = self.gemm_w(h2[ts], L.uxc, L.uxb[e * L.ux_per:], KE.MOE_INTER, KE.H, ne)
+                g = self.gemm_w(h2[ts], L.exc, L.exb[e * L.ex_per:], KE.MOE_INTER, KE.H, ne,
+                                gname=f"blk.{L.li}.ffn_gate_exps.weight", goff=e * L.ex_per)
+                u = self.gemm_w(h2[ts], L.uxc, L.uxb[e * L.ux_per:], KE.MOE_INTER, KE.H, ne,
+                                gname=f"blk.{L.li}.ffn_up_exps.weight", goff=e * L.ux_per)
                 gu = KE.silu(g) * u
-                d = self.gemm_w(gu, L.dxc, L.dxb[e * L.dx_per:], KE.H, KE.MOE_INTER, ne)
+                d = self.gemm_w(gu, L.dxc, L.dxb[e * L.dx_per:], KE.H, KE.MOE_INTER, ne,
+                                gname=f"blk.{L.li}.ffn_down_exps.weight", goff=e * L.dx_per)
             else:         # 稀疏行：直接 gemv（免 dequant+GEMM 的固定开销）
                 gs = np.empty((ne, KE.MOE_INTER), np.float32)
                 us = np.empty((ne, KE.MOE_INTER), np.float32)
@@ -133,9 +148,11 @@ class Prefiller:
                 d = ds
             out[ts] += d * rw[ts, kk][:, None]
         # 共享专家（批量）
-        g = self.gemm_w(h2, L.sgc, L.sgb, KE.MOE_INTER, KE.H, T)
-        u = self.gemm_w(h2, L.suc, L.sub, KE.MOE_INTER, KE.H, T)
-        d = self.gemm_w(KE.silu(g) * u, L.sdc, L.sdb, KE.H, KE.MOE_INTER, T)
+        p = f"blk.{L.li}."
+        g = self.gemm_w(h2, L.sgc, L.sgb, KE.MOE_INTER, KE.H, T, gname=p + "ffn_gate_shexp.weight")
+        u = self.gemm_w(h2, L.suc, L.sub, KE.MOE_INTER, KE.H, T, gname=p + "ffn_up_shexp.weight")
+        d = self.gemm_w(KE.silu(g) * u, L.sdc, L.sdb, KE.H, KE.MOE_INTER, T,
+                        gname=p + "ffn_down_shexp.weight")
         return out + d
 
     # —— 批量 rope（HF rotate_half 约定，位置 pos0..pos0+T-1）——
@@ -170,8 +187,8 @@ class Prefiller:
         for li, L in enumerate(KE.LAYERS):
             h = KE.grouped_rms1(x, L.norm_a) if x.ndim == 1 else self._rms_batch(x, L.norm_a, 2, eps)
             # Q/K 批量
-            qf = self.gemm_w(h, L.qc, L.qb, NH * HD, H, T)
-            kf = self.gemm_w(h, L.kc, L.kb, NKV * HD, H, T)
+            qf = self.gemm_w(h, L.qc, L.qb, NH * HD, H, T, f"blk.{li}.attn_q.weight")
+            kf = self.gemm_w(h, L.kc, L.kb, NKV * HD, H, T, f"blk.{li}.attn_k.weight")
             q = self.rope_batch(qf.reshape(T, NH, HD), pos0, HD, KE.THETA)   # ★ q 必须过 rope
             k = self.rope_batch(kf.reshape(T, NKV, HD), pos0, HD, KE.THETA)
             # V
@@ -192,7 +209,8 @@ class Prefiller:
             att = KE.softmax_last(
                 scores * np.float32(HD ** -0.5) + self._causal_mask(T, pos0))
             out = np.matmul(att, L.Vt[:, None, :kv_n, :]).transpose(2, 0, 1, 3).reshape(T, NH * HD)
-            gate = KE.softplus_ln2(self.gemm_w(h, L.gc, L.gb, NH * HD, H, T))
+            gate = KE.softplus_ln2(self.gemm_w(h, L.gc, L.gb, NH * HD, H, T,
+                                               f"blk.{li}.attn_gate.weight"))
             attn = self.gemm_w(out * gate, L.oc, L.ob, H, NH * HD, T)
             x = x + attn
             h2 = self._rms_batch(x, L.norm_f, 2, eps)
@@ -205,9 +223,11 @@ class Prefiller:
                     DBG["moe3"] = mo.copy()
                 x = x + mo
             else:
-                g = self.gemm_w(h2, L.g1c, L.g1b, 6144, H, T)
-                u = self.gemm_w(h2, L.u1c, L.u1b, 6144, H, T)
-                x = x + self.gemm_w(KE.silu(g) * u, L.d1c, L.d1b, H, 6144, T)
+                p = f"blk.{L.li}."
+                g = self.gemm_w(h2, L.g1c, L.g1b, 6144, H, T, gname=p + "ffn_gate.weight")
+                u = self.gemm_w(h2, L.u1c, L.u1b, 6144, H, T, gname=p + "ffn_up.weight")
+                x = x + self.gemm_w(KE.silu(g) * u, L.d1c, L.d1b, H, 6144, T,
+                                    gname=p + "ffn_down.weight")
             if layer_hook is not None:
                 layer_hook(li, x.copy())   # 全行（调试口径）
         xf = self._rms_batch(x, KE.ONORM, 2, eps)

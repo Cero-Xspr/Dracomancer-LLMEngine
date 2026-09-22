@@ -31,6 +31,7 @@ struct VG {
     VkInstance inst; VkPhysicalDevice pd; VkDevice dev; VkQueue queue; uint32_t qf;
     VkDescriptorPool dpool; VkDescriptorSetLayout dsl; VkDescriptorSet dsets[MAXW];
     VkPipelineLayout playout; VkPipeline pipe; VkPipeline pipe2; int has_pipe2;
+    VkPipeline pipe3; int has_pipe3;   // IQ2_S GEMM16（prefill 批处理）
     VkCommandPool cpool; VkCommandBuffer cmd; VkFence fence;
     int n_w; VkBuffer wb[MAXW]; VkDeviceMemory wm[MAXW]; unsigned long wbytes[MAXW]; int wheap[MAXW];
     void* wmap[MAXW];                       // 仅 GTT 缓冲非 NULL
@@ -123,8 +124,8 @@ static void* keeper_fn(void* p) {
 }
 
 int vg_init(struct VG** out, unsigned long total_bytes, const char* spv_path,
-            const char* spv2_path, unsigned long x_bytes, unsigned long y_bytes,
-            unsigned long stage_bytes, struct VGInfo* info) {
+            const char* spv2_path, const char* spv3_path, unsigned long x_bytes,
+            unsigned long y_bytes, unsigned long stage_bytes, struct VGInfo* info) {
     *out = NULL;
     VG* vg = (VG*)calloc(1, sizeof(VG));
     VkApplicationInfo ai = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_2 };
@@ -283,6 +284,24 @@ int vg_init(struct VG** out, unsigned long total_bytes, const char* spv_path,
         CHECK(vkCreateComputePipelines(vg->dev, NULL, 1, &pci2, NULL, &vg->pipe2), "pipe2");
         vg->has_pipe2 = 1;
     }
+    vg->has_pipe3 = 0;
+    if (spv3_path && spv3_path[0]) {
+        FILE* sp3 = fopen(spv3_path, "rb");
+        if (!sp3) { fprintf(stderr, "[vkrun] 缺 %s\n", spv3_path); return -1; }
+        fseek(sp3, 0, SEEK_END); long sp3sz = ftell(sp3); rewind(sp3);
+        char* code3 = (char*)malloc((size_t)sp3sz);
+        if (fread(code3, 1, (size_t)sp3sz, sp3) != (size_t)sp3sz) return -1;
+        fclose(sp3);
+        VkShaderModuleCreateInfo smci3 = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                           .codeSize = (size_t)sp3sz, .pCode = (uint32_t*)code3 };
+        VkShaderModule smod3; CHECK(vkCreateShaderModule(vg->dev, &smci3, NULL, &smod3), "sm3");
+        VkPipelineShaderStageCreateInfo ss3 = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = smod3, .pName = "main" };
+        VkComputePipelineCreateInfo pci3 = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                                             .stage = ss3, .layout = vg->playout };
+        CHECK(vkCreateComputePipelines(vg->dev, NULL, 1, &pci3, NULL, &vg->pipe3), "pipe3");
+        vg->has_pipe3 = 1;
+    }
     VkCommandPoolCreateInfo cpci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = vg->qf };
     CHECK(vkCreateCommandPool(vg->dev, &cpci, NULL, &vg->cpool), "cpool");
     VkCommandBufferAllocateInfo cbai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
@@ -398,14 +417,18 @@ int vg_run(struct VG* vg, const struct VGMat* mats, int n, const float* x, unsig
                                     0, 1, &vg->dsets[mats[i].wset], 0, NULL);
             cur_set = (int)mats[i].wset;
         }
-        uint32_t p = (mats[i].pipe == 1 && vg->has_pipe2) ? 1 : 0;
-        if (p != cur_pipe) {
-            vkCmdBindPipeline(vg->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p ? vg->pipe2 : vg->pipe);
+        uint32_t p = 0;
+        if (mats[i].pipe == 1 && vg->has_pipe2) p = 1;
+        if (mats[i].pipe == 2 && vg->has_pipe3) p = 2;
+        if (p != (uint32_t)cur_pipe) {
+            vkCmdBindPipeline(vg->cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                              p == 0 ? vg->pipe : (p == 1 ? vg->pipe2 : vg->pipe3));
             cur_pipe = (int)p;
         }
         uint32_t pc[7] = { mats[i].w_off, mats[i].x_off, mats[i].y_off, mats[i].n_out, mats[i].nb, 0, 0 };
         vkCmdPushConstants(vg->cmd, vg->playout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 20, pc);
         uint32_t wgr = (p == 1u) ? 4u : (vg->wg_rows > 0 ? vg->wg_rows : 1u);
+        // pipe2(GEMM16) 与 pipe0 同为 8 行/WG ⇒ 用 wg_rows
         uint32_t groups = (mats[i].n_out + wgr - 1u) / wgr;
         vkCmdDispatch(vg->cmd, groups, 1, 1);
     }
