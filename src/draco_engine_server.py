@@ -584,9 +584,12 @@ def _load_k2():
                                        #   不设的话会静默用默认 Q4_K_M（22GB 纯 CPU 磁盘流式）！
     import k2_engine as E
     import falcon_tok as FT
-    # ★ 不接 forward_chunk（CPU 批量 prefill）：实测 IQ2_M 上 CPU GEMM ~700ms/tok，
-    #   比 GPU 增量路径（~250ms/tok）慢 2-3×——iGPU gemv 已是最快 prefill。
-    #   真 TTFT 杠杆 = GPU GEMM 内核（F2.7 候选）。k2_prefill.py 保留作 CPU 模式工具。
+    import k2_prefill as KP
+    _PF = KP.Prefiller(E)
+    def _forward_chunk(inc_ids, pos0):
+        lg, _ = _PF.prefill(list(inc_ids), pos0=pos0)
+        E.LOGITS = np.asarray(lg, np.float32)
+        return E.LOGITS
     tk, _R = FT.build(ARGS.model, add_bos=False, pre="llama3")   # pre=k2-horizon 的正则与 llama3 相同
     render = _template_renderer(ARGS.model, think_default=False)
     if render is None:
@@ -603,6 +606,7 @@ def _load_k2():
               system_default=None, bos=0,
               think_block=False, think_default=False,
               state_arrays=(lambda: E.STATES) if hasattr(E, "STATES") else None,
+              forward_chunk=(None if os.environ.get("K2_PF_BATCH") == "0" else _forward_chunk),
               render=render)
     return ap
 
@@ -739,10 +743,10 @@ def sample(logits, temp, seed_rng, repeat_penalty, recent, pen_texts=None, top_p
         p = np.exp((z - z.max()) / temp)
         p /= p.sum()
         if top_p and 0.0 < top_p < 1.0:
-            order = np.argsort(-p)
-            cum = np.cumsum(p[order])
-            cut = int(np.searchsorted(cum, top_p) + 1)
-            keep = order[:cut]
+            # argpartition O(n) 取前 k（实测 250k 词表 5.15→2.73ms/tok；集合与全排序前缀等价）
+            ps = np.sort(p)[::-1]
+            k = int(np.searchsorted(np.cumsum(ps), top_p)) + 1
+            keep = np.argpartition(p, -k)[-k:]
             pk = p[keep] / p[keep].sum()
             return int(seed_rng.choices(keep.tolist(), weights=pk.tolist())[0])
         # ★ random.Random.choice 没有 p= 参数（那是 numpy 的）—— 用 choices(weights=)
