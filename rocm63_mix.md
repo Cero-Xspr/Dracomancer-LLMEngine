@@ -90,3 +90,21 @@ ROCBLAS_TENSILE_LIBPATH=/media/xiao_/OverSys1/npu-direct/rocm63-mix/tensile_gfx9
   用宿主 1.0f 数组 memcpy 才是真初始化（初版测试自摆乌龙）。
 - 至此 HIP 三件套全通：内核 launch ✓（单卡过滤）+ rocBLAS ✓ + 配方可复用；
   下一步自然是 llama.cpp-HIP/attention 走 hipBLAS 实测。
+
+## ✅ B 结案 + 7.0 谜底（同夜）
+**llama.cpp-HIP 实测**（build-hip：GGML_HIP=ON、CMAKE_HIP_ARCHITECTURES=gfx906——注意
+必须 gfx 前缀，裸 906 被 ROCm10 clang 拒；CMAKE_HIP_COMPILER 别指 hipcc，CMake 要裸 clang）：
+```
+Device 0: AMD Radeon Pro VII, gfx906:sramecc+:xnack- (0x906) VRAM 16368 MiB
+Llama-3.2-1B Q4_K:  pp512 GPU 2285 t/s vs CPU 1329（1.7×）
+                    tg128 GPU 157.3 t/s vs CPU 47.3（3.3×）
+功率: 峰值 72W（50W 钳毛刺）均值 43W
+```
+- **-ngl 0 对照初跑崩溃 = 同一个多 GPU bug**（忘了给 CPU run 也套 HIP_VISIBLE_DEVICES=1，
+  init 枚举双卡即炸）——过滤是所有 HIP 进程的必戴项。
+- **ROCm 7.0 有没有 gfx906？——没有**：rocblas_5.0.0 deb 解包 `gfx906 文件数=0`、
+  无 TensileLibrary_lazy_gfx906.dat（只有 gfx950 等新卡）⇒ **6.3（及 6.4 系）是
+  gfx906 Tensile 数据的最后世代**，选 6.3 不是保守是唯一有货的档位之一。
+- Vulkan 与 ROCm 版本无关：本机 RADV VEGA20 来自**系统 Mesa**（api 1.4.318），
+  ROCm 包不带显卡 Vulkan 驱动；6.3/7/10 都不影响我们引擎的 Vulkan 路径。
+- 热插拔：TB3+amdgpu 支持（开机不必插着），但插拔时序三条军规见记忆/提交信息。
