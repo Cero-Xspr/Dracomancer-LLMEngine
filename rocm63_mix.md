@@ -49,3 +49,27 @@ LD_LIBRARY_PATH=$OV/lib:/opt/rocm/lib:/opt/rocm/core-10.0/lib ./<binary>
 **剩余步骤（下一夜，需 ltrace/gdb 或读 rocr6.3 源码）**：对
 `comgr_copy_symbols/comgr_validate_code_object` 打点看返回码；或追 rocr 的
 agent-target 推导（hsakmt topology→amdgpu asic 映射）。overlay+工具链全部就位可复用。
+
+## ★★ 真根因（2026-09-24 终章）：多 GPU 可见性 bug，一行环境变量修复
+前面五层（CO 版本/SONAME/工具链时代/特征串/KFD 推导）全是弯路——决定性 2×2：
+
+| 栈 | 双卡可见（默认） | HIP_VISIBLE_DEVICES=1 |
+|---|---|---|
+| ROCm10 原生 | ✗ invalid image | ✅ **PASS (y=42)** |
+| 6.3 overlay 老栈 | ✗ invalid device function | ✅ PASS |
+
+**根因 = clr 加载器在多 GPU 可见时符号/agent 查串**（ltrace 指纹：
+`hsa_executable_symbol_get_info(kind=10 VARIABLE_IS_CONST) = 0x1001 ×225`、
+KERNEL_OBJECT(22)×15 却成功——正是“在两个 agent 间遍历错配”的形态）。
+新老栈症状不同（image vs device function）但同病灶。
+
+### 最终配方（HIP-on-MI50，ROCm10 原生即可，无需 overlay）
+```bash
+HIP_VISIBLE_DEVICES=1 ./your_hip_binary     # 隔离到 MI50（索引按枚举序，本机 1=vega20）
+# 或 ROCR_VISIBLE_DEVICES=1；iGPU 侧进程用 HIP_VISIBLE_DEVICES=0，两进程互不干扰
+# 注意：进程内设备序会被过滤重排——按 gcnArchName/枚举结果选卡，别写死索引
+```
+- **rocBLAS 仍缺 gfx906 Tensile 库**（只有 gfx1150 目录）——BLAS 混用下一步
+  （149MB rocblas_4.3 deb 里抽 gfx906，预期同样受 VISIBLE 过滤保护）。
+- 6.3 overlay + 老工具链（1.2GB）保留：Tensile 混用/考古备用，非必需。
+- 本机 bug 归属：kernel7.0 + ROCm10 clr 双卡枚举路径（AMD 上游可报 issue 的级别）。
