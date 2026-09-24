@@ -34,3 +34,18 @@ LD_LIBRARY_PATH=$OV/lib:/opt/rocm/lib:/opt/rocm/core-10.0/lib ./<binary>
 - [ ] 下载 6.3 工具链（rocm-llvm 325MB + hip-dev + hipcc + rocm-device-libs ≈ 327MB）
 - [ ] 老 hipcc 编 gfx906 kernel → patchelf → launch 验证
 - [ ] 通过后：rocBLAS Tensile gfx906（149MB deb 里只取 gfx906 目录）→ llama.cpp HIP 路线
+
+## 终审补充（2026-09-24 晚，工具链已下并实测）
+6.3 工具链（rocm-llvm 325MB 等 4 包）已解进 overlay（root/ 共 1.2GB），用老 hipcc 实测：
+- **老工具链 + 老栈原生组合（同代发行版配对）→ 仍 invalid device function** ⇒ 排除
+  一切版本代差假设（CO 版本/SONAME/工具链时代 三层全灭）。
+- **裸 `--offload-arch=gfx906`（嵌入串无 sramecc/xnack 尾巴）→ 仍败** ⇒ 排除特征串不匹配假设。
+- **strace 决定性负结果**：/dev/kfd 328 个 ioctl **零失败**（ALLOC/MAP/EVENT 全成功），
+  但 **CREATE_QUEUE 从未被调用** ⇒ 死在用户态 comgr↔agent 符号/目标解析层，队列都没排到。
+- iGPU 同栈同编译器 PASS ⇒ comgr 读 CO 本身没问题，**只有 gfx906 的 agent 目标推导出错**。
+- KFD topology：`name`=“vega20”（kernel7 新命名，非 LLVM 三元组）、properties 无特征串、
+  gfx_target_version=90006 ⇒ 嫌疑：老 rocr 从新内核 sysfs/驱动推 agent target 时拿不到
+  与镜像匹配的串。
+**剩余步骤（下一夜，需 ltrace/gdb 或读 rocr6.3 源码）**：对
+`comgr_copy_symbols/comgr_validate_code_object` 打点看返回码；或追 rocr 的
+agent-target 推导（hsakmt topology→amdgpu asic 映射）。overlay+工具链全部就位可复用。
