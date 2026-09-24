@@ -131,7 +131,21 @@ int vg_init(struct VG** out, unsigned long total_bytes, const char* spv_path,
     VkApplicationInfo ai = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_2 };
     VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &ai };
     CHECK(vkCreateInstance(&ici, NULL, &vg->inst), "inst");
-    vkEnumeratePhysicalDevices(vg->inst, &(uint32_t){1}, &vg->pd);
+    // VKRUN_PHYS=N 选物理设备（默认 0=第一个）；打印选中项防"跑错卡"
+    {
+        uint32_t npd = 0;
+        vkEnumeratePhysicalDevices(vg->inst, &npd, NULL);
+        VkPhysicalDevice* pds = (VkPhysicalDevice*)calloc(npd ? npd : 1, sizeof(VkPhysicalDevice));
+        vkEnumeratePhysicalDevices(vg->inst, &npd, pds);
+        int pick = getenv("VKRUN_PHYS") ? atoi(getenv("VKRUN_PHYS")) : 0;
+        if (pick < 0 || (uint32_t)pick >= npd) pick = 0;
+        vg->pd = pds[pick];
+        for (uint32_t i = 0; i < npd; i++) {
+            VkPhysicalDeviceProperties pr; vkGetPhysicalDeviceProperties(pds[i], &pr);
+            fprintf(stderr, "[vkrun] phys%u: %s %s\n", i, pr.deviceName, i == (uint32_t)pick ? "<= SELECTED" : "");
+        }
+        free(pds);
+    }
     VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(vg->pd, &pp);
     VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(vg->pd, &mp);
     VkPhysicalDeviceLimits lim = pp.limits;
