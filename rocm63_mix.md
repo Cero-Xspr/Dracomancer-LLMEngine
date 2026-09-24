@@ -73,3 +73,20 @@ HIP_VISIBLE_DEVICES=1 ./your_hip_binary     # 隔离到 MI50（索引按枚举�
   （149MB rocblas_4.3 deb 里抽 gfx906，预期同样受 VISIBLE 过滤保护）。
 - 6.3 overlay + 老工具链（1.2GB）保留：Tensile 混用/考古备用，非必需。
 - 本机 bug 归属：kernel7.0 + ROCm10 clr 双卡枚举路径（AMD 上游可报 issue 的级别）。
+
+## ✅ A 结案（同夜）：rocBLAS gfx906 混用 PASS
+配方（三个变量，全环境变量、零 root）：
+```bash
+HIP_VISIBLE_DEVICES=1 \
+ROCBLAS_TENSILE_LIBPATH=/media/xiao_/OverSys1/npu-direct/rocm63-mix/tensile_gfx906_slim \
+./your_blas_program   # 链系统 librocblas.so.5（ROCm10）
+```
+- 数据源：rocblas_4.3 deb（149MB，Size=149099742 校验过）内 `library/*gfx906*` +
+  `TensileLibrary_lazy_gfx906.dat` → 已抽成 **tensile_gfx906_slim（156 文件/142MB）**；
+  3.7GB 全架构解包目录已删（deb 保留可重解）。
+- **实测：sgemm512 status=0、C[0]=512.00 精确、burst 2866-3298 GFLOPS（860MHz/50W 钳下）**
+  —— rocBLAS5.6 读 4.3 时代 Tensile 数据无 schema 拒收。
+- 坑：hipMemset(A,1,…) 是按字节填 → float=1.4e-39 非规格化 → C[0]=0 假 FAIL；
+  用宿主 1.0f 数组 memcpy 才是真初始化（初版测试自摆乌龙）。
+- 至此 HIP 三件套全通：内核 launch ✓（单卡过滤）+ rocBLAS ✓ + 配方可复用；
+  下一步自然是 llama.cpp-HIP/attention 走 hipBLAS 实测。
