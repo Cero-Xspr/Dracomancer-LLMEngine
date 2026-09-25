@@ -108,3 +108,21 @@ Llama-3.2-1B Q4_K:  pp512 GPU 2285 t/s vs CPU 1329（1.7×）
 - Vulkan 与 ROCm 版本无关：本机 RADV VEGA20 来自**系统 Mesa**（api 1.4.318），
   ROCm 包不带显卡 Vulkan 驱动；6.3/7/10 都不影响我们引擎的 Vulkan 路径。
 - 热插拔：TB3+amdgpu 支持（开机不必插着），但插拔时序三条军规见记忆/提交信息。
+
+## 社区方案调查（2026-09-25，答用户"ROCm7+mi50 社区方案"）
+- **官方 7.x 全系无 gfx906 Tensile**：7.0=0 文件、**7.2=0 文件**（rocblas_5.2.0 实测）——
+  "ROCm7 能跑"的社区方案全部是**自带库**：
+  - `xxDoman/ollama-mi50-rocm7.2-optimized-gfx906`（10★）：Docker 内置
+    `LD_LIBRARY_PATH=/usr/lib/ollama/rocm` 自带 ROCm7.2 运行时+gfx906 库、
+    `HSA_OVERRIDE_GFX_VERSION=9.0.6`；卖点=修 Qwen3.5 SSM 文本损坏 + KV q8_0 +
+    **MTP 投机 +20-28%**（gemma4 draft 头）+ 32GB 卡 35B Q6_K 52 t/s；
+    ★功率情报：**其 VBIOS 上限 225-250W，`--setpoweroverdrive 160` → SCLK 1143→1606
+    （+8~9%）、解码实拉 113-155W、结温 <85°C**；⚠️陷阱：VRAM 被占时 ollama 静默
+    半卸载 → 掉 3×。
+  - `Intermountainh8ter/rocm-gfx906-sramecc-fix`：**sramecc- 变体**（Radeon VII/部分
+    MI50）装官方库会段错误（No compatible code objects）⇒ 重建整套 math libraries。
+    本机卡是 **sramecc+** 不中招；HSA_OVERRIDE 救不了 sramecc 变体。
+  - `Wulfsta/vllm-flake`（18★ Nix 构建 gfx906 vLLM）、`NnnHU/sglang-mi50`（W4A16 Triton）。
+- **对比我们**：等价能力已用更轻方式拿到（6.3 官方 Tensile + ROCm10 运行时 + LIBPATH
+  混用 + 单卡过滤），零 Docker；独有根因发现（多 GPU bug）社区文档未见记载。
+- 本机 power1_cap_max=**190W**（非 32GB 卡的 250）；当前 100W。
